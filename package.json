@@ -1,0 +1,64 @@
+{
+  "name": "codext-agent",
+  "version": "0.1.0",
+  "description": "Windows desktop ReAct AI agent built with TypeScript and Electron.",
+  "main": "./out/main/index.js",
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "package:win": "npm run build && electron-builder --win nsis portable"
+  },
+  "dependencies": {
+    "@electron-toolkit/preload": "^3.0.2",
+    "@electron-toolkit/utils": "^4.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@electron-toolkit/tsconfig": "1.0.1",
+    "@eslint/js": "9.30.1",
+    "@types/node": "22.15.32",
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "@vitejs/plugin-react": "4.4.1",
+    "electron": "35.7.5",
+    "electron-builder": "26.0.12",
+    "electron-vite": "3.1.0",
+    "eslint": "9.30.1",
+    "jsdom": "26.1.0",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.35.0",
+    "vite": "6.3.5",
+    "vitest": "3.2.4"
+  },
+  "build": {
+    "appId": "com.codext.agent",
+    "productName": "Codext Agent",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

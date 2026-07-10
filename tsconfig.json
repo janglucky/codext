@@ -1,0 +1,5 @@
+{
+  "extends": "@electron-toolkit/tsconfig/tsconfig.node.json",
+  "include": ["src/main/**/*", "src/preload/**/*", "src/shared/**/*", "electron.vite.config.ts"],
+  "compilerOptions": { "noImplicitAny": true, "strict": true }
+}

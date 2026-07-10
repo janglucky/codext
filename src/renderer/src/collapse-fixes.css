@@ -1,0 +1,38 @@
+.agent-process.agent-process-flow > summary::before,
+.agent-process.agent-process-flow .agent-flow-action > summary::before,
+.agent-process.agent-process-flow .agent-flow-observation > summary::before {
+  display: block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-right: 1.5px solid #a2a2a2;
+  border-bottom: 1.5px solid #a2a2a2;
+  color: transparent;
+  content: ";
+  font-size: 0;
+  transform: rotate(-45deg);
+  transform-origin: 55% 55%;
+  transition: transform 160ms ease;
+}
+
+.agent-process.agent-process-flow[open] > summary::before,
+.agent-process.agent-process-flow .agent-flow-action[open] > summary::before,
+.agent-process.agent-process-flow .agent-flow-observation[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.agent-process.agent-process-flow > summary,
+.agent-process.agent-process-flow .agent-flow-action > summary,
+.agent-process.agent-process-flow .agent-flow-observation > summary {
+  display: flex;
+  align-items: center;
+}
+
+.agent-process.agent-process-flow .agent-flow-action > summary,
+.agent-process.agent-process-flow .agent-flow-observation > summary {
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}

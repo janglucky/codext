@@ -461,6 +461,29 @@ describe('ReactAgent.execute', () => {
       await expect(execute('test', makeTask())).rejects.toThrow('模型请求失败')
     })
 
+    it('retries transient 524 responses', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 524,
+            json: () => Promise.resolve({ error: { message: 'Server error, please try again later.' } })
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'recovered' }) } }] })
+        })
+      })
+
+      const { execute } = makeAgent(makeSettings({ maxRetries: 1 }))
+      const result = await execute('retry task', makeTask())
+      expect(result).toBe('recovered')
+      expect(callCount).toBe(2)
+    })
+
     it('throws when model returns empty content', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,

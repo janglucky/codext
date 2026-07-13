@@ -153,20 +153,32 @@ export class ReactAgent {
 
   private async callModel(messages: ModelMessage[], onDelta?: DeltaCallback): Promise<string> {
     const { model } = this.getSettings()
+    const maxAttempts = Math.max(1, model.maxRetries + 1)
+    let lastError: Error | undefined
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.callModelOnce(messages, model, onDelta)
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error('模型请求失败')
+        if (!this.isRetryableModelError(lastError) || attempt === maxAttempts) throw lastError
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * 2 ** (attempt - 1), 5000)))
+      }
+    }
+    throw lastError ?? new Error('模型请求失败')
+  }
+
+  private async callModelOnce(messages: ModelMessage[], model: AppSettings['model'], onDelta?: DeltaCallback): Promise<string> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), model.timeoutMs)
-
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'text/event-stream' }
       if (model.apiKey.trim()) headers.Authorization = 'Bearer ' + model.apiKey
-
       const response = await fetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
         signal: controller.signal,
         headers,
         body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 16384, stream: true })
       })
-
       if (!response.ok) {
         let errorDetail = ''
         try {
@@ -175,9 +187,10 @@ export class ReactAgent {
         } catch {
           /* 响应体无法解析为 JSON */
         }
-        throw new Error('模型请求失败：' + response.status + (errorDetail ? ' - ' + errorDetail : ''))
+        const error = new Error('模型请求失败：' + response.status + (errorDetail ? ' - ' + errorDetail : ''))
+        ;(error as Error & { status?: number }).status = response.status
+        throw error
       }
-
       const contentType = response.headers?.get('content-type') ?? ''
       const content = contentType.includes('text/event-stream') ? await this.readStreamResponse(response, onDelta) : await this.readJsonResponse(response)
       if (!content) throw new Error('模型返回为空')
@@ -190,6 +203,11 @@ export class ReactAgent {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  private isRetryableModelError(error: Error): boolean {
+    const status = (error as Error & { status?: number }).status
+    return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524
   }
 
   private async readJsonResponse(response: Response): Promise<string> {

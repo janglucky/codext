@@ -84,6 +84,10 @@ export class ReactAgent {
         this.upsertStep(task, thoughtStep, onStep)
       }
       if (reply.final) {
+        if (isIncompleteFinal(reply.final)) {
+          messages.push({ role: 'user', content: '任务尚未完成。不要等待用户提供工具结果；如果需要检查、读取、写入或执行命令，请立即输出下一步 Action JSON。只有完成全部目标后才能输出 Final。' })
+          continue
+        }
         stream.flushFinal(reply.final)
         return reply.final
       }
@@ -491,6 +495,10 @@ function sanitizeThoughtBeforeAction(thought: string): string {
   const planned = segments.filter((segment) => !completionPattern.test(segment))
   const result = planned.join('。').trim()
   return result || '准备执行所需工具。'
+}
+
+function isIncompleteFinal(finalText: string): boolean {
+  return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目).{0,8}(?:尚未|未).{0,8}(?:完成|结束)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
 }
 
 class ReactFieldStream {

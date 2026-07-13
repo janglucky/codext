@@ -30,7 +30,7 @@ app.whenReady().then(async () => {
     const history = conversationBeforeRun.messages
       .filter((message) => message.id !== assistantMessage.id)
       .slice(0, -1)
-      .map((message) => ({ role: message.role, content: message.content }))
+      .map((message) => ({ role: message.role, content: historyContent(message) }))
     const task = await agent.run(prompt.trim(), history, (taskStep) => {
       assistantMessage.steps = upsertStep(assistantMessage.steps ?? [], taskStep)
       event.sender.send('agent:step', { conversationId, messageId: assistantMessage.id, step: taskStep })
@@ -79,4 +79,13 @@ function upsertStep<T extends { id: string }>(steps: T[], nextStep: T): T[] {
   const index = steps.findIndex((item) => item.id === nextStep.id)
   if (index < 0) return [...steps, nextStep]
   return steps.map((item) => item.id === nextStep.id ? nextStep : item)
+}
+
+function historyContent(message: ChatMessage): string {
+  if (message.role !== 'assistant' || !message.steps?.length) return message.content
+  const trace = message.steps
+    .filter((item) => item.phase === 'act')
+    .map((item) => item.title + ': ' + item.detail)
+    .join('\n')
+  return [message.content, trace ? 'Previous execution trace:\n' + trace : ''].filter(Boolean).join('\n\n')
 }

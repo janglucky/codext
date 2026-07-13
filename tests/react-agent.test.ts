@@ -387,6 +387,30 @@ describe('ReactAgent.execute', () => {
       expect(callCount).toBe(2)
     })
 
+    it('continues when model returns an incomplete final asking for observations', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ final: '任务尚未完成，请提供工具返回结果后继续。' })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'package.json' } } })
+            : JSON.stringify({ final: 'completed' })
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content } }] })
+        })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await execute('continue task', task)
+
+      expect(result).toBe('completed')
+      expect(callCount).toBe(3)
+      expect(task.steps.some((item) => item.title.includes('read_file'))).toBe(true)
+    })
+
     it('filters out unknown tool names from tool_calls', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,

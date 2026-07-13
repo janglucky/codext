@@ -132,6 +132,19 @@ describe('ReactAgent.execute', () => {
       expect(result).toBe('{tool_calls: [broken json')
     })
 
+    it('extracts final text from malformed JSON with raw newlines', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ choices: [{ message: { content: '{"final":"line one\nline two"} trailing' } }] })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const result = await execute('finish', makeTask())
+
+      expect(result).toBe('line one\nline two')
+      expect(result).not.toContain('{"final"')
+    })
+
     it('streams final field deltas when server returns SSE', async () => {
       const encoder = new TextEncoder()
       const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')

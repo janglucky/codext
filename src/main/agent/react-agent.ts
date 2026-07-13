@@ -256,6 +256,8 @@ export class ReactAgent {
       if (recoveredAction) return { thought: thought || undefined, action: recoveredAction }
       const finalReply = objects.find((item) => typeof item.final === 'string')
       if (finalReply) return this.attachThought(finalReply, thought)
+      const recoveredFinal = this.recoverFinal(payload)
+      if (recoveredFinal !== undefined) return this.attachThought({ final: recoveredFinal }, thought)
       return { thought: thought || undefined, final: payload || content }
     }
   }
@@ -320,6 +322,19 @@ export class ReactAgent {
       if (typeof candidate.name !== 'string' || !isToolName(candidate.name)) return undefined
       if (!candidate.arguments || typeof candidate.arguments !== 'object') return undefined
       return candidate as ToolCall
+    } catch {
+      return undefined
+    }
+  }
+
+  private recoverFinal(content: string): string | undefined {
+    const objectStart = content.indexOf('{')
+    if (objectStart < 0) return undefined
+    const object = this.extractBalancedObject(content, objectStart)
+    if (!object) return undefined
+    try {
+      const candidate = JSON.parse(this.normalizeJsonControlCharacters(object)) as Partial<ReactModelReply>
+      return typeof candidate.final === 'string' ? candidate.final : undefined
     } catch {
       return undefined
     }

@@ -64,6 +64,7 @@ export class ReactAgent {
       { role: 'user', content: prompt }
     ]
     let previousActionSignature = ''
+    let previousActionHadError = false
 
     for (let turn = 1; turn <= MAX_REACT_TURNS; turn++) {
       const thoughtStep = step('reason', '思考过程', '')
@@ -94,13 +95,21 @@ export class ReactAgent {
 
       if (!toolCalls.length) return content
       const actionSignature = JSON.stringify(toolCalls)
-      if (actionSignature === previousActionSignature) return content
+      if (actionSignature === previousActionSignature && !previousActionHadError) return content
       previousActionSignature = actionSignature
 
       const observations: string[] = []
+      let currentActionHadError = false
       for (const call of toolCalls.slice(0, MAX_ACTIONS_PER_TURN)) {
         this.addStep(task, step('act', '正在执行工具：' + call.name, this.toolDetail(call)), onStep)
-        const output = await this.executeTool(call, tools, policy)
+        let output: string
+        try {
+          output = await this.executeTool(call, tools, policy)
+        } catch (error) {
+          if (!isRecoverableToolError(error)) throw error
+          currentActionHadError = true
+          output = '工具执行失败：' + (error instanceof Error ? error.message : String(error))
+        }
         const observation = call.name + ': ' + output
         observations.push(observation)
         this.addStep(task, step('act', 'Observation #' + turn + '：' + call.name, output.slice(0, 800)), onStep)
@@ -108,6 +117,7 @@ export class ReactAgent {
 
       const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n')
       messages.push({ role: 'user', content: observationText })
+      previousActionHadError = currentActionHadError
     }
 
     throw new Error('ReAct 循环达到最大轮数，仍未得到 Final。')
@@ -499,6 +509,12 @@ function sanitizeThoughtBeforeAction(thought: string): string {
 
 function isIncompleteFinal(finalText: string): boolean {
   return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目).{0,8}(?:尚未|未).{0,8}(?:完成|结束)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
+}
+
+function isRecoverableToolError(error: unknown): boolean {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
+  const message = error instanceof Error ? error.message : String(error)
+  return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)
 }
 
 class ReactFieldStream {

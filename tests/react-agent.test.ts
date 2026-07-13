@@ -1,4 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { ReactAgent } from '../src/main/agent/react-agent'
 import type { AgentPolicy, AppSettings, AgentTask } from '../src/shared/types'
 
@@ -411,6 +413,31 @@ describe('ReactAgent.execute', () => {
       expect(task.steps.some((item) => item.title.includes('read_file'))).toBe(true)
     })
 
+    it('continues after read_file reports a missing file', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'missing-file.txt' } } })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'write_file', arguments: { path: 'recovered.txt', content: 'created' } } })
+            : JSON.stringify({ final: 'recovered from missing file' })
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content } }] })
+        })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await execute('recover files', task)
+
+      expect(result).toBe('recovered from missing file')
+      expect(callCount).toBe(3)
+      expect(task.steps.some((item) => item.detail.includes('工具执行失败'))).toBe(true)
+      expect(task.steps.some((item) => item.title.includes('write_file'))).toBe(true)
+    })
+
     it('filters out unknown tool names from tool_calls', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,
@@ -625,7 +652,7 @@ describe('ReactAgent.execute', () => {
       expect(result).toContain('tool_calls')
     })
 
-    it('truncates long tool output in step detail to 180 chars', async () => {
+    it('truncates long tool output in step detail to 800 chars', async () => {
       globalThis.fetch = vi.fn()
         .mockImplementationOnce(() => Promise.resolve({
           ok: true,
@@ -633,7 +660,7 @@ describe('ReactAgent.execute', () => {
             choices: [{
               message: {
                 content: JSON.stringify({
-                  tool_calls: [{ name: 'read_file', arguments: { path: 'package.json' } }]
+                  tool_calls: [{ name: 'read_file', arguments: { path: 'tests/fixtures/long-tool-output.txt' } }]
                 })
               }
             }]
@@ -644,22 +671,21 @@ describe('ReactAgent.execute', () => {
           json: () => Promise.resolve({ choices: [{ message: { content: 'ok' } }] })
         }))
 
-      // mock WorkspaceTools.readFile to return long content
-      vi.mock('../src/main/tools/workspace-tools', () => ({
-        WorkspaceTools: vi.fn().mockImplementation(() => ({
-          readFile: () => Promise.resolve('x'.repeat(300)),
-          writeFile: () => Promise.resolve('ok'),
-          runCommand: () => Promise.resolve('ok')
-        }))
-      }))
-
       const { execute } = makeAgent(makeSettings())
       const task = makeTask()
-      await execute('test', task)
+      const fixturePath = join(process.cwd(), 'tests/fixtures/long-tool-output.txt')
+      await mkdir(dirname(fixturePath), { recursive: true })
+      await writeFile(fixturePath, 'x'.repeat(1_000), 'utf8')
 
-      const toolStep = task.steps.find(s => s.title.includes('read_file'))
-      expect(toolStep).toBeDefined()
-      expect(toolStep!.detail.length).toBeLessThanOrEqual(180)
+      try {
+        await execute('test', task)
+      } finally {
+        await rm(fixturePath, { force: true })
+      }
+
+      const observationStep = task.steps.find(s => s.title.startsWith('Observation #') && s.title.includes('read_file'))
+      expect(observationStep).toBeDefined()
+      expect(observationStep!.detail).toHaveLength(800)
     })
   })
 })

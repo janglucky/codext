@@ -78,8 +78,9 @@ export class ReactAgent {
       messages.push({ role: 'assistant', content })
 
       const reply = this.parseReply(content)
+      const toolCalls = this.getToolCalls(reply)
       if (reply.thought) {
-        thoughtStep.detail = reply.thought
+        thoughtStep.detail = toolCalls.length ? sanitizeThoughtBeforeAction(reply.thought) : reply.thought
         this.upsertStep(task, thoughtStep, onStep)
       }
       if (reply.final) {
@@ -87,7 +88,6 @@ export class ReactAgent {
         return reply.final
       }
 
-      const toolCalls = this.getToolCalls(reply)
       if (!toolCalls.length) return content
       const actionSignature = JSON.stringify(toolCalls)
       if (actionSignature === previousActionSignature) return content
@@ -450,6 +450,14 @@ function trimTrailingPartialThoughtTag(content: string): string {
   }
 
   return content
+}
+
+function sanitizeThoughtBeforeAction(thought: string): string {
+  const completionPattern = /(?:已(?:经)?(?:成功)?(?:创建|写入|生成|完成|修改|实现|运行|确认)|(?:创建|写入|生成|修改|实现|运行)成功|任务已完成)/i
+  const segments = thought.split(/[。！？.!?\n]/)
+  const planned = segments.filter((segment) => !completionPattern.test(segment))
+  const result = planned.join('。').trim()
+  return result || '准备执行所需工具。'
 }
 
 class ReactFieldStream {

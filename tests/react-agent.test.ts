@@ -247,6 +247,30 @@ describe('ReactAgent.execute', () => {
       expect(task.result).toBeUndefined()
     })
 
+    it('removes completion claims from thought before action', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ thought: '已成功写入 HTML 文件。准备创建 CSS 文件。', action: { name: 'write_file', arguments: { path: 'style.css', content: 'body {}' } } })
+          : JSON.stringify({ final: 'done' })
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content } }] })
+        })
+      })
+
+      const snapshots: string[] = []
+      const { agent } = makeAgent(makeSettings())
+      const task = makeTask()
+      await (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: (step: { title: string; detail: string }) => void) => Promise<string> })
+        .execute('create files', basePolicy, task, [], (taskStep) => {
+          if (taskStep.title === '思考过程') snapshots.push(taskStep.detail)
+        })
+
+      expect(snapshots.at(-1)).toBe('准备创建 CSS 文件。')
+    })
+
     it('recovers write_file action when content contains raw newlines', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {

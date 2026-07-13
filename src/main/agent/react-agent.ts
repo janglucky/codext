@@ -127,6 +127,8 @@ export class ReactAgent {
       '',
       '你必须遵循 ReAct 循环：Thought -> Action -> Observation -> Thought -> ... -> Final。',
       '每一轮先输出一段可展示的简短思考过程，必须包裹在 <think>...</think> 或 <thought>...</thought> 标签中；标签内容会被实时流式展示给用户。',
+      '如果本轮需要工具，思考内容只能描述将要执行的计划和原因，必须使用“准备、将要、需要”等未完成措辞；在工具 Observation 返回前，严禁声称文件已经创建、已经写入、已经修改、已经运行、已经完成或已经确认。',
+      '只有收到对应工具的 Observation 后，下一轮 Thought 才能描述该工具确实完成的结果；不得在 Action 之前提前编造工具结果。',
       '思考标签结束后，只能输出一个 JSON 对象，不要输出 Markdown，不要包裹代码块，不要把 JSON 放进思考标签里。',
       '如果本轮输出 Action JSON，就必须立刻停止输出，等待工具 Observation；同一轮绝不能再输出 Final 或第二个 JSON 对象。',
       '当需要读取文件、写入文件或执行命令时，输出 Action JSON：',

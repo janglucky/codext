@@ -79,6 +79,21 @@ describe('ReactAgent.execute', () => {
 
   // 2. model returns content without tool_calls
   describe('no tool calls', () => {
+    it('requires unfinished wording before an action observation', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'done' }) } }] })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      await execute('inspect files', makeTask())
+
+      const request = vi.mocked(globalThis.fetch).mock.calls[0]?.[1]
+      const body = JSON.parse(String(request?.body)) as { messages: Array<{ role: string; content: string }> }
+      const systemPrompt = body.messages.find((message) => message.role === 'system')?.content ?? ''
+      expect(systemPrompt).toContain('未完成措辞')
+      expect(systemPrompt).toContain('严禁声称文件已经创建')
+    })
     beforeEach(() => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,

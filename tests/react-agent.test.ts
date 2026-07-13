@@ -232,6 +232,28 @@ describe('ReactAgent.execute', () => {
       expect(task.result).toBeUndefined()
     })
 
+    it('recovers write_file action when content contains raw newlines', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? '{"action":{"name":"write_file","arguments":{"path":"generated.txt","content":"line one\nline two"}} trailing'
+          : JSON.stringify({ final: 'file written' })
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content } }] })
+        })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await execute('write file', task)
+
+      expect(result).toBe('file written')
+      expect(callCount).toBe(2)
+      expect(task.steps.some((item) => item.title.includes('write_file'))).toBe(true)
+    })
+
     it('streams thought tags before executing tool calls', async () => {
       const encoder = new TextEncoder()
       const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')

@@ -162,7 +162,7 @@ export class ReactAgent {
         method: 'POST',
         signal: controller.signal,
         headers,
-        body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 4096, stream: true })
+        body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 16384, stream: true })
       })
 
       if (!response.ok) {
@@ -250,6 +250,8 @@ export class ReactAgent {
       const objects = this.parseJsonObjects(payload)
       const actionReply = objects.find((item) => this.getToolCalls(item).length > 0)
       if (actionReply) return this.attachThought(actionReply, thought)
+      const recoveredAction = this.recoverAction(payload)
+      if (recoveredAction) return { thought: thought || undefined, action: recoveredAction }
       const finalReply = objects.find((item) => typeof item.final === 'string')
       if (finalReply) return this.attachThought(finalReply, thought)
       return { thought: thought || undefined, final: payload || content }
@@ -302,6 +304,74 @@ export class ReactAgent {
     }
 
     return objects
+  }
+
+  private recoverAction(content: string): ToolCall | undefined {
+    const actionKey = content.indexOf('"action"')
+    if (actionKey < 0) return undefined
+    const objectStart = content.indexOf('{', actionKey)
+    if (objectStart < 0) return undefined
+    const actionObject = this.extractBalancedObject(content, objectStart)
+    if (!actionObject) return undefined
+    try {
+      const candidate = JSON.parse(this.normalizeJsonControlCharacters(actionObject)) as Partial<ToolCall>
+      if (typeof candidate.name !== 'string' || !isToolName(candidate.name)) return undefined
+      if (!candidate.arguments || typeof candidate.arguments !== 'object') return undefined
+      return candidate as ToolCall
+    } catch {
+      return undefined
+    }
+  }
+
+  private normalizeJsonControlCharacters(content: string): string {
+    let result = ''
+    let inString = false
+    let escaped = false
+    for (const char of content) {
+      if (inString) {
+        if (escaped) {
+          result += char
+          escaped = false
+        } else if (char === String.fromCharCode(92)) {
+          result += char
+          escaped = true
+        } else if (char === '"') {
+          result += char
+          inString = false
+        } else if (char === '\n') result += '\\n'
+        else if (char === '\r') result += '\\r'
+        else if (char === '\t') result += '\\t'
+        else result += char
+      } else {
+        result += char
+        if (char === '"') inString = true
+      }
+    }
+    return result
+  }
+
+  private extractBalancedObject(content: string, start: number): string | undefined {
+    let depth = 0
+    let inString = false
+    let escaped = false
+    const backslash = String.fromCharCode(92)
+    for (let index = start; index < content.length; index++) {
+      const char = content[index]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (char === backslash) escaped = true
+        else if (char === '"') inString = false
+        continue
+      }
+      if (char === '"') {
+        inString = true
+        continue
+      }
+      if (char === '{') depth++
+      else if (char === '}') depth--
+      if (depth === 0) return content.slice(start, index + 1)
+    }
+    return undefined
   }
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {

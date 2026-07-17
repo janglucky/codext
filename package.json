@@ -19,12 +19,20 @@
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@xmldom/xmldom": "^0.9.10",
+    "fflate": "^0.8.3",
+    "officeparser": "^7.3.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@electron-toolkit/tsconfig": "1.0.1",
     "@eslint/js": "9.30.1",
+    "@types/express": "^5.0.6",
     "@types/node": "22.15.32",
     "@types/react": "19.1.8",
     "@types/react-dom": "19.1.6",
@@ -34,6 +42,7 @@
     "electron-vite": "3.1.0",
     "eslint": "9.30.1",
     "jsdom": "26.1.0",
+    "officegen": "^0.6.5",
     "typescript": "5.8.3",
     "typescript-eslint": "8.35.0",
     "vite": "6.3.5",

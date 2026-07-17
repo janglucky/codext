@@ -1,7 +1,21 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
-import type { AgentPolicy, AppSettings, ChatMessage, Conversation, TaskStatus, TaskStep } from '../../shared/types'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import type { AgentPolicy, AppSettings, ChatAttachment, ChatMessage, Conversation, McpApprovalRequest, TaskStatus, TaskStep, UserChoiceRequest } from '../../shared/types'
+import {
+  ATTACHMENT_ACCEPT,
+  inferAttachmentMimeType,
+  isImageAttachmentType,
+  isOfficeAttachmentType,
+  isSupportedAttachmentType,
+  MAX_ATTACHMENT_COUNT,
+  MAX_IMAGE_ATTACHMENT_SIZE,
+  MAX_OFFICE_ATTACHMENT_SIZE,
+  MAX_TEXT_ATTACHMENT_SIZE,
+  MAX_TOTAL_ATTACHMENT_SIZE
+} from '../../shared/attachments'
 
-type IconName = 'panel' | 'chevron-left' | 'chevron-right' | 'message' | 'search' | 'skills' | 'clock' | 'folder' | 'settings' | 'plus' | 'shield' | 'chevron-down' | 'send' | 'monitor' | 'branch' | 'search-small' | 'check' | 'trash'
+type IconName = 'panel' | 'chevron-left' | 'chevron-right' | 'message' | 'search' | 'skills' | 'clock' | 'folder' | 'settings' | 'plus' | 'shield' | 'chevron-down' | 'send' | 'pause' | 'monitor' | 'branch' | 'search-small' | 'check' | 'trash' | 'file' | 'close'
 type IconProps = SVGProps<SVGSVGElement> & { name: IconName }
 
 const paths: Record<IconName, ReactElement> = {
@@ -18,21 +32,24 @@ const paths: Record<IconName, ReactElement> = {
   shield: <path d="M12 3 19 6v5c0 4.3-2.7 7.7-7 10-4.3-2.3-7-5.7-7-10V6z" />,
   'chevron-down': <path d="m7 10 5 5 5-5" />,
   send: <path d="m5 12 14-7-4 14-3-5zM12 12l3-3" />,
+  pause: <><rect x="7" y="6" width="3" height="12" rx="1" fill="currentColor" stroke="none" /><rect x="14" y="6" width="3" height="12" rx="1" fill="currentColor" stroke="none" /></>,
   monitor: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
   branch: <><path d="M6 3v12" /><circle cx="6" cy="3" r="2" /><circle cx="6" cy="15" r="2" /><circle cx="18" cy="7" r="2" /><path d="M8 15c6 0 2-8 8-8" /></>,
   'search-small': <><circle cx="11" cy="11" r="6" /><path d="m20 20-4-4" /></>,
   check: <path d="m5 12 4 4L19 6" />,
-  trash: <><path d="M4 7h16" /><path d="M10 11v6M14 11v6" /><path d="M6 7l1 14h10l1-14" /><path d="M9 7V4h6v3" /></>
+  trash: <><path d="M4 7h16" /><path d="M10 11v6M14 11v6" /><path d="M6 7l1 14h10l1-14" /><path d="M9 7V4h6v3" /></>,
+  file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /></>,
+  close: <><path d="m7 7 10 10" /><path d="M17 7 7 17" /></>
 }
 
-const initialSettings: AppSettings = { model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 }, mcpUrl: '', skillsEnabled: true }
-const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败' }
+const initialSettings: AppSettings = { model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 }, skillsEnabled: true }
+const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败', paused: '已暂停' }
 const THINKING_TITLE = '思考过程'
 const THINKING_PLACEHOLDER = '思考中…'
 const LOCAL_ASSISTANT_PREFIX = 'local-agent-'
 const LOCAL_STEP_PREFIX = 'local-step-'
 type View = 'chat' | 'settings'
-type SettingTab = '常规' | '外观' | '配置' | '个性化' | 'MCP 服务器' | '浏览器' | 'Git' | '环境'
+type SettingTab = '常规' | '外观' | '配置' | '个性化' | '浏览器' | 'Git' | '环境'
 
 function Icon({ name, ...props }: IconProps): ReactElement {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{paths[name]}</svg>
@@ -40,18 +57,34 @@ function Icon({ name, ...props }: IconProps): ReactElement {
 
 export function App(): ReactElement {
   const [prompt, setPrompt] = useState('')
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([])
+  const [attachmentError, setAttachmentError] = useState('')
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false)
+  const [previewAttachment, setPreviewAttachment] = useState<ChatAttachment | undefined>()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState('')
   const [settings, setSettings] = useState<AppSettings>(initialSettings)
   const [policy, setPolicy] = useState<AgentPolicy | undefined>()
   const [running, setRunning] = useState(false)
+  const [pauseRequested, setPauseRequested] = useState(false)
+  const [mcpApproval, setMcpApproval] = useState<McpApprovalRequest | undefined>()
+  const [userChoice, setUserChoice] = useState<UserChoiceRequest | undefined>()
+  const [selectedChoiceId, setSelectedChoiceId] = useState('')
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const [view, setView] = useState<View>('chat')
   const [tab, setTab] = useState<SettingTab>('常规')
   const messageListRef = useRef<HTMLElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const attachmentsRef = useRef<ChatAttachment[]>([])
+  const activeAttachmentsRef = useRef<ChatAttachment[]>([])
+  const pendingAttachmentReadsRef = useRef<Promise<void> | null>(null)
+  const runningConversationIdRef = useRef('')
 
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
-  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.steps?.length ?? 0].join(':')).join('|') ?? '', [activeConversation])
+  const activeWorkspacePath = activeConversation?.workspacePath || policy?.workspacePath || ''
+  const activeAttachments = activeConversation?.activeAttachments ?? []
+  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0].join(':')).join('|') ?? '', [activeConversation])
 
   useEffect(() => {
     void Promise.all([window.api.getConversations(), window.api.getSettings(), window.api.getPolicy()]).then(([savedConversations, savedSettings, savedPolicy]) => {
@@ -96,6 +129,9 @@ export function App(): ReactElement {
 
   useEffect(() => {
     return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt }) => {
+      setMcpApproval(undefined)
+      setUserChoice(undefined)
+      setSelectedChoiceId('')
       setConversations((current) => current.map((conversation) => {
         if (conversation.id !== conversationId) return conversation
         return {
@@ -106,19 +142,142 @@ export function App(): ReactElement {
     })
   }, [])
 
+  useEffect(() => window.api.onMcpApprovalRequest((request) => {
+    setMcpApproval(request)
+    if (request.conversationId) setActiveId(request.conversationId)
+    setView('chat')
+  }), [])
+
+  useEffect(() => window.api.onUserChoiceRequest((request) => {
+    setUserChoice(request)
+    setSelectedChoiceId('')
+    if (request.conversationId) setActiveId(request.conversationId)
+    setView('chat')
+  }), [])
+
+  useEffect(() => {
+    if (!mcpApproval) return
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') respondToMcpApproval(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [mcpApproval])
+
   useEffect(() => {
     const list = messageListRef.current
     if (!list) return
     list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' })
-  }, [activeConversation?.id, scrollKey])
+  }, [activeConversation?.id, scrollKey, mcpApproval?.id, userChoice?.id])
+
+  useEffect(() => {
+    if (!previewAttachment) return
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setPreviewAttachment(undefined)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [previewAttachment])
+
+  useEffect(() => {
+    attachmentsRef.current = []
+    setAttachments([])
+    setAttachmentError('')
+    setWorkspaceMenuOpen(false)
+  }, [activeId])
+
+  useEffect(() => {
+    activeAttachmentsRef.current = activeAttachments
+  }, [activeAttachments])
+
+  function queueFiles(files: File[]): void {
+    if (!files.length) return
+    setAttachmentsLoading(true)
+    const previous = pendingAttachmentReadsRef.current ?? Promise.resolve()
+    const operation = previous.then(() => addFiles(files))
+    pendingAttachmentReadsRef.current = operation
+    void operation.then(() => {
+      if (pendingAttachmentReadsRef.current !== operation) return
+      pendingAttachmentReadsRef.current = null
+      setAttachmentsLoading(false)
+    }, () => {
+      if (pendingAttachmentReadsRef.current !== operation) return
+      pendingAttachmentReadsRef.current = null
+      setAttachmentsLoading(false)
+    })
+  }
+
+  async function addFiles(files: File[]): Promise<void> {
+    if (!files.length) return
+    const errors: string[] = []
+    const remainingCount = MAX_ATTACHMENT_COUNT - activeAttachmentsRef.current.length - attachmentsRef.current.length
+    const selectedFiles = files.slice(0, Math.max(0, remainingCount))
+    if (files.length > remainingCount) errors.push('附件最多只能添加 ' + MAX_ATTACHMENT_COUNT + ' 个')
+
+    let totalSize = [...activeAttachmentsRef.current, ...attachmentsRef.current].reduce((sum, attachment) => sum + attachment.size, 0)
+    const readableFiles = selectedFiles.filter((file) => {
+      const mimeType = inferAttachmentMimeType(file.type, file.name)
+      if (!isSupportedAttachmentType(mimeType, file.name)) {
+        errors.push('不支持的文件类型：' + file.name)
+        return false
+      }
+      const maxSize = isImageAttachmentType(mimeType)
+        ? MAX_IMAGE_ATTACHMENT_SIZE
+        : isOfficeAttachmentType(mimeType, file.name)
+          ? MAX_OFFICE_ATTACHMENT_SIZE
+          : MAX_TEXT_ATTACHMENT_SIZE
+      if (file.size <= 0 || file.size > maxSize) {
+        errors.push(file.name + ' 超出 ' + formatBytes(maxSize) + ' 限制')
+        return false
+      }
+      if (totalSize + file.size > MAX_TOTAL_ATTACHMENT_SIZE) {
+        errors.push('附件总大小不能超过 ' + formatBytes(MAX_TOTAL_ATTACHMENT_SIZE))
+        return false
+      }
+      totalSize += file.size
+      return true
+    })
+
+    const results = await Promise.allSettled(readableFiles.map((file) => readAttachment(file)))
+    const nextAttachments: ChatAttachment[] = []
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') nextAttachments.push(result.value)
+      else errors.push('无法读取文件：' + readableFiles[index].name)
+    })
+    if (nextAttachments.length) {
+      const mergedAttachments = [...attachmentsRef.current, ...nextAttachments].slice(0, MAX_ATTACHMENT_COUNT)
+      attachmentsRef.current = mergedAttachments
+      setAttachments(mergedAttachments)
+    }
+    setAttachmentError(errors.join('；'))
+  }
+
+  function removeAttachment(id: string): void {
+    const remainingAttachments = attachmentsRef.current.filter((attachment) => attachment.id !== id)
+    attachmentsRef.current = remainingAttachments
+    setAttachments(remainingAttachments)
+    setAttachmentError('')
+  }
 
   async function submit(event: FormEvent): Promise<void> {
     event.preventDefault()
-    if (!prompt.trim() || running || !activeConversation) return
+    if (running || !activeConversation) return
+    if (pendingAttachmentReadsRef.current) await pendingAttachmentReadsRef.current
+    const currentAttachments = attachmentsRef.current
+    const retainedAttachments = activeAttachmentsRef.current
+    const effectiveAttachments = [...retainedAttachments, ...currentAttachments.filter((attachment) => !retainedAttachments.some((active) => active.id === attachment.id))]
+    if (!prompt.trim() && !effectiveAttachments.length) return
     const submittedPrompt = prompt.trim()
+    const submittedAttachments = currentAttachments
     const conversationId = activeConversation.id
     const createdAt = new Date().toISOString()
-    const optimisticMessage: ChatMessage = { id: 'local-' + crypto.randomUUID(), role: 'user', content: submittedPrompt, createdAt }
+    const optimisticMessage: ChatMessage = {
+      id: 'local-' + crypto.randomUUID(),
+      role: 'user',
+      content: submittedPrompt,
+      attachments: submittedAttachments.length ? submittedAttachments : undefined,
+      createdAt
+    }
     const pendingAssistant: ChatMessage = {
       id: LOCAL_ASSISTANT_PREFIX + crypto.randomUUID(),
       role: 'assistant',
@@ -128,24 +287,38 @@ export function App(): ReactElement {
       steps: [createThinkingStep()]
     }
     setPrompt('')
+    attachmentsRef.current = []
+    setAttachments([])
+    setAttachmentError('')
     setActiveId(conversationId)
     setConversations((current) => current.map((conversation) => {
       if (conversation.id !== conversationId) return conversation
       return {
         ...conversation,
-        title: conversation.title === '新对话' ? submittedPrompt.slice(0, 28) || '新对话' : conversation.title,
+        title: conversation.title === '新对话' ? submittedPrompt.slice(0, 28) || effectiveAttachments[0]?.name.slice(0, 28) || '新对话' : conversation.title,
         updatedAt: createdAt,
+        activeAttachments: effectiveAttachments.length ? effectiveAttachments : undefined,
         messages: [...conversation.messages, optimisticMessage, pendingAssistant]
       }
     }))
     setRunning(true)
+    setPauseRequested(false)
+    runningConversationIdRef.current = conversationId
     try {
-      const result = await window.api.runTask(conversationId, submittedPrompt)
+      const result = await window.api.runTask(conversationId, submittedPrompt, submittedAttachments)
       setConversations((current) => [result.conversation, ...current.filter((item) => item.id !== result.conversation.id)])
       setActiveId(result.conversation.id)
     } finally {
       setRunning(false)
+      setPauseRequested(false)
+      runningConversationIdRef.current = ''
     }
+  }
+
+  function pauseTask(): void {
+    if (!running || pauseRequested || !runningConversationIdRef.current) return
+    setPauseRequested(true)
+    window.api.cancelTask(runningConversationIdRef.current)
   }
 
   async function createConversation(): Promise<void> {
@@ -160,12 +333,41 @@ export function App(): ReactElement {
     if (conversationId === activeId) setActiveId(next[0]?.id ?? '')
   }
 
+  async function selectWorkspace(): Promise<void> {
+    if (!activeConversation || running) return
+    const conversation = await window.api.selectConversationWorkspace(activeConversation.id)
+    setConversations((current) => [conversation, ...current.filter((item) => item.id !== conversation.id)])
+    setWorkspaceMenuOpen(false)
+  }
+
+  async function resetWorkspace(): Promise<void> {
+    if (!activeConversation || running) return
+    const conversation = await window.api.resetConversationWorkspace(activeConversation.id)
+    setConversations((current) => [conversation, ...current.filter((item) => item.id !== conversation.id)])
+    setWorkspaceMenuOpen(false)
+  }
+
   async function saveSettings(): Promise<void> {
     await window.api.saveSettings(settings)
     if (policy) await window.api.savePolicy(policy)
   }
 
-  if (view === 'settings' && policy) return <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => setView('chat')} onSave={() => void saveSettings()} />
+  function respondToMcpApproval(approved: boolean): void {
+    if (!mcpApproval) return
+    window.api.respondMcpApproval(mcpApproval.id, approved)
+    setMcpApproval(undefined)
+  }
+
+  function confirmUserChoice(): void {
+    if (!userChoice || !selectedChoiceId) return
+    window.api.respondUserChoice(userChoice.id, selectedChoiceId)
+    setUserChoice(undefined)
+    setSelectedChoiceId('')
+  }
+
+  if (view === 'settings' && policy) return <>
+    <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => setView('chat')} onSave={() => void saveSettings()} />
+  </>
 
   return <div className="chat-app">
     <header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span><div className="bar-spacer" /><button className="top-settings" onClick={() => setView('settings')}><Icon name="settings" />设置</button></header>
@@ -175,10 +377,42 @@ export function App(): ReactElement {
       <button className="sidebar-settings" onClick={() => setView('settings')}><Icon name="settings" /><span>设置</span></button>
     </aside>
     <main className="chat-main">
-      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} message={message} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}</section>
-      <form className="chat-composer" onSubmit={submit}><textarea aria-label="向 Agent 描述任务" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="输入任务，Enter 发送，Shift+Enter 换行" /><div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加上下文"><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button className="send" disabled={running} aria-label="发送任务"><Icon name={running ? 'clock' : 'send'} /></button></div><footer><span><Icon name="folder" />codext-agent<Icon name="chevron-down" /></span><span><Icon name="monitor" />本地模式<Icon name="chevron-down" /></span><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer></form>
+      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
+      <form className="chat-composer" onSubmit={submit}>
+        <input ref={fileInputRef} className="attachment-input" type="file" accept={ATTACHMENT_ACCEPT} multiple onChange={(event) => { queueFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = '' }} />
+        {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onRemove={() => removeAttachment(attachment.id)} onPreview={() => setPreviewAttachment(attachment)} />)}</div> : null}
+        <textarea aria-label="向 Agent 描述任务" value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => { const files = getClipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); queueFiles(files) } }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="输入任务，或直接粘贴截图；Enter 发送，Shift+Enter 换行" />
+        {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
+        {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
+        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}><Icon name={running ? 'pause' : 'send'} /></button></div>
+        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => setWorkspaceMenuOpen((open) => !open)}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><span><Icon name="monitor" />本地模式<Icon name="chevron-down" /></span><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
+      </form>
+      {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
   </div>
+}
+
+function McpApprovalMessage({ request, onRespond }: { request: McpApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
+  return <article className="message-item assistant mcp-approval-message" role="group" aria-labelledby="mcp-approval-title">
+    <div className="message-meta"><span>Codext Agent</span><b className="run-status mcp-waiting">等待授权</b></div>
+    <section className="mcp-approval-inline">
+      <div className="mcp-approval-heading"><span className="mcp-approval-icon"><Icon name="shield" /></span><div><h2 id="mcp-approval-title">PPT MCP 请求授权</h2><p>Agent 准备通过本地 PPT 处理服务读取演示文稿。</p></div></div>
+      <dl className="mcp-approval-details"><div><dt>工具</dt><dd>{toolDisplayName(request.toolName)}</dd></div>{request.workspacePath ? <div><dt>工作区</dt><dd>{request.workspacePath}</dd></div> : null}{request.path ? <div><dt>文件</dt><dd>{request.path}</dd></div> : null}<div><dt>服务</dt><dd>{request.serverUrl}</dd></div></dl>
+      <div className="mcp-approval-footer"><span>仅授权本次调用</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>取消</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>允许一次</button></div></div>
+    </section>
+  </article>
+}
+
+function UserChoiceMessage({ request, selectedId, onSelect, onConfirm }: { request: UserChoiceRequest; selectedId: string; onSelect: (id: string) => void; onConfirm: () => void }): ReactElement {
+  return <article className="message-item assistant user-choice-message" role="group" aria-labelledby="user-choice-title">
+    <div className="message-meta"><span>Codext Agent</span><b className="run-status choice-waiting">等待选择</b></div>
+    <section className="user-choice-inline">
+      <h2 id="user-choice-title">{request.title}</h2>
+      {request.description ? <p>{request.description}</p> : null}
+      <div className="user-choice-options">{request.options.map((option) => <label key={option.id} className={selectedId === option.id ? 'selected' : ''}><input type="radio" name={'choice-' + request.id} value={option.id} checked={selectedId === option.id} onChange={() => onSelect(option.id)} /><span><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span></label>)}</div>
+      <div className="user-choice-actions"><button type="button" disabled={!selectedId} onClick={onConfirm}>确认选择</button></div>
+    </section>
+  </article>
 }
 
 function upsertStep<T extends { id: string }>(steps: T[], nextStep: T): T[] {
@@ -222,13 +456,62 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
   return upsertStep(currentSteps, nextStep)
 }
 
-function MessageView({ message }: { message: ChatMessage }): ReactElement {
+function MessageView({ message, onPreview }: { message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
   return <article className={'message-item ' + message.role}>
     <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
     {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
-    {message.content ? <div className="message-bubble">{message.content}</div> : null}
+    <div className="message-content-group">
+      {message.content ? message.role === 'assistant'
+        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div>
+        : <div className="message-bubble">{message.content}</div> : null}
+      {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onPreview={() => onPreview(attachment)} />)}</div> : null}
+    </div>
   </article>
+}
+
+function AttachmentCard({ attachment, onRemove, onPreview }: { attachment: ChatAttachment; onRemove?: () => void; onPreview?: () => void }): ReactElement {
+  const isImage = isImageAttachmentType(attachment.mimeType)
+  return <div className={'attachment-card ' + (isImage ? 'image' : 'file')} title={attachment.name}>
+    {isImage ? <button type="button" className="attachment-image-button" aria-label={'查看原图 ' + attachment.name} onClick={onPreview}><img src={attachment.dataUrl} alt={attachment.name} /></button> : <div className="attachment-file-icon"><Icon name="file" /></div>}
+    {!isImage ? <div className="attachment-file-meta"><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)}</small></div> : <span className="attachment-image-name">{attachment.name}</span>}
+    {onRemove ? <button type="button" className="attachment-remove" aria-label={'移除附件 ' + attachment.name} onClick={onRemove}><Icon name="close" /></button> : null}
+  </div>
+}
+
+function readAttachment(file: File): Promise<ChatAttachment> {
+  const mimeType = inferAttachmentMimeType(file.type, file.name)
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error ?? new Error('无法读取附件'))
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('无法读取附件'))
+        return
+      }
+      resolve({ id: crypto.randomUUID(), name: file.name || 'clipboard-image.png', mimeType, size: file.size, dataUrl: reader.result })
+    }
+    reader.readAsDataURL(new Blob([file], { type: mimeType }))
+  })
+}
+
+function getClipboardFiles(clipboardData: DataTransfer): File[] {
+  const itemFiles = Array.from(clipboardData.items)
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null)
+  return itemFiles.length ? itemFiles : Array.from(clipboardData.files)
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) return size + ' B'
+  if (size < 1024 * 1024) return Math.ceil(size / 1024) + ' KB'
+  return (size / (1024 * 1024)).toFixed(1) + ' MB'
+}
+
+function workspaceLabel(workspacePath: string): string {
+  const normalized = workspacePath.replace(/[\\/]+$/, '')
+  return normalized.split(/[\\/]/).at(-1) || '工作区'
 }
 
 function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
@@ -284,6 +567,10 @@ function getToolName(taskStep: TaskStep): string {
   return taskStep.title.replace(/^正在执行工具：/, '').trim()
 }
 
+function toolDisplayName(name: string): string {
+  return name === 'parse_powerpoint' ? '解析 PowerPoint' : name
+}
+
 function useNow(enabled: boolean): number {
   const [now, setNow] = useState(Date.now())
 
@@ -312,9 +599,9 @@ function formatElapsed(durationMs: number): string {
 }
 
 function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => void }): ReactElement {
-  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['MCP 服务器', '浏览器'] }, { title: '编码', tabs: ['Git', '环境'] }]
+  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['浏览器'] }, { title: '编码', tabs: ['Git', '环境'] }]
   const isGeneral = tab === '常规'
-  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'MCP 服务器' ? 'skills' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
+  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
@@ -326,7 +613,17 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | undefined>()
   async function save(): Promise<void> { setSaving(true); setNotice(undefined); try { onSave(); await new Promise((resolve) => setTimeout(resolve, 420)); setNotice({ type: 'success', text: '配置已保存到本地。' }) } catch { setNotice({ type: 'error', text: '保存失败，请重试。' }) } finally { setSaving(false) } }
   async function test(): Promise<void> { setTesting(true); setNotice(undefined); try { const result = await window.api.testConnection(settings); setNotice({ type: result.ok ? 'success' : 'error', text: result.message }) } finally { setTesting(false) } }
-  const toolLabels: Record<string, string> = { read_file: '读取文件', write_file: '写入文件', run_command: '执行命令行' }
+  const toolLabels: Record<string, string> = {
+    read_file: '读取文件',
+    write_file: '写入文件',
+    create_directory: '创建目录',
+    list_files: '列举文件',
+    decrypt_file: '文件解密',
+    parse_word: '解析 Word',
+    parse_excel: '解析 Excel',
+    parse_powerpoint: '解析 PowerPoint',
+    run_command: '执行命令行'
+  }
   function toggleTool(name: string): void { setPolicy({ ...policy, enabledTools: policy.enabledTools.includes(name) ? policy.enabledTools.filter((item) => item !== name) : [...policy.enabledTools, name] }) }
 
   return <div className="settings-inner">
@@ -337,7 +634,6 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
       <label>接口地址<input value={settings.model.baseUrl} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, baseUrl: event.target.value } })} placeholder="https://api.openai.com/v1" /></label>
       <label>模型名称<input value={settings.model.model} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, model: event.target.value } })} placeholder="gpt-4.1-mini" /></label>
       <label>API Key <small className="optional-field">（可选）</small><input type="password" value={settings.model.apiKey} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, apiKey: event.target.value } })} placeholder="无需鉴权的自定义接口可留空" /></label>
-      <label>MCP 地址<input value={settings.mcpUrl} onChange={(event) => setSettings({ ...settings, mcpUrl: event.target.value })} placeholder="可选" /></label>
     </section>
     <section className="settings-section compact">
       <h2>系统提示词</h2>

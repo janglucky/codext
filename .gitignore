@@ -4,3 +4,4 @@ release/
 dist/
 snake-game/
 *.log
+.codext-attachments/

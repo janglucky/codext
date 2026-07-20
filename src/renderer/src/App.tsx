@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { Check, Copy, Eye, EyeOff } from 'lucide-react'
 import type { AgentPolicy, AppSettings, ChatAttachment, ChatMessage, Conversation, McpApprovalRequest, TaskStatus, TaskStep, UserChoiceRequest } from '../../shared/types'
 import {
   ATTACHMENT_ACCEPT,
@@ -610,9 +611,20 @@ function SettingRow({ title, description, checked, onChange }: { title: string; 
 function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => void }): ReactElement {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [apiKeyVisible, setApiKeyVisible] = useState(false)
+  const [apiKeyCopied, setApiKeyCopied] = useState(false)
+  const copyResetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | undefined>()
+  useEffect(() => () => { if (copyResetTimer.current) clearTimeout(copyResetTimer.current) }, [])
   async function save(): Promise<void> { setSaving(true); setNotice(undefined); try { onSave(); await new Promise((resolve) => setTimeout(resolve, 420)); setNotice({ type: 'success', text: '配置已保存到本地。' }) } catch { setNotice({ type: 'error', text: '保存失败，请重试。' }) } finally { setSaving(false) } }
   async function test(): Promise<void> { setTesting(true); setNotice(undefined); try { const result = await window.api.testConnection(settings); setNotice({ type: result.ok ? 'success' : 'error', text: result.message }) } finally { setTesting(false) } }
+  function copyApiKey(): void {
+    if (!settings.model.apiKey) return
+    window.api.copyText(settings.model.apiKey)
+    setApiKeyCopied(true)
+    if (copyResetTimer.current) clearTimeout(copyResetTimer.current)
+    copyResetTimer.current = setTimeout(() => setApiKeyCopied(false), 1600)
+  }
   const toolLabels: Record<string, string> = {
     read_file: '读取文件',
     write_file: '写入文件',
@@ -633,7 +645,16 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
       <p>这些配置保存在本地，用于 OpenAI 兼容接口调用。</p>
       <label>接口地址<input value={settings.model.baseUrl} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, baseUrl: event.target.value } })} placeholder="https://api.openai.com/v1" /></label>
       <label>模型名称<input value={settings.model.model} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, model: event.target.value } })} placeholder="gpt-4.1-mini" /></label>
-      <label>API Key <small className="optional-field">（可选）</small><input type="password" value={settings.model.apiKey} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, apiKey: event.target.value } })} placeholder="无需鉴权的自定义接口可留空" /></label>
+      <div className="api-key-field">
+        <label htmlFor="model-api-key">API Key <small className="optional-field">（可选）</small></label>
+        <div className="api-key-input">
+          <input id="model-api-key" type={apiKeyVisible ? 'text' : 'password'} value={settings.model.apiKey} onChange={(event) => { setApiKeyCopied(false); setSettings({ ...settings, model: { ...settings.model, apiKey: event.target.value } }) }} placeholder="无需鉴权的自定义接口可留空" autoComplete="off" spellCheck={false} />
+          <div className="api-key-actions">
+            <button type="button" className="api-key-action" disabled={!settings.model.apiKey} aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} aria-pressed={apiKeyVisible} title={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} onClick={() => setApiKeyVisible((visible) => !visible)}>{apiKeyVisible ? <EyeOff /> : <Eye />}</button>
+            <button type="button" className={'api-key-action ' + (apiKeyCopied ? 'copied' : '')} disabled={!settings.model.apiKey} aria-label={apiKeyCopied ? 'API Key 已复制' : '复制 API Key'} title={apiKeyCopied ? '已复制' : '复制 API Key'} onClick={copyApiKey}>{apiKeyCopied ? <Check /> : <Copy />}</button>
+          </div>
+        </div>
+      </div>
     </section>
     <section className="settings-section compact">
       <h2>系统提示词</h2>

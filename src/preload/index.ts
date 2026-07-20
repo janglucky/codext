@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { clipboard, contextBridge, ipcRenderer } from 'electron'
 import type { AgentPolicy, AppSettings, DesktopApi } from '../shared/types'
 
 const api: DesktopApi = {
@@ -15,6 +15,7 @@ const api: DesktopApi = {
   testConnection: (settings: AppSettings) => ipcRenderer.invoke('settings:test-connection', settings),
   getPolicy: () => ipcRenderer.invoke('policy:get'),
   savePolicy: (policy: AgentPolicy) => ipcRenderer.invoke('policy:save', policy),
+  copyText: (text) => clipboard.writeText(text),
   onAgentStep: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)
     ipcRenderer.on('agent:step', listener)

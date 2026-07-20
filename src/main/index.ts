@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
-import { join, resolve } from 'node:path'
+import { mkdir } from 'node:fs/promises'
+import { isAbsolute, join, resolve } from 'node:path'
 import { is } from '@electron-toolkit/utils'
 import { ReactAgent } from './agent/react-agent'
 import type { AppSettings, ChatAttachment, ChatMessage, Conversation } from '../shared/types'
@@ -99,7 +100,22 @@ app.whenReady().then(async () => {
     }, (delta) => {
       assistantMessage.content += delta
       event.sender.send('agent:delta', { conversationId, messageId: assistantMessage.id, delta })
-    }, normalizedAttachments, (request) => mcpApprovalManager.request(event.sender, { ...request, conversationId }), controller.signal, workspacePath, (request) => userChoiceManager.request(event.sender, { ...request, conversationId }))
+    }, normalizedAttachments, (request) => mcpApprovalManager.request(event.sender, { ...request, conversationId }), controller.signal, workspacePath, async (request) => {
+      const optionId = await userChoiceManager.request(event.sender, { ...request, conversationId })
+      const selectedOption = request.options.find((option) => option.id === optionId)
+      if (!selectedOption?.workspacePath?.trim()) return optionId
+
+      const requestedPath = selectedOption.workspacePath.trim()
+      if (!isAbsolute(requestedPath)) throw new Error('切换会话工作区时必须使用绝对路径。')
+      const selectedPath = resolve(requestedPath)
+      const conversation = store.getConversation(conversationId)
+      const sourcePath = effectiveWorkspacePath(conversation)
+      await mkdir(selectedPath, { recursive: true })
+      await copyConversationAttachments(conversation, sourcePath, selectedPath)
+      const globalPath = resolve(store.getPolicy().workspacePath)
+      const updated = await store.setConversationWorkspace(conversationId, workspaceKey(selectedPath) === workspaceKey(globalPath) ? undefined : selectedPath)
+      return { optionId, workspacePath: effectiveWorkspacePath(updated) }
+    })
     assistantMessage.content = task.status === 'paused' && assistantMessage.content.trim()
       ? assistantMessage.content.trimEnd() + '\n\n[已暂停]'
       : task.result ?? task.error ?? ''

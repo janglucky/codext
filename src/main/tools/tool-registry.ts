@@ -120,12 +120,12 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   run_command: {
     name: 'run_command',
     description: '在工作区目录下执行安全的命令行程序，并返回 stdout/stderr。',
-    whenToUse: '需要运行测试、构建或执行非破坏性工程命令时调用。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机或修改注册表。',
+    whenToUse: '需要运行测试、构建或执行非破坏性工程命令时调用。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机或修改注册表。',
     inputSchema: {
       type: 'object',
       required: ['command'],
       properties: {
-        command: { type: 'string', description: '可执行文件名，例如 npm、node、git。不要传整段 shell 字符串。' },
+        command: { type: 'string', description: '可执行文件名，例如 npm、node、git。调用 Node 包管理器时固定传 npm 或 npx，不要传 npm.cmd、npm。cmd 等 Windows 启动名，宿主会自动解析。不要传整段 shell 字符串。' },
         args: { type: 'array', items: { type: 'string' }, description: '命令参数数组，例如 ["run", "build"]。' }
       }
     },

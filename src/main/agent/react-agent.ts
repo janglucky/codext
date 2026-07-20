@@ -5,7 +5,7 @@ import { getEnabledToolDefinitions, isToolName, type ToolCall } from '../tools/t
 import { parseOfficeDocument, type OfficeDocumentKind } from '../tools/office-parser'
 import { PptMcpClient } from '../ppt/ppt-mcp-client'
 
-const MAX_REACT_TURNS = 20
+const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
 
 const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep => ({
@@ -37,10 +37,16 @@ type ConversationMessage = { role: 'user' | 'assistant'; content: string; attach
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
 type McpApprovalCallback = (request: McpApprovalDetails) => Promise<boolean>
-type UserChoiceCallback = (request: UserChoiceDetails) => Promise<string | undefined>
+type UserChoiceSelection = string | { optionId?: string; workspacePath?: string }
+type UserChoiceCallback = (request: UserChoiceDetails) => Promise<UserChoiceSelection | undefined>
 
 export class ReactAgent {
-  constructor(private readonly getSettings: () => AppSettings, private readonly getPolicy: () => AgentPolicy, private readonly getPptMcpUrl: () => string = () => '') {}
+  constructor(
+    private readonly getSettings: () => AppSettings,
+    private readonly getPolicy: () => AgentPolicy,
+    private readonly getPptMcpUrl: () => string = () => '',
+    private readonly maxReactTurns = MAX_REACT_TURNS
+  ) {}
 
   async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback): Promise<AgentTask> {
     const task: AgentTask = { id: crypto.randomUUID(), prompt, status: 'reasoning', createdAt: new Date().toISOString(), steps: [] }
@@ -69,7 +75,8 @@ export class ReactAgent {
       return this.demoResponse(prompt, policy)
     }
 
-    const tools = new WorkspaceTools(policy.workspacePath)
+    let currentPolicy = policy
+    let tools = new WorkspaceTools(currentPolicy.workspacePath)
     const allAttachments = [...attachments, ...history.flatMap((message) => message.attachments ?? [])]
     const pendingDecryptPaths = new Set(allAttachments
       .filter((attachment) => attachment.workspacePath && isDecryptableAttachmentName(attachment.name) && looksLikeEncryptedTextAttachment(attachment))
@@ -77,10 +84,10 @@ export class ReactAgent {
     const pendingOfficeParses = new Map<string, OfficeAttachmentTool>()
     for (const attachment of allAttachments) {
       const toolName = officeAttachmentTool(attachment.name)
-      if (attachment.workspacePath && toolName && policy.enabledTools.includes(toolName)) pendingOfficeParses.set(attachment.workspacePath, toolName)
+      if (attachment.workspacePath && toolName && currentPolicy.enabledTools.includes(toolName)) pendingOfficeParses.set(attachment.workspacePath, toolName)
     }
     const messages: ModelMessage[] = [
-      { role: 'system', content: this.buildSystemPrompt(policy) },
+      { role: 'system', content: this.buildSystemPrompt(currentPolicy) },
       ...history
         .filter((message) => message.content.trim() || message.attachments?.length)
         .slice(-12)
@@ -92,9 +99,10 @@ export class ReactAgent {
     ]
     let previousActionSignature = ''
     let previousActionHadError = false
+    let unresolvedCommandFailure = false
     const deniedMcpPaths = new Set<string>()
 
-    for (let turn = 1; turn <= MAX_REACT_TURNS; turn++) {
+    for (let turn = 1; turn <= this.maxReactTurns + 1; turn++) {
       throwIfAborted(signal)
       const thoughtStep = step('reason', '思考过程', '')
       const stream = new ReactFieldStream(
@@ -112,6 +120,9 @@ export class ReactAgent {
         ? inferOfficeToolCall(prompt, reply, pendingOfficeParses)
         : undefined
       if (implicitOfficeCall) toolCalls = [implicitOfficeCall]
+      if (turn > this.maxReactTurns && toolCalls.length) {
+        throw new Error('ReAct 已达到最大工具轮数，收尾轮不能继续调用工具。')
+      }
       const choiceRequest = !toolCalls.length ? normalizeChoiceRequest(reply.choice) ?? inferChoiceRequest(reply.final) : undefined
       if (reply.thought) {
         thoughtStep.detail = toolCalls.length ? sanitizeThoughtBeforeAction(reply.thought) : reply.thought
@@ -121,15 +132,23 @@ export class ReactAgent {
         this.upsertStep(task, thoughtStep, onStep)
       }
       if (choiceRequest) {
-        const selectedId = requestUserChoice ? await requestUserChoice(choiceRequest) : undefined
+        const selection = requestUserChoice ? await requestUserChoice(choiceRequest) : undefined
         throwIfAborted(signal)
+        const selectedId = typeof selection === 'string' ? selection : selection?.optionId
         const selected = choiceRequest.options.find((option) => option.id === selectedId)
         if (!selected) {
           messages.push({ role: 'user', content: '用户没有确认任何方案。不要重复请求相同选择；请采用不需要该选择的安全方案，或说明无法继续并输出 Final。' })
           continue
         }
         this.addStep(task, step('reason', '用户已选择方案', selected.label), onStep)
-        messages.push({ role: 'user', content: 'UserChoice Observation:\n用户选择了方案 ' + selected.id + '：' + selected.label + (selected.description ? '\n' + selected.description : '') + '\n请基于该选择继续原任务，不要再次询问同一问题。' })
+        const selectedWorkspacePath = typeof selection === 'object' ? selection.workspacePath?.trim() : undefined
+        if (selectedWorkspacePath) {
+          currentPolicy = { ...currentPolicy, workspacePath: selectedWorkspacePath }
+          tools = new WorkspaceTools(selectedWorkspacePath)
+          messages[0] = { role: 'system', content: this.buildSystemPrompt(currentPolicy) }
+          this.addStep(task, step('reason', '会话工作区已切换', selectedWorkspacePath), onStep)
+        }
+        messages.push({ role: 'user', content: 'UserChoice Observation:\n用户选择了方案 ' + selected.id + '：' + selected.label + (selected.description ? '\n' + selected.description : '') + (selectedWorkspacePath ? '\n会话工作区已切换为：' + selectedWorkspacePath + '。后续工具必须立即使用该工作区。' : '') + '\n请基于该选择继续原任务，不要再次询问同一问题。' })
         continue
       }
       if (reply.final && !toolCalls.length) {
@@ -138,6 +157,10 @@ export class ReactAgent {
             role: 'user',
             content: '附件内容疑似加密或二进制，不能直接猜测或要求用户重新提供文件。必须先调用 decrypt_file，path 使用：' + [...pendingDecryptPaths].join('、') + '。解密成功后用 read_file 读取返回的 output_path。'
           })
+          continue
+        }
+        if (unresolvedCommandFailure) {
+          messages.push({ role: 'user', content: '上一条 run_command 仍处于失败状态，任务尚未验证完成，不能输出 Final。请根据 Observation 中的 stdout/stderr 读取相关文件并修复，然后重新执行对应的构建、测试或检查命令；只有命令成功后才能完成任务。工具名必须使用 run_command，不能写成 run-command。' })
           continue
         }
         if (isIncompleteFinal(reply.final)) {
@@ -170,8 +193,9 @@ export class ReactAgent {
         }
         let output: string
         try {
-          output = await this.executeTool(call, tools, policy, requestMcpApproval, signal)
+          output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, signal)
           throwIfAborted(signal)
+          if (call.name === 'run_command') unresolvedCommandFailure = false
           if (call.name === 'parse_powerpoint' && call.arguments.path && output.includes('用户未授权')) {
             deniedMcpPaths.add(call.arguments.path)
             currentActionHadError = true
@@ -181,6 +205,7 @@ export class ReactAgent {
           throwIfAborted(signal)
           if (!isRecoverableToolError(error, call.name)) throw error
           currentActionHadError = true
+          if (call.name === 'run_command') unresolvedCommandFailure = true
           output = '工具执行失败：' + (error instanceof Error ? error.message : String(error))
         }
         const observation = call.name + ': ' + output
@@ -190,10 +215,16 @@ export class ReactAgent {
 
       const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n')
       messages.push({ role: 'user', content: observationText })
+      if (turn === this.maxReactTurns) {
+        messages.push({
+          role: 'user',
+          content: '已达到本次任务的最大工具轮数。你还有一个不允许调用工具的收尾轮次：请完整读取最后一个 Observation；如果任务和验证已经完成，立即输出 Final JSON，总结实际完成内容和验证结果。禁止再次输出 Action 或 Choice。'
+        })
+      }
       previousActionHadError = currentActionHadError
     }
 
-    throw new Error('ReAct 循环达到最大轮数，仍未得到 Final。')
+    throw new Error('ReAct 达到最大工具轮数，并在追加收尾轮后仍未得到 Final。')
   }
 
   private buildSystemPrompt(policy: AgentPolicy): string {
@@ -216,7 +247,7 @@ export class ReactAgent {
       '    "description": "为什么必须选择",',
       '    "options": [',
       '      { "id": "option_1", "label": "方案名称", "description": "该方案的影响" },',
-      '      { "id": "option_2", "label": "方案名称", "description": "该方案的影响" }',
+      '      { "id": "option_2", "label": "切换会话工作区", "description": "该方案的影响", "workspacePath": "用户指定的绝对目录" }',
       '    ]',
       '  }',
       '}'
@@ -240,12 +271,13 @@ export class ReactAgent {
       finalSchema,
       '当存在两个或以上会改变执行路径、工作区、输出位置或实现方案的互斥选项，且无法从上下文安全决定时，输出 Choice JSON：',
       choiceSchema,
+      '如果某个选项表示切换会话工作区，该选项必须提供 workspacePath，值为用户明确指定的绝对目录；不要只在 label 或 description 中描述目录。用户确认后宿主会真正切换工作区，不能自行声称已经切换。',
       '输出 Choice 后立即停止。禁止把“请选择”及编号方案写进 Final；宿主会显示单选按钮并等待用户确认，随后以 UserChoice Observation 返回选择结果，你必须在同一次任务中继续执行。',
       'Final 字符串必须使用规范的 GitHub Flavored Markdown 排版：用简短标题组织主题，用有序或无序列表拆分要点，需要对比时使用表格；不要输出未闭合的 Markdown 标记，不要用多余空行模拟布局。',
       '工具注册表（只能调用 enabled=true 的工具；严格按 inputSchema 传 arguments）：',
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
-      '所有文件路径必须是工作区内的相对路径。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的 command 必须是可执行文件名，参数放入 args 数组。',
+      '所有文件路径必须是工作区内的相对路径。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。'
     ].join('\n')
   }
@@ -407,7 +439,10 @@ export class ReactAgent {
 
   private isRetryableModelError(error: Error): boolean {
     const status = (error as Error & { status?: number }).status
-    return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524
+    const causeCode = (error as Error & { cause?: { code?: unknown } }).cause?.code
+    return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524 ||
+      error.name === 'TypeError' || /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(error.message) ||
+      (typeof causeCode === 'string' && /ECONNRESET|ETIMEDOUT|UND_ERR|EAI_AGAIN|ENETUNREACH/i.test(causeCode))
   }
 
   private async readJsonResponse(response: Response): Promise<string> {
@@ -537,9 +572,11 @@ export class ReactAgent {
     if (!actionObject) return undefined
     try {
       const candidate = JSON.parse(this.normalizeJsonControlCharacters(actionObject)) as Partial<ToolCall>
-      if (typeof candidate.name !== 'string' || !isToolName(candidate.name)) return undefined
+      if (typeof candidate.name !== 'string') return undefined
+      const name = normalizeToolName(candidate.name)
+      if (!isToolName(name)) return undefined
       if (!candidate.arguments || typeof candidate.arguments !== 'object') return undefined
-      return candidate as ToolCall
+      return { ...candidate, name } as ToolCall
     } catch {
       return undefined
     }
@@ -611,7 +648,11 @@ export class ReactAgent {
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {
     const calls = reply.action ? [reply.action] : reply.tool_calls ?? []
-    return calls.filter((item): item is ToolCall => isToolName(item.name))
+    return calls.flatMap((item) => {
+      const name = typeof item?.name === 'string' ? normalizeToolName(item.name) : ''
+      if (!isToolName(name) || !item.arguments || typeof item.arguments !== 'object') return []
+      return [{ ...item, name }]
+    })
   }
 
   private addStep(task: AgentTask, taskStep: TaskStep, onStep?: StepCallback): void {
@@ -694,7 +735,11 @@ function sanitizeThoughtBeforeAction(thought: string): string {
 }
 
 function isIncompleteFinal(finalText: string): boolean {
-  return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目).{0,8}(?:尚未|未).{0,8}(?:完成|结束)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
+  return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目|构建|验证|修复|定位).{0,8}(?:尚未|未).{0,8}(?:完成|结束|通过|解决)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
+}
+
+function normalizeToolName(name: string): string {
+  return name.trim().toLowerCase().replaceAll('-', '_')
 }
 
 function inferOfficeToolCall(prompt: string, reply: ReactModelReply, pendingOfficeParses: Map<string, OfficeAttachmentTool>): ToolCall | undefined {
@@ -723,7 +768,8 @@ function normalizeChoiceRequest(value?: UserChoiceDetails): UserChoiceDetails | 
     .map((option, index) => ({
       id: option.id.trim().slice(0, 80) || 'option_' + (index + 1),
       label: option.label.trim().slice(0, 300),
-      description: typeof option.description === 'string' && option.description.trim() ? option.description.trim().slice(0, 600) : undefined
+      description: typeof option.description === 'string' && option.description.trim() ? option.description.trim().slice(0, 600) : undefined,
+      workspacePath: typeof option.workspacePath === 'string' && option.workspacePath.trim() ? option.workspacePath.trim().slice(0, 1000) : undefined
     }))
     .filter((option) => option.label)
   if (options.length < 2 || new Set(options.map((option) => option.id)).size !== options.length) return undefined
@@ -796,9 +842,10 @@ function abortableDelay(durationMs: number, signal?: AbortSignal): Promise<void>
 }
 
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {
-  if (toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
-  const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   const message = error instanceof Error ? error.message : String(error)
+  if (/工具未启用|工具参数不完整/.test(message)) return false
+  if (toolName === 'run_command' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
+  const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)
 }
 

@@ -14,7 +14,7 @@ export interface AgentDoneEvent { conversationId: string; messageId: string; sta
 export interface AgentRunResult { conversation: Conversation; task: AgentTask }
 export interface McpApprovalDetails { toolName: string; serverUrl: string; path?: string; workspacePath?: string; conversationId?: string }
 export interface McpApprovalRequest extends McpApprovalDetails { id: string; expiresAt: string }
-export interface UserChoiceOption { id: string; label: string; description?: string }
+export interface UserChoiceOption { id: string; label: string; description?: string; workspacePath?: string }
 export interface UserChoiceDetails { title: string; description?: string; options: UserChoiceOption[]; conversationId?: string }
 export interface UserChoiceRequest extends UserChoiceDetails { id: string; expiresAt: string }
 export interface DesktopApi {
@@ -31,6 +31,7 @@ export interface DesktopApi {
   testConnection(settings: AppSettings): Promise<ConnectionTestResult>
   getPolicy(): Promise<AgentPolicy>
   savePolicy(policy: AgentPolicy): Promise<AgentPolicy>
+  copyText(text: string): void
   onAgentStep(callback: (event: AgentStepEvent) => void): () => void
   onAgentDelta(callback: (event: AgentDeltaEvent) => void): () => void
   onAgentDone(callback: (event: AgentDoneEvent) => void): () => void

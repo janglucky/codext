@@ -79,6 +79,41 @@ describe('ReactAgent.execute', () => {
       expect(choices).toEqual([{ title: '路径需要确认', labels: ['将项目放到当前工作区内。', '将会话工作区切换到目标目录。'] }])
       expect(task.steps.some((step) => step.title === '用户已选择方案' && step.detail.includes('切换'))).toBe(true)
     })
+
+    it('switches the active tool context after a workspace choice', async () => {
+      let modelCall = 0
+      const targetWorkspace = 'D:/work/aigent'
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        modelCall++
+        const content = modelCall === 1
+          ? JSON.stringify({ choice: { title: '选择工作区', options: [
+            { id: 'current', label: '保留当前工作区' },
+            { id: 'switch', label: '切换到 aigent 工作区', workspacePath: targetWorkspace }
+          ] } })
+          : modelCall === 2
+            ? JSON.stringify({ action: { name: 'list_files', arguments: {} } })
+            : JSON.stringify({ final: 'done' })
+        if (modelCall === 2) {
+          const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: unknown }> }
+          expect(JSON.stringify(body.messages)).toContain(targetWorkspace)
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockImplementation(function () {
+        expect((this as unknown as { workspacePath: string }).workspacePath).toBe(targetWorkspace)
+        return Promise.resolve('目录为空')
+      })
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('在目标目录创建项目', [], undefined, undefined, [], undefined, undefined, undefined, async (request) => {
+        expect(request.options.find((option) => option.id === 'switch')?.workspacePath).toBe(targetWorkspace)
+        return { optionId: 'switch', workspacePath: targetWorkspace }
+      })
+
+      expect(task.status).toBe('succeeded')
+      expect(listFiles).toHaveBeenCalledOnce()
+      expect(task.steps.some((item) => item.title === '会话工作区已切换' && item.detail === targetWorkspace)).toBe(true)
+    })
   })
 
   describe('task pause', () => {
@@ -511,6 +546,26 @@ describe('ReactAgent.execute', () => {
 
   // 3. model returns tool_calls
   describe('with tool calls', () => {
+    it('adds a finalization turn after the last allowed tool observation', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount <= 2
+          ? JSON.stringify({ action: { name: 'list_files', arguments: { path: 'turn-' + callCount } } })
+          : JSON.stringify({ final: '最后一次验证完成。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const agent = new ReactAgent(() => makeSettings(), () => basePolicy, () => '', 2)
+
+      const task = await agent.run('执行两轮工具后完成')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('最后一次验证完成。')
+      expect(callCount).toBe(3)
+      expect(task.steps.filter((item) => item.title.includes('list_files'))).toHaveLength(4)
+    })
+
     it('executes tools and calls model again with observations', async () => {
       // first call: returns tool_calls
       // second call: returns final answer
@@ -742,6 +797,36 @@ describe('ReactAgent.execute', () => {
       await rm(join(process.cwd(), 'tests/fixtures/recovered-missing-file.txt'), { force: true })
     })
 
+    it('requires a successful validation command before completing after a command failure', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'npm', args: ['install'] } } })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'write_file', arguments: { path: 'package.json', content: '{}' } } })
+            : callCount === 3
+              ? JSON.stringify({ final: '构建定位尚未完成。' })
+              : callCount === 4
+                ? JSON.stringify({ action: { name: 'run-command', arguments: { command: 'npm', args: ['run', 'build'] } } })
+                : JSON.stringify({ final: '构建修复并验证完成。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand')
+        .mockRejectedValueOnce(new Error('npm warn EBADENGINE'))
+        .mockResolvedValueOnce('build succeeded')
+      vi.spyOn(WorkspaceTools.prototype, 'writeFile').mockResolvedValue('已写入 package.json')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('安装依赖')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('构建修复并验证完成。')
+      expect(callCount).toBe(5)
+      expect(runCommand).toHaveBeenCalledTimes(2)
+      expect(task.steps.some((item) => item.detail.includes('EBADENGINE'))).toBe(true)
+    })
+
     it('filters out unknown tool names from tool_calls', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,
@@ -836,6 +921,24 @@ describe('ReactAgent.execute', () => {
       const { execute } = makeAgent(makeSettings({ maxRetries: 1 }))
       const result = await execute('retry task', makeTask())
       expect(result).toBe('recovered')
+      expect(callCount).toBe(2)
+    })
+
+    it('retries transient fetch failures', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 1) return Promise.reject(new TypeError('fetch failed'))
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'network recovered' }) } }] })
+        })
+      })
+
+      const { execute } = makeAgent(makeSettings({ maxRetries: 1 }))
+      const result = await execute('retry fetch', makeTask())
+
+      expect(result).toBe('network recovered')
       expect(callCount).toBe(2)
     })
 

@@ -54,6 +54,29 @@ describe('tool registry', () => {
   })
 })
 
+describe('WorkspaceTools.runCommand', () => {
+  it('includes stderr when a command exits unsuccessfully', async () => {
+    await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stderr.write('diagnostic stderr'); process.exit(2)"]))
+      .rejects.toThrow('diagnostic stderr')
+  })
+
+  it.runIf(process.platform === 'win32')('resolves npm to its Windows command wrapper', async () => {
+    await expect(workspaceTools.runCommand('npm', ['--version'])).resolves.toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  it.runIf(process.platform === 'win32')('runs an explicit npm.cmd command', async () => {
+    await expect(workspaceTools.runCommand('npm.cmd', ['--version'])).resolves.toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  it.runIf(process.platform === 'win32')('normalizes a full-width dot in a Windows command name', async () => {
+    await expect(workspaceTools.runCommand('npm。cmd', ['--version'])).resolves.toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  it.runIf(process.platform === 'win32')('rejects shell metacharacters passed to Windows command wrappers', async () => {
+    await expect(workspaceTools.runCommand('npm.cmd', ['--version & whoami'])).rejects.toThrow('不安全')
+  })
+})
+
 describe('WorkspaceTools.decryptFile', () => {
   it('uploads to the decrypt service and saves the downloaded result', async () => {
     await writeFile(join(workspacePath, 'secret.txt'), 'encrypted-content', 'utf8')

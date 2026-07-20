@@ -9,9 +9,13 @@ const DECRYPT_UPLOAD_URL = 'http://172.16.51.141:8899/encrypt/file/tranferEncryp
 const DECRYPT_SERVICE_ORIGIN = 'http://172.16.51.141:8899'
 const DECRYPT_DOWNLOAD_PATH = '/encrypt/file/downloadEncryptFile/'
 const DECRYPT_TIMEOUT_MS = 120_000
+const COMMAND_TIMEOUT_MS = 120_000
+const PACKAGE_COMMAND_TIMEOUT_MS = 10 * 60_000
 const MAX_DECRYPT_FILE_SIZE = 50 * 1024 * 1024
 const MAX_LIST_ENTRIES = 500
 const DECRYPT_EXTENSIONS = new Set(['.txt', '.csv', '.pdf', '.docx', '.xlsx', '.pptx'])
+const WINDOWS_BATCH_EXTENSIONS = new Set(['.cmd', '.bat'])
+const WINDOWS_BATCH_META_CHARACTERS = /[\0\r\n"&|<>^%!()]/
 
 export class WorkspaceTools {
   constructor(private readonly workspacePath: string) {}
@@ -129,9 +133,113 @@ export class WorkspaceTools {
   }
 
   async runCommand(command: string, args: string[] = [], signal?: AbortSignal): Promise<string> {
-    if (blockedCommands.test([command, ...args].join(' '))) throw new Error('安全策略阻止了危险命令。')
-    const result = await execFileAsync(command, args, { cwd: this.workspacePath, timeout: 30000, windowsHide: true, maxBuffer: 1024 * 1024, encoding: 'buffer', signal }) as unknown as { stdout: Buffer; stderr: Buffer }
-    return (this.decodeCommandOutput(result.stdout) || this.decodeCommandOutput(result.stderr) || '命令执行完成。').trim()
+    const executable = this.normalizeExecutableName(command)
+    if (!executable) throw new Error('命令不能为空。')
+    if (blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令。')
+    const timeoutMs = this.commandTimeout(executable, args)
+
+    if (process.platform === 'win32' && this.isWindowsBatchCommand(executable)) {
+      return this.runWindowsBatchCommand(executable, args, signal, timeoutMs)
+    }
+
+    try {
+      return await this.runExecutable(executable, args, signal, timeoutMs)
+    } catch (error) {
+      if (process.platform !== 'win32' || !this.isMissingExecutableError(error)) throw error
+      const batchCommand = await this.findWindowsBatchCommand(executable, signal)
+      if (!batchCommand) throw error
+      return this.runWindowsBatchCommand(batchCommand, args, signal, timeoutMs)
+    }
+  }
+
+  private async runExecutable(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
+    try {
+      const result = await execFileAsync(command, args, this.commandOptions(signal, timeoutMs)) as unknown as { stdout: Buffer; stderr: Buffer }
+      return (this.decodeCommandOutput(result.stdout) || this.decodeCommandOutput(result.stderr) || '命令执行完成。').trim()
+    } catch (error) {
+      if (this.isMissingExecutableError(error)) throw error
+      const details = this.commandErrorDetails(error)
+      if (this.isCommandTimeoutError(error)) {
+        throw new Error('命令执行超过 ' + Math.ceil(timeoutMs / 1000) + ' 秒，已停止。' + (details ? '\n' + details : ''))
+      }
+      const exitCode = this.commandExitCode(error)
+      throw new Error('命令执行失败' + (exitCode ? '（退出码 ' + exitCode + '）' : '') + '。' + (details ? '\n' + details : ''))
+    }
+  }
+
+  private async runWindowsBatchCommand(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
+    this.assertSafeWindowsBatchArguments(command, args)
+    const commandProcessor = process.env.ComSpec?.trim() || 'cmd.exe'
+    return this.runExecutable(commandProcessor, ['/d', '/s', '/c', command, ...args], signal, timeoutMs)
+  }
+
+  private async findWindowsBatchCommand(command: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (extname(command)) return undefined
+    for (const extension of WINDOWS_BATCH_EXTENSIONS) {
+      try {
+        const result = await execFileAsync('where.exe', [command + extension], {
+          ...this.commandOptions(signal),
+          timeout: 5000
+        }) as unknown as { stdout: Buffer }
+        const match = this.decodeCommandOutput(result.stdout).split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+        if (match) return match
+      } catch (error) {
+        if (signal?.aborted) throw error
+      }
+    }
+    return undefined
+  }
+
+  private commandOptions(signal?: AbortSignal, timeout = COMMAND_TIMEOUT_MS) {
+    return { cwd: this.workspacePath, timeout, windowsHide: true, maxBuffer: 1024 * 1024, encoding: 'buffer' as const, signal }
+  }
+
+  private isWindowsBatchCommand(command: string): boolean {
+    return WINDOWS_BATCH_EXTENSIONS.has(extname(command).toLowerCase())
+  }
+
+  private normalizeExecutableName(command: string): string {
+    return command.trim().replace(/[。．](?=(?:cmd|bat|exe)$)/i, '.')
+  }
+
+  private commandTimeout(command: string, args: string[]): number {
+    const executableName = basename(command).toLowerCase().replace(/\.(?:cmd|bat|exe)$/, '')
+    const operation = args[0]?.toLowerCase()
+    const packageManagers = new Set(['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'yarnpkg', 'corepack'])
+    const longOperations = new Set(['install', 'i', 'ci', 'add', 'create', 'exec', 'dlx'])
+    return packageManagers.has(executableName) && operation && longOperations.has(operation) ? PACKAGE_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS
+  }
+
+  private isCommandTimeoutError(error: unknown): boolean {
+    if (typeof error !== 'object' || error === null) return false
+    const details = error as { code?: unknown; killed?: unknown }
+    return details.code === 'ETIMEDOUT' || details.killed === true
+  }
+
+  private commandErrorDetails(error: unknown): string {
+    if (typeof error !== 'object' || error === null) return ''
+    const details = error as { stdout?: unknown; stderr?: unknown; message?: unknown }
+    const output = [details.stdout, details.stderr]
+      .map((value) => Buffer.isBuffer(value) ? this.decodeCommandOutput(value) : typeof value === 'string' ? value : '')
+      .filter(Boolean)
+      .join('\n') || (typeof details.message === 'string' ? details.message : '')
+    return output.length > 8000 ? output.slice(0, 5000) + '\n...输出已截断...\n' + output.slice(-2000) : output.trim()
+  }
+
+  private commandExitCode(error: unknown): string {
+    if (typeof error !== 'object' || error === null || !('code' in error)) return ''
+    const code = error.code
+    return typeof code === 'string' || typeof code === 'number' ? String(code) : ''
+  }
+
+  private isMissingExecutableError(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+  }
+
+  private assertSafeWindowsBatchArguments(command: string, args: string[]): void {
+    if ([command, ...args].some((value) => WINDOWS_BATCH_META_CHARACTERS.test(value))) {
+      throw new Error('Windows 脚本命令包含不安全的 shell 字符。')
+    }
   }
 
   private resolvePath(filePath: string): string {

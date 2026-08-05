@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { ReactAgent } from '../src/main/agent/react-agent'
 import { PptMcpClient } from '../src/main/ppt/ppt-mcp-client'
 import { WorkspaceTools } from '../src/main/tools/workspace-tools'
-import type { AgentPolicy, AppSettings, AgentTask, ChatAttachment } from '../src/shared/types'
+import type { AgentPolicy, AppSettings, AgentTask, ChatAttachment, CommandApprovalDetails } from '../src/shared/types'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -14,7 +14,7 @@ afterEach(() => {
 const basePolicy: AgentPolicy = {
   systemPrompt: 'test',
   workspacePath: 'D:/work/codext',
-  enabledTools: ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command']
+  enabledTools: ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command', 'start_service']
 }
 
 const modelConfigured: AppSettings['model'] = {
@@ -28,7 +28,8 @@ const modelConfigured: AppSettings['model'] = {
 function makeSettings(overrides: Partial<AppSettings['model']> = {}): AppSettings {
   return {
     model: { ...modelConfigured, ...overrides },
-    skillsEnabled: true
+    skillsEnabled: true,
+    navigation: { fileApplicationPath: '', browserApplicationPath: '' }
   }
 }
 
@@ -52,6 +53,10 @@ function makeTask(prompt = 'test prompt'): AgentTask {
     createdAt: new Date().toISOString(),
     steps: []
   }
+}
+
+function runWithCommandApproval(agent: ReactAgent, prompt: string, approval: (details: CommandApprovalDetails) => Promise<boolean>): Promise<AgentTask> {
+  return agent.run(prompt, [], undefined, undefined, [], undefined, undefined, undefined, undefined, approval)
 }
 
 // ---- tests ----
@@ -546,6 +551,127 @@ describe('ReactAgent.execute', () => {
 
   // 3. model returns tool_calls
   describe('with tool calls', () => {
+    it('records written files and web services as navigable artifacts', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'write_file', arguments: { path: 'src/app.ts', content: 'export {}' } } })
+          : JSON.stringify({ final: '应用已完成，可访问 http://0.0.0.0:5173/app。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'writeFile').mockResolvedValue('已写入 src/app.ts')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('创建应用')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.artifacts).toEqual([
+        { type: 'file', path: 'src/app.ts' },
+        { type: 'service', url: 'http://localhost:5173/app' }
+      ])
+    })
+
+    it('starts a persistent service with start_service and records its URL', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'start_service', arguments: { command: 'node', args: ['server.js'] } } })
+          : JSON.stringify({ final: '服务已启动：[http://127.0.0.1:3000/](http://127.0.0.1:3000/)' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const startService = vi.spyOn(WorkspaceTools.prototype, 'startService').mockResolvedValue(JSON.stringify({ ok: true, url: 'http://127.0.0.1:3000/', pid: 123 }))
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('启动服务')
+
+      expect(task.status).toBe('succeeded')
+      expect(startService).toHaveBeenCalledWith('node', ['server.js'], undefined)
+      expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/' }])
+    })
+
+    it('runs an SSH read-only command without requesting approval', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'ssh', args: ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'] } } })
+          : JSON.stringify({ final: 'remote directory inspected' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockResolvedValue('/home/guider/work/file.txt')
+      const approval = vi.fn(async () => true)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '查看远程目录', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(approval).not.toHaveBeenCalled()
+      expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, false)
+    })
+
+    it('requests single-use approval before executing a write command', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'npm', args: ['install'] } } })
+          : JSON.stringify({ final: 'dependencies installed' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockResolvedValue('installed')
+      const approval = vi.fn(async () => true)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '安装依赖', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'npm', args: ['install'], displayCommand: 'npm install' }))
+      expect(runCommand).toHaveBeenCalledWith('npm', ['install'], undefined, true)
+    })
+
+    it('does not request the same write command again after the user denies it', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount <= 2
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'npm', args: ['install'] } } })
+          : JSON.stringify({ final: 'continued without installing dependencies' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand')
+      const approval = vi.fn(async () => false)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '尝试安装依赖', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('continued without installing dependencies')
+      expect(approval).toHaveBeenCalledOnce()
+      expect(runCommand).not.toHaveBeenCalled()
+    })
+
+    it('blocks a destructive command without requesting approval', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'cmd', args: ['/c', 'del important.txt'] } } })
+          : JSON.stringify({ final: 'dangerous command refused' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const approval = vi.fn(async () => true)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '删除文件', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('dangerous command refused')
+      expect(approval).not.toHaveBeenCalled()
+      expect(task.steps.some((item) => item.detail.includes('安全策略阻止'))).toBe(true)
+    })
+
     it('adds a finalization turn after the last allowed tool observation', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
@@ -664,6 +790,63 @@ describe('ReactAgent.execute', () => {
       expect(callCount).toBe(2)
       expect(task.steps.some((item) => item.title.includes('write_file'))).toBe(true)
       await rm(join(process.cwd(), 'tests/fixtures/generated-raw-newlines.txt'), { force: true })
+    })
+
+    it('retries an incomplete write_file action instead of displaying raw JSON as final', async () => {
+      let callCount = 0
+      const requestBodies: string[] = []
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(String(init?.body ?? ''))
+        callCount++
+        const content = callCount === 1
+          ? '{"action":{"name":"write_file","arguments":{"path":"tests/fixtures/generated-after-truncation.txt","content":"const page = `<html>`;\\'
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'write_file', arguments: { path: 'tests/fixtures/generated-after-truncation.txt', content: 'complete' } } })
+            : JSON.stringify({ final: 'file written after retry' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await execute('write a large page', task)
+
+      expect(result).toBe('file written after retry')
+      expect(callCount).toBe(3)
+      expect(task.steps.some((item) => item.title === '工具调用响应不完整')).toBe(true)
+      expect(requestBodies[1]).toContain('单次 content 不得超过 6000 个字符')
+      expect(requestBodies[1]).not.toContain('const page = `<html>`')
+      expect(await readFile(join(process.cwd(), 'tests/fixtures/generated-after-truncation.txt'), 'utf8')).toBe('complete')
+      await rm(join(process.cwd(), 'tests/fixtures/generated-after-truncation.txt'), { force: true })
+    })
+
+    it('recovers a model connection failure after a successful file write', async () => {
+      let callCount = 0
+      const requestBodies: string[] = []
+      const largeContent = 'x'.repeat(5000)
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(String(init?.body ?? ''))
+        callCount++
+        if (callCount === 1) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ action: { name: 'write_file', arguments: { path: 'generated-page.html', content: largeContent } } }) } }] })
+          })
+        }
+        if (callCount === 2) return Promise.reject(new TypeError('fetch failed'))
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'continued after reconnecting' }) } }] }) })
+      })
+      const writeFile = vi.spyOn(WorkspaceTools.prototype, 'writeFile').mockResolvedValue('已写入 generated-page.html')
+      const { execute } = makeAgent(makeSettings({ maxRetries: 0 }))
+      const task = makeTask()
+
+      const result = await execute('create a page', task)
+
+      expect(result).toBe('continued after reconnecting')
+      expect(callCount).toBe(3)
+      expect(writeFile).toHaveBeenCalledOnce()
+      expect(task.steps.some((item) => item.title === '模型连接中断，正在恢复')).toBe(true)
+      expect(requestBodies[1]).toContain('已执行 write_file：generated-page.html')
+      expect(requestBodies[1]).not.toContain(largeContent)
     })
 
     it('streams thought tags before executing tool calls', async () => {
@@ -818,7 +1001,7 @@ describe('ReactAgent.execute', () => {
       vi.spyOn(WorkspaceTools.prototype, 'writeFile').mockResolvedValue('已写入 package.json')
       const { agent } = makeAgent(makeSettings())
 
-      const task = await agent.run('安装依赖')
+      const task = await runWithCommandApproval(agent, '安装依赖', async () => true)
 
       expect(task.status).toBe('succeeded')
       expect(task.result).toBe('构建修复并验证完成。')

@@ -1,7 +1,9 @@
-import { execFile } from 'node:child_process'
-import { lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { lstat, mkdir, open, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
+import { classifyCommandRisk } from './command-risk'
 
 const execFileAsync = promisify(execFile)
 const blockedCommands = /(^|\s)(del|erase|rmdir|rd|format|shutdown|restart|diskpart)(\s|$)|reg\s+delete/i
@@ -16,6 +18,29 @@ const MAX_LIST_ENTRIES = 500
 const DECRYPT_EXTENSIONS = new Set(['.txt', '.csv', '.pdf', '.docx', '.xlsx', '.pptx'])
 const WINDOWS_BATCH_EXTENSIONS = new Set(['.cmd', '.bat'])
 const WINDOWS_BATCH_META_CHARACTERS = /[\0\r\n"&|<>^%!()]/
+const SERVICE_START_TIMEOUT_MS = 30_000
+
+interface RunningWorkspaceService { child: ChildProcess; url?: string; logPath: string }
+const runningWorkspaceServices = new Map<string, RunningWorkspaceService>()
+
+export async function stopAllWorkspaceServices(): Promise<void> {
+  const services = [...runningWorkspaceServices.values()]
+  runningWorkspaceServices.clear()
+  await Promise.all(services.map((service) => new Promise<void>((resolveStop) => {
+    if (service.child.exitCode !== null) {
+      void rm(service.logPath, { force: true })
+      resolveStop()
+      return
+    }
+    const timer = setTimeout(resolveStop, 2000)
+    service.child.once('exit', () => {
+      clearTimeout(timer)
+      void rm(service.logPath, { force: true })
+      resolveStop()
+    })
+    service.child.kill()
+  })))
+}
 
 export class WorkspaceTools {
   constructor(private readonly workspacePath: string) {}
@@ -132,10 +157,12 @@ export class WorkspaceTools {
     }
   }
 
-  async runCommand(command: string, args: string[] = [], signal?: AbortSignal): Promise<string> {
+  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('命令不能为空。')
-    if (blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令。')
+    const risk = classifyCommandRisk(executable, args)
+    if (risk.level === 'blocked' || blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令：' + risk.reason)
+    if (risk.level === 'write' && !writeApproved) throw new Error('该命令可能修改状态，需要用户授权后执行。')
     const timeoutMs = this.commandTimeout(executable, args)
 
     if (process.platform === 'win32' && this.isWindowsBatchCommand(executable)) {
@@ -150,6 +177,83 @@ export class WorkspaceTools {
       if (!batchCommand) throw error
       return this.runWindowsBatchCommand(batchCommand, args, signal, timeoutMs)
     }
+  }
+
+  async startService(command: string, args: string[] = [], signal?: AbortSignal): Promise<string> {
+    const executable = this.normalizeExecutableName(command)
+    if (!executable) throw new Error('服务命令不能为空。')
+    if (blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令。')
+
+    const invocation = await this.resolveServiceInvocation(executable, args, signal)
+    const serviceKey = resolve(this.workspacePath) + '\n' + JSON.stringify(invocation)
+    const existing = runningWorkspaceServices.get(serviceKey)
+    if (existing?.child.exitCode === null && existing.url) return JSON.stringify({ ok: true, url: existing.url, reused: true })
+    if (existing?.child.exitCode === null) existing.child.kill()
+
+    const logPath = join(tmpdir(), 'codext-service-' + crypto.randomUUID() + '.log')
+    const logFile = await open(logPath, 'a')
+    let child: ChildProcess
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        cwd: this.workspacePath,
+        windowsHide: true,
+        detached: true,
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        stdio: ['ignore', logFile.fd, logFile.fd]
+      })
+    } finally {
+      await logFile.close()
+    }
+    child.unref()
+    const service: RunningWorkspaceService = { child, logPath }
+    runningWorkspaceServices.set(serviceKey, service)
+
+    return new Promise((resolveService, rejectService) => {
+      let settled = false
+      let output = ''
+      let pollTimer: ReturnType<typeof setTimeout> | undefined
+      const timer = setTimeout(() => settle(new Error('服务在 ' + SERVICE_START_TIMEOUT_MS / 1000 + ' 秒内没有输出可访问的 HTTP 地址。')), SERVICE_START_TIMEOUT_MS)
+      const onAbort = (): void => settle(new DOMException('服务启动已暂停', 'AbortError'))
+      const pollOutput = async (): Promise<void> => {
+        if (settled) return
+        try {
+          output = this.decodeCommandOutput(await readFile(logPath)).slice(-16_000)
+        } catch {
+          /* 进程刚启动时日志文件可能尚未可读，继续轮询。 */
+        }
+        const url = this.findServiceUrl(output)
+        if (url) {
+          service.url = url
+          settle(undefined, url)
+          return
+        }
+        pollTimer = setTimeout(() => void pollOutput(), 100)
+      }
+      const settle = (error?: Error, url?: string): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (pollTimer) clearTimeout(pollTimer)
+        signal?.removeEventListener('abort', onAbort)
+        if (error) {
+          child.kill()
+          runningWorkspaceServices.delete(serviceKey)
+          void rm(logPath, { force: true })
+          rejectService(error)
+          return
+        }
+        resolveService(JSON.stringify({ ok: true, url, pid: child.pid }))
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
+      child.once('error', (error) => settle(error))
+      child.once('exit', (code) => {
+        runningWorkspaceServices.delete(serviceKey)
+        void rm(logPath, { force: true })
+        if (!settled) settle(new Error('服务进程提前退出' + (code === null ? '' : '（退出码 ' + code + '）') + '。' + (output ? '\n' + output.trim() : '')))
+      })
+      void pollOutput()
+    })
   }
 
   private async runExecutable(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
@@ -188,6 +292,14 @@ export class WorkspaceTools {
       }
     }
     return undefined
+  }
+
+  private async resolveServiceInvocation(command: string, args: string[], signal?: AbortSignal): Promise<{ command: string; args: string[] }> {
+    if (process.platform !== 'win32') return { command, args }
+    const batchCommand = this.isWindowsBatchCommand(command) ? command : await this.findWindowsBatchCommand(command, signal)
+    if (!batchCommand) return { command, args }
+    this.assertSafeWindowsBatchArguments(batchCommand, args)
+    return { command: process.env.ComSpec?.trim() || 'cmd.exe', args: ['/d', '/s', '/c', batchCommand, ...args] }
   }
 
   private commandOptions(signal?: AbortSignal, timeout = COMMAND_TIMEOUT_MS) {
@@ -230,6 +342,20 @@ export class WorkspaceTools {
     if (typeof error !== 'object' || error === null || !('code' in error)) return ''
     const code = error.code
     return typeof code === 'string' || typeof code === 'number' ? String(code) : ''
+  }
+
+  private findServiceUrl(output: string): string | undefined {
+    const ansiEscapePattern = new RegExp(String.fromCharCode(27) + '\\[[0-?]*[ -/]*[@-~]', 'g')
+    const match = output.replace(ansiEscapePattern, '').match(/https?:\/\/[^\s<>"'`]+/i)?.[0]
+    if (!match) return undefined
+    try {
+      const url = new URL(match.replace(/[),.;\]，。；]+$/, ''))
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+      if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
+      return url.toString()
+    } catch {
+      return undefined
+    }
   }
 
   private isMissingExecutableError(error: unknown): boolean {

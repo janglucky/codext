@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { WorkspaceTools } from '../src/main/tools/workspace-tools'
+import { stopAllWorkspaceServices, WorkspaceTools } from '../src/main/tools/workspace-tools'
 import { getEnabledToolDefinitions, isToolName } from '../src/main/tools/tool-registry'
 
 const originalFetch = globalThis.fetch
@@ -15,6 +15,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  await stopAllWorkspaceServices()
   globalThis.fetch = originalFetch
   await rm(workspacePath, { recursive: true, force: true })
 })
@@ -47,16 +48,35 @@ describe('WorkspaceTools directories and listing', () => {
 })
 
 describe('tool registry', () => {
-  it('registers the three new tools', () => {
-    const names = ['create_directory', 'list_files', 'decrypt_file']
+  it('registers workspace and service tools', () => {
+    const names = ['create_directory', 'list_files', 'decrypt_file', 'start_service']
     expect(names.every(isToolName)).toBe(true)
     expect(getEnabledToolDefinitions(names).map((tool) => tool.name)).toEqual(names)
   })
 })
 
+describe('WorkspaceTools.startService', () => {
+  it('returns the service URL while leaving the server available', async () => {
+    const script = "const http=require('node:http');const server=http.createServer((_request,response)=>response.end('ready'));server.listen(0,'127.0.0.1',()=>console.log('http://127.0.0.1:'+server.address().port))"
+
+    const result = JSON.parse(await workspaceTools.startService(process.execPath, ['-e', script])) as { url: string; pid: number }
+
+    expect(result.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/)
+    expect(result.pid).toBeGreaterThan(0)
+    await expect(fetch(result.url).then((response) => response.text())).resolves.toBe('ready')
+  })
+})
+
 describe('WorkspaceTools.runCommand', () => {
+  it('requires approval for state-changing commands and blocks destructive commands', async () => {
+    await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stdout.write('script')"]))
+      .rejects.toThrow('需要用户授权')
+    await expect(workspaceTools.runCommand('cmd', ['/c', 'del important.txt'], undefined, true))
+      .rejects.toThrow('安全策略')
+  })
+
   it('includes stderr when a command exits unsuccessfully', async () => {
-    await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stderr.write('diagnostic stderr'); process.exit(2)"]))
+    await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stderr.write('diagnostic stderr'); process.exit(2)"], undefined, true))
       .rejects.toThrow('diagnostic stderr')
   })
 
@@ -73,7 +93,7 @@ describe('WorkspaceTools.runCommand', () => {
   })
 
   it.runIf(process.platform === 'win32')('rejects shell metacharacters passed to Windows command wrappers', async () => {
-    await expect(workspaceTools.runCommand('npm.cmd', ['--version & whoami'])).rejects.toThrow('不安全')
+    await expect(workspaceTools.runCommand('npm.cmd', ['--version & whoami'], undefined, true)).rejects.toThrow('不安全')
   })
 })
 

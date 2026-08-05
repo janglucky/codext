@@ -1,4 +1,4 @@
-export type ToolName = 'read_file' | 'write_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command'
+export type ToolName = 'read_file' | 'write_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command' | 'start_service'
 export type ToolArguments = { path?: string; content?: string; command?: string; args?: string[]; recursive?: boolean; output_path?: string; max_characters?: number; include_notes?: boolean }
 export type ToolCall = { name: ToolName; arguments: ToolArguments }
 
@@ -119,8 +119,8 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   },
   run_command: {
     name: 'run_command',
-    description: '在工作区目录下执行安全的命令行程序，并返回 stdout/stderr。',
-    whenToUse: '需要运行测试、构建或执行非破坏性工程命令时调用。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机或修改注册表。',
+    description: '执行命令行程序并返回 stdout/stderr。只读查询可直接运行；可能写入本地或远程状态的命令会请求用户单次授权；高危命令直接拒绝。',
+    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。远程 ls、find、cat、grep 等只读查询可以直接执行，不受本地工作区路径限制；写入、安装、脚本和状态修改命令必须等待用户授权。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机、终止进程或修改注册表。',
     inputSchema: {
       type: 'object',
       required: ['command'],
@@ -130,6 +130,20 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
       }
     },
     example: { name: 'run_command', arguments: { command: 'npm', args: ['run', 'build'] } }
+  },
+  start_service: {
+    name: 'start_service',
+    description: '在工作区以独立进程启动长驻 Web 服务，检测到 HTTP(S) 地址后立即返回；关闭应用后服务仍会继续运行。',
+    whenToUse: '需要启动开发服务器、预览服务或本地 HTTP 服务时调用。禁止用 run_command 启动不会自行退出的服务。服务必须在 30 秒内向 stdout 或 stderr 输出完整访问地址。',
+    inputSchema: {
+      type: 'object',
+      required: ['command'],
+      properties: {
+        command: { type: 'string', description: '服务可执行文件名，例如 node、npm。' },
+        args: { type: 'array', items: { type: 'string' }, description: '服务参数数组，例如 ["server.js"] 或 ["run", "dev"]。' }
+      }
+    },
+    example: { name: 'start_service', arguments: { command: 'npm', args: ['run', 'dev'] } }
   }
 }
 

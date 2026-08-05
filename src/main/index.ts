@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron'
 import { mkdir } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { is } from '@electron-toolkit/utils'
@@ -18,13 +18,16 @@ import {
 import { LocalStore } from './persistence/store'
 import { copyConversationAttachments, materializeOfficeAttachments } from './attachment-storage'
 import { McpApprovalManager } from './mcp-approval'
+import { CommandApprovalManager } from './command-approval'
 import { UserChoiceManager } from './user-choice'
 import { startPptMcpServer, type RunningPptMcpServer } from './ppt/ppt-mcp-server'
+import { isTextFilePath, launchApplication, normalizeWebUrl, resolveWorkspaceFile, validateApplicationPath } from './navigation'
 
 const store = new LocalStore()
 let pptMcpUrl = ''
 const agent = new ReactAgent(() => store.getSettings(), () => store.getPolicy(), () => pptMcpUrl)
 const mcpApprovalManager = new McpApprovalManager()
+const commandApprovalManager = new CommandApprovalManager()
 const userChoiceManager = new UserChoiceManager()
 const runningTasks = new Map<string, AbortController>()
 let pptMcpServer: RunningPptMcpServer | undefined
@@ -47,10 +50,15 @@ app.whenReady().then(async () => {
     if (typeof requestId !== 'string' || typeof approved !== 'boolean') return
     mcpApprovalManager.respond(event.sender.id, requestId, approved)
   })
+  ipcMain.on('command:approval-response', (event, requestId: unknown, approved: unknown) => {
+    if (typeof requestId !== 'string' || typeof approved !== 'boolean') return
+    commandApprovalManager.respond(event.sender.id, requestId, approved)
+  })
   ipcMain.on('agent:cancel', (event, conversationId: unknown) => {
     if (typeof conversationId !== 'string') return
     runningTasks.get(taskKey(event.sender.id, conversationId))?.abort()
     mcpApprovalManager.cancelTarget(event.sender.id)
+    commandApprovalManager.cancelTarget(event.sender.id)
     userChoiceManager.cancelTarget(event.sender.id)
   })
   ipcMain.on('choice:response', (event, requestId: unknown, optionId: unknown) => {
@@ -115,12 +123,13 @@ app.whenReady().then(async () => {
       const globalPath = resolve(store.getPolicy().workspacePath)
       const updated = await store.setConversationWorkspace(conversationId, workspaceKey(selectedPath) === workspaceKey(globalPath) ? undefined : selectedPath)
       return { optionId, workspacePath: effectiveWorkspacePath(updated) }
-    })
+    }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }))
     assistantMessage.content = task.status === 'paused' && assistantMessage.content.trim()
       ? assistantMessage.content.trimEnd() + '\n\n[已暂停]'
       : task.result ?? task.error ?? ''
     assistantMessage.status = task.status
     assistantMessage.steps = task.steps
+    assistantMessage.artifacts = task.artifacts?.length ? task.artifacts : undefined
     assistantMessage.completedAt = new Date().toISOString()
     event.sender.send('agent:done', { conversationId, messageId: assistantMessage.id, status: assistantMessage.status, content: assistantMessage.content, completedAt: assistantMessage.completedAt })
     const conversation = await store.updateMessage(conversationId, assistantMessage)
@@ -156,8 +165,53 @@ app.whenReady().then(async () => {
     const conversation = store.getConversation(conversationId)
     return store.setConversationAttachments(conversationId, (conversation.activeAttachments ?? []).filter((attachment) => attachment.id !== attachmentId))
   })
+  ipcMain.handle('workspace:open-file', async (_event, conversationId: unknown, filePath: unknown) => {
+    try {
+      if (typeof conversationId !== 'string' || typeof filePath !== 'string') throw new Error('文件导航参数无效。')
+      const conversation = store.getConversations().find((item) => item.id === conversationId)
+      if (!conversation) throw new Error('找不到对应会话。')
+      const target = await resolveWorkspaceFile(effectiveWorkspacePath(conversation), filePath)
+      const configuredApplication = store.getSettings().navigation.fileApplicationPath.trim()
+      if (configuredApplication && isTextFilePath(filePath)) {
+        await launchApplication(await validateApplicationPath(configuredApplication), target)
+        return { ok: true }
+      }
+      const errorMessage = await shell.openPath(target)
+      return errorMessage ? { ok: false, message: errorMessage } : { ok: true }
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '无法打开文件。' }
+    }
+  })
+  ipcMain.handle('external:open-url', async (_event, value: unknown) => {
+    try {
+      if (typeof value !== 'string') throw new Error('Web 服务地址无效。')
+      const url = normalizeWebUrl(value)
+      const configuredBrowser = store.getSettings().navigation.browserApplicationPath.trim()
+      if (configuredBrowser) {
+        await launchApplication(await validateApplicationPath(configuredBrowser), url)
+        return { ok: true }
+      }
+      await shell.openExternal(url)
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : '无法打开 Web 服务。' }
+    }
+  })
   ipcMain.handle('settings:get', () => store.getSettings())
   ipcMain.handle('settings:save', (_event, settings: AppSettings) => store.saveSettings(settings))
+  ipcMain.handle('settings:select-application', async (event, kind: unknown) => {
+    if (kind !== 'file' && kind !== 'browser') return undefined
+    const current = store.getSettings().navigation[kind === 'file' ? 'fileApplicationPath' : 'browserApplicationPath']
+    const parent = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = {
+      title: kind === 'file' ? '选择代码和文本文件的默认应用' : '选择 Web 服务的默认浏览器',
+      defaultPath: current.trim() || undefined,
+      properties: ['openFile'],
+      filters: process.platform === 'win32' ? [{ name: '应用程序', extensions: ['exe'] }, { name: '所有文件', extensions: ['*'] }] : undefined
+    }
+    const result = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options)
+    return result.canceled ? undefined : result.filePaths[0]
+  })
   ipcMain.handle('policy:get', () => store.getPolicy())
   ipcMain.handle('policy:save', (_event, policy) => store.savePolicy(policy))
   ipcMain.handle('settings:test-connection', async (_event, settings: AppSettings) => {
@@ -185,6 +239,7 @@ app.on('before-quit', () => {
   for (const controller of runningTasks.values()) controller.abort()
   runningTasks.clear()
   mcpApprovalManager.cancelAll()
+  commandApprovalManager.cancelAll()
   userChoiceManager.cancelAll()
   if (pptMcpServer) void pptMcpServer.close().catch((error) => console.error('[ppt mcp close failed]', error))
 })

@@ -13,9 +13,12 @@ const api: DesktopApi = {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (settings: AppSettings) => ipcRenderer.invoke('settings:save', settings),
   testConnection: (settings: AppSettings) => ipcRenderer.invoke('settings:test-connection', settings),
+  selectApplication: (kind) => ipcRenderer.invoke('settings:select-application', kind),
   getPolicy: () => ipcRenderer.invoke('policy:get'),
   savePolicy: (policy: AgentPolicy) => ipcRenderer.invoke('policy:save', policy),
   copyText: (text) => clipboard.writeText(text),
+  openWorkspaceFile: (conversationId, path) => ipcRenderer.invoke('workspace:open-file', conversationId, path),
+  openExternalUrl: (url) => ipcRenderer.invoke('external:open-url', url),
   onAgentStep: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)
     ipcRenderer.on('agent:step', listener)
@@ -38,6 +41,14 @@ const api: DesktopApi = {
   },
   respondMcpApproval: (requestId, approved) => {
     ipcRenderer.send('mcp:approval-response', requestId, approved)
+  },
+  onCommandApprovalRequest: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)
+    ipcRenderer.on('command:approval-request', listener)
+    return () => ipcRenderer.off('command:approval-request', listener)
+  },
+  respondCommandApproval: (requestId, approved) => {
+    ipcRenderer.send('command:approval-response', requestId, approved)
   },
   onUserChoiceRequest: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)

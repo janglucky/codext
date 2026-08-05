@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Check, Copy, Eye, EyeOff } from 'lucide-react'
-import type { AgentPolicy, AppSettings, ChatAttachment, ChatMessage, Conversation, McpApprovalRequest, TaskStatus, TaskStep, UserChoiceRequest } from '../../shared/types'
+import { Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, RotateCcw, SquareTerminal } from 'lucide-react'
+import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, TaskStatus, TaskStep, UserChoiceRequest } from '../../shared/types'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -43,14 +43,18 @@ const paths: Record<IconName, ReactElement> = {
   close: <><path d="m7 7 10 10" /><path d="M17 7 7 17" /></>
 }
 
-const initialSettings: AppSettings = { model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 }, skillsEnabled: true }
+const initialSettings: AppSettings = {
+  model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 },
+  skillsEnabled: true,
+  navigation: { fileApplicationPath: '', browserApplicationPath: '' }
+}
 const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败', paused: '已暂停' }
 const THINKING_TITLE = '思考过程'
 const THINKING_PLACEHOLDER = '思考中…'
 const LOCAL_ASSISTANT_PREFIX = 'local-agent-'
 const LOCAL_STEP_PREFIX = 'local-step-'
 type View = 'chat' | 'settings'
-type SettingTab = '常规' | '外观' | '配置' | '个性化' | '浏览器' | 'Git' | '环境'
+type SettingTab = '常规' | '外观' | '配置' | '个性化' | '打开方式' | 'Git' | '环境'
 
 function Icon({ name, ...props }: IconProps): ReactElement {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{paths[name]}</svg>
@@ -69,6 +73,7 @@ export function App(): ReactElement {
   const [running, setRunning] = useState(false)
   const [pauseRequested, setPauseRequested] = useState(false)
   const [mcpApproval, setMcpApproval] = useState<McpApprovalRequest | undefined>()
+  const [commandApproval, setCommandApproval] = useState<CommandApprovalRequest | undefined>()
   const [userChoice, setUserChoice] = useState<UserChoiceRequest | undefined>()
   const [selectedChoiceId, setSelectedChoiceId] = useState('')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
@@ -131,6 +136,7 @@ export function App(): ReactElement {
   useEffect(() => {
     return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt }) => {
       setMcpApproval(undefined)
+      setCommandApproval(undefined)
       setUserChoice(undefined)
       setSelectedChoiceId('')
       setConversations((current) => current.map((conversation) => {
@@ -145,6 +151,12 @@ export function App(): ReactElement {
 
   useEffect(() => window.api.onMcpApprovalRequest((request) => {
     setMcpApproval(request)
+    if (request.conversationId) setActiveId(request.conversationId)
+    setView('chat')
+  }), [])
+
+  useEffect(() => window.api.onCommandApprovalRequest((request) => {
+    setCommandApproval(request)
     if (request.conversationId) setActiveId(request.conversationId)
     setView('chat')
   }), [])
@@ -166,10 +178,19 @@ export function App(): ReactElement {
   }, [mcpApproval])
 
   useEffect(() => {
+    if (!commandApproval) return
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') respondToCommandApproval(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [commandApproval])
+
+  useEffect(() => {
     const list = messageListRef.current
     if (!list) return
     list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' })
-  }, [activeConversation?.id, scrollKey, mcpApproval?.id, userChoice?.id])
+  }, [activeConversation?.id, scrollKey, mcpApproval?.id, commandApproval?.id, userChoice?.id])
 
   useEffect(() => {
     if (!previewAttachment) return
@@ -359,6 +380,12 @@ export function App(): ReactElement {
     setMcpApproval(undefined)
   }
 
+  function respondToCommandApproval(approved: boolean): void {
+    if (!commandApproval) return
+    window.api.respondCommandApproval(commandApproval.id, approved)
+    setCommandApproval(undefined)
+  }
+
   function confirmUserChoice(): void {
     if (!userChoice || !selectedChoiceId) return
     window.api.respondUserChoice(userChoice.id, selectedChoiceId)
@@ -378,7 +405,7 @@ export function App(): ReactElement {
       <button className="sidebar-settings" onClick={() => setView('settings')}><Icon name="settings" /><span>设置</span></button>
     </aside>
     <main className="chat-main">
-      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
+      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
       <form className="chat-composer" onSubmit={submit}>
         <input ref={fileInputRef} className="attachment-input" type="file" accept={ATTACHMENT_ACCEPT} multiple onChange={(event) => { queueFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = '' }} />
         {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onRemove={() => removeAttachment(attachment.id)} onPreview={() => setPreviewAttachment(attachment)} />)}</div> : null}
@@ -400,6 +427,17 @@ function McpApprovalMessage({ request, onRespond }: { request: McpApprovalReques
       <div className="mcp-approval-heading"><span className="mcp-approval-icon"><Icon name="shield" /></span><div><h2 id="mcp-approval-title">PPT MCP 请求授权</h2><p>Agent 准备通过本地 PPT 处理服务读取演示文稿。</p></div></div>
       <dl className="mcp-approval-details"><div><dt>工具</dt><dd>{toolDisplayName(request.toolName)}</dd></div>{request.workspacePath ? <div><dt>工作区</dt><dd>{request.workspacePath}</dd></div> : null}{request.path ? <div><dt>文件</dt><dd>{request.path}</dd></div> : null}<div><dt>服务</dt><dd>{request.serverUrl}</dd></div></dl>
       <div className="mcp-approval-footer"><span>仅授权本次调用</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>取消</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>允许一次</button></div></div>
+    </section>
+  </article>
+}
+
+function CommandApprovalMessage({ request, onRespond }: { request: CommandApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
+  return <article className="message-item assistant mcp-approval-message" role="group" aria-labelledby="command-approval-title">
+    <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">等待命令授权</b></div>
+    <section className="mcp-approval-inline command-approval-inline">
+      <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">命令可能修改状态</h2><p>{request.reason}</p></div></div>
+      <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
+      <div className="mcp-approval-footer"><span>仅授权本次命令</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>允许一次</button></div></div>
     </section>
   </article>
 }
@@ -457,7 +495,7 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
   return upsertStep(currentSteps, nextStep)
 }
 
-function MessageView({ message, onPreview }: { message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
+function MessageView({ conversationId, message, onPreview }: { conversationId: string; message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
   return <article className={'message-item ' + message.role}>
     <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
@@ -466,9 +504,136 @@ function MessageView({ message, onPreview }: { message: ChatMessage; onPreview: 
       {message.content ? message.role === 'assistant'
         ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div>
         : <div className="message-bubble">{message.content}</div> : null}
+      {message.role === 'assistant' && message.artifacts?.length ? <ResultArtifacts conversationId={conversationId} artifacts={message.artifacts} /> : null}
       {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onPreview={() => onPreview(attachment)} />)}</div> : null}
     </div>
   </article>
+}
+
+function ResultArtifacts({ conversationId, artifacts }: { conversationId: string; artifacts: AgentArtifact[] }): ReactElement {
+  const files = artifacts.filter((artifact): artifact is Extract<AgentArtifact, { type: 'file' }> => artifact.type === 'file')
+  const services = [...new Set(artifacts
+    .filter((artifact): artifact is Extract<AgentArtifact, { type: 'service' }> => artifact.type === 'service')
+    .map((artifact) => normalizeServiceArtifactUrl(artifact.url))
+    .filter((url): url is string => Boolean(url)))]
+  const [opening, setOpening] = useState('')
+  const [error, setError] = useState('')
+  const [filesExpanded, setFilesExpanded] = useState(false)
+  const [serviceMenu, setServiceMenu] = useState('')
+  const [copiedUrl, setCopiedUrl] = useState('')
+  const menuRef = useRef<HTMLDivElement | null>(null)
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const visibleFiles = filesExpanded ? files : files.slice(0, 3)
+  useEffect(() => {
+    if (!serviceMenu) return
+    const closeMenu = (event: PointerEvent): void => {
+      if (!menuRef.current?.contains(event.target as Node)) setServiceMenu('')
+    }
+    document.addEventListener('pointerdown', closeMenu)
+    return () => document.removeEventListener('pointerdown', closeMenu)
+  }, [serviceMenu])
+  useEffect(() => () => { if (copyTimer.current) clearTimeout(copyTimer.current) }, [])
+
+  async function openFile(path: string): Promise<void> {
+    const key = 'file:' + path
+    setOpening(key)
+    setError('')
+    try {
+      const result = await window.api.openWorkspaceFile(conversationId, path)
+      if (!result.ok) setError(result.message || '无法打开文件。')
+    } catch {
+      setError('无法打开文件。')
+    } finally {
+      setOpening('')
+    }
+  }
+
+  async function openService(url: string): Promise<void> {
+    const key = 'service:' + url
+    setServiceMenu('')
+    setOpening(key)
+    setError('')
+    try {
+      const result = await window.api.openExternalUrl(url)
+      if (!result.ok) setError(result.message || '无法打开 Web 服务。')
+    } catch {
+      setError('无法打开 Web 服务。')
+    } finally {
+      setOpening('')
+    }
+  }
+
+  function copyServiceUrl(url: string): void {
+    window.api.copyText(url)
+    setCopiedUrl(url)
+    if (copyTimer.current) clearTimeout(copyTimer.current)
+    copyTimer.current = setTimeout(() => setCopiedUrl(''), 1600)
+  }
+
+  return <section className="result-artifacts" aria-label="任务产物">
+    {files.length ? <div className="file-result-card">
+      <div className="file-result-heading"><span className="result-card-icon file"><FileCode2 /></span><div><strong>已创建或编辑 {files.length} 个文件</strong><small>工作区文件</small></div></div>
+      <div className="file-result-list">{visibleFiles.map((file) => {
+        const key = 'file:' + file.path
+        return <button type="button" key={key} className="file-result-row" disabled={Boolean(opening)} title={'使用本地应用打开 ' + file.path} onClick={() => void openFile(file.path)}><ArtifactFileIcon path={file.path} /><span><strong>{artifactFileName(file.path)}</strong><small>{file.path}</small></span>{opening === key ? <LoaderCircle className="artifact-spinner" /> : <ExternalLink />}</button>
+      })}</div>
+      {files.length > 3 ? <button type="button" className={'file-result-expand ' + (filesExpanded ? 'expanded' : '')} onClick={() => setFilesExpanded((expanded) => !expanded)}>{filesExpanded ? '收起文件' : '显示另外 ' + (files.length - 3) + ' 个文件'}<ChevronDown /></button> : null}
+    </div> : null}
+    {services.map((url) => {
+      const key = 'service:' + url
+      const menuOpen = serviceMenu === url
+      return <div className="service-preview-card" key={key}>
+        <span className="result-card-icon service"><Globe2 /></span>
+        <div className="service-preview-details"><strong>网页预览</strong><small title={url}>{serviceDisplayName(url)} · 网站</small></div>
+        <div className="service-open-control" ref={menuOpen ? menuRef : undefined}>
+          <button type="button" className={'service-open-trigger ' + (menuOpen ? 'open' : '')} disabled={Boolean(opening)} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setServiceMenu(menuOpen ? '' : url)}>{opening === key ? <LoaderCircle className="artifact-spinner" /> : null}<span>{opening === key ? '打开中…' : '打开方式'}</span><ChevronDown /></button>
+          {menuOpen ? <div className="service-open-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => void openService(url)}><ExternalLink /><span><strong>打开网页</strong><small>默认浏览器</small></span></button>
+            <button type="button" role="menuitem" onClick={() => copyServiceUrl(url)}>{copiedUrl === url ? <Check /> : <Copy />}<span><strong>{copiedUrl === url ? '已复制' : '复制链接'}</strong><small>{url}</small></span></button>
+          </div> : null}
+        </div>
+      </div>
+    })}
+    {error ? <p className="artifact-error" role="alert">{error}</p> : null}
+  </section>
+}
+
+function ArtifactFileIcon({ path }: { path: string }): ReactElement {
+  const normalized = path.toLowerCase().replaceAll('\\', '/')
+  const extension = normalized.split('/').at(-1)?.split('.').at(-1) ?? ''
+  if (extension === 'json' || extension === 'jsonc') return <FileJson2 />
+  if (['html', 'htm', 'xml', 'vue', 'svelte'].includes(extension)) return <CodeXml />
+  if (['css', 'scss', 'sass', 'less', 'styl'].includes(extension)) return <Palette />
+  if (['md', 'mdx', 'txt', 'log'].includes(extension)) return <FileText />
+  if (['sql', 'db', 'sqlite', 'sqlite3'].includes(extension)) return <Database />
+  if (['yaml', 'yml', 'toml', 'ini', 'env', 'config'].includes(extension) || normalized.endsWith('/.gitignore')) return <FileCog />
+  return <FileCode2 />
+}
+
+function artifactFileName(path: string): string {
+  return path.replaceAll('\\', '/').split('/').filter(Boolean).at(-1) || path
+}
+
+function serviceDisplayName(value: string): string {
+  try {
+    const url = new URL(value)
+    return url.host || value
+  } catch {
+    return value
+  }
+}
+
+function normalizeServiceArtifactUrl(value: string): string | undefined {
+  const markdownTarget = /\]\((https?:\/\/[^\s)]+)\)?$/i.exec(value)?.[1]
+  const candidate = (markdownTarget ?? value).replace(/[),.;\]，。；]+$/, '')
+  try {
+    const url = new URL(candidate)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
+    return url.toString()
+  } catch {
+    return undefined
+  }
 }
 
 function AttachmentCard({ attachment, onRemove, onPreview }: { attachment: ChatAttachment; onRemove?: () => void; onPreview?: () => void }): ReactElement {
@@ -600,9 +765,66 @@ function formatElapsed(durationMs: number): string {
 }
 
 function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => void }): ReactElement {
-  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['浏览器'] }, { title: '编码', tabs: ['Git', '环境'] }]
+  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['打开方式'] }, { title: '编码', tabs: ['Git', '环境'] }]
   const isGeneral = tab === '常规'
-  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
+  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : item === '打开方式' ? 'folder' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : tab === '打开方式' ? <NavigationSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
+}
+
+function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => void }): ReactElement {
+  const [selecting, setSelecting] = useState<'file' | 'browser' | undefined>()
+  const [saved, setSaved] = useState(false)
+  async function selectApplication(kind: 'file' | 'browser'): Promise<void> {
+    setSelecting(kind)
+    setSaved(false)
+    try {
+      const selectedPath = await window.api.selectApplication(kind)
+      if (!selectedPath) return
+      setSettings({
+        ...settings,
+        navigation: {
+          ...settings.navigation,
+          [kind === 'file' ? 'fileApplicationPath' : 'browserApplicationPath']: selectedPath
+        }
+      })
+    } finally {
+      setSelecting(undefined)
+    }
+  }
+  function resetApplication(kind: 'file' | 'browser'): void {
+    setSaved(false)
+    setSettings({
+      ...settings,
+      navigation: {
+        ...settings.navigation,
+        [kind === 'file' ? 'fileApplicationPath' : 'browserApplicationPath']: ''
+      }
+    })
+  }
+  function save(): void {
+    onSave()
+    setSaved(true)
+  }
+  const rows = [
+    { kind: 'file' as const, title: '代码和文本文件', description: '用于打开代码、Markdown、配置和其他文本文件。', path: settings.navigation.fileApplicationPath, icon: <FileCode2 /> },
+    { kind: 'browser' as const, title: 'Web 浏览器', description: '用于打开任务产生的 HTTP 和 HTTPS 服务地址。', path: settings.navigation.browserApplicationPath, icon: <Globe2 /> }
+  ]
+  return <div className="settings-inner navigation-settings">
+    <h1>打开方式</h1>
+    <section className="settings-section">
+      <h2>默认应用</h2>
+      <p>未指定应用时，将使用 Windows 的系统默认设置。</p>
+      <div className="application-list">{rows.map((row) => <div className="application-row" key={row.kind}>
+        <span className="application-type-icon">{row.icon}</span>
+        <div className="application-details"><strong>{row.title}</strong><p>{row.description}</p><code title={row.path || '使用系统默认'}>{row.path || '使用系统默认'}</code></div>
+        <div className="application-actions">
+          <button type="button" className="application-select" disabled={Boolean(selecting)} onClick={() => void selectApplication(row.kind)}><FolderOpen />{selecting === row.kind ? '选择中…' : '选择应用'}</button>
+          <button type="button" className="application-reset" disabled={!row.path || Boolean(selecting)} aria-label={'恢复' + row.title + '的系统默认应用'} title="恢复系统默认" onClick={() => resetApplication(row.kind)}><RotateCcw /></button>
+        </div>
+      </div>)}</div>
+    </section>
+    <button className="settings-save" onClick={save}>保存更改</button>
+    {saved && <div className="config-notice success"><Check />打开方式已保存到本地。</div>}
+  </div>
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
@@ -634,7 +856,8 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
     parse_word: '解析 Word',
     parse_excel: '解析 Excel',
     parse_powerpoint: '解析 PowerPoint',
-    run_command: '执行命令行'
+    run_command: '执行命令行',
+    start_service: '启动 Web 服务'
   }
   function toggleTool(name: string): void { setPolicy({ ...policy, enabledTools: policy.enabledTools.includes(name) ? policy.enabledTools.filter((item) => item !== name) : [...policy.enabledTools, name] }) }
 

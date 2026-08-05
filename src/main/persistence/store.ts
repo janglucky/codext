@@ -4,13 +4,34 @@ import { join } from 'node:path'
 import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation } from '../../shared/types'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
+type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation'> & {
+  model?: Partial<AppSettings['model']>
+  navigation?: Partial<AppSettings['navigation']>
+}
 type PersistedStateDraft = Partial<PersistedState> & {
-  settings?: Partial<AppSettings> & { model?: Partial<AppSettings['model']> }
+  settings?: SettingsDraft
   policy?: Partial<AgentPolicy>
   tasks?: AgentTask[]
 }
 
-export const defaults: AppSettings = { model: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3 }, skillsEnabled: true }
+export const defaults: AppSettings = {
+  model: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3 },
+  skillsEnabled: true,
+  navigation: { fileApplicationPath: '', browserApplicationPath: '' }
+}
+
+function normalizeSettings(settings?: SettingsDraft): AppSettings {
+  const normalized: AppSettings = {
+    model: { ...defaults.model, ...settings?.model },
+    skillsEnabled: settings?.skillsEnabled ?? defaults.skillsEnabled,
+    navigation: {
+      fileApplicationPath: typeof settings?.navigation?.fileApplicationPath === 'string' ? settings.navigation.fileApplicationPath : '',
+      browserApplicationPath: typeof settings?.navigation?.browserApplicationPath === 'string' ? settings.navigation.browserApplicationPath : ''
+    }
+  }
+  normalized.model.timeoutMs = Math.max(normalized.model.timeoutMs, defaults.model.timeoutMs)
+  return normalized
+}
 const legacySystemPrompt = '你是 Codext Agent。你在 Windows 桌面工作区中协助用户完成任务。优先使用可用工具读取、写入和检查文件；执行命令前说明目的；绝不访问工作区外的文件；遇到危险或破坏性命令必须拒绝。输出简洁、可验证的结果。'
 const previousOfficeMcpSystemPrompt = [
   '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
@@ -28,6 +49,7 @@ const previousLocalOfficeSystemPrompt = [
 ].join('\n')
 const legacyEnabledTools = ['read_file', 'write_file', 'run_command']
 const previousDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'run_command']
+const previousOfficeDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command']
 export const defaultPolicy: AgentPolicy = {
   systemPrompt: [
     '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
@@ -37,7 +59,7 @@ export const defaultPolicy: AgentPolicy = {
     '最终答复要简洁、可验证，并说明实际完成了什么。'
   ].join('\n'),
   workspacePath: 'D:/work/codext',
-  enabledTools: ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command']
+  enabledTools: ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command', 'start_service']
 }
 
 /** 返回当前时间的 ISO 8601 字符串，用于时间戳字段的统一格式。 */
@@ -54,11 +76,7 @@ export class LocalStore {
   async load(): Promise<void> {
     try {
       const draft = JSON.parse(await readFile(this.path, 'utf8')) as PersistedStateDraft
-      const settings: AppSettings = {
-        model: { ...defaults.model, ...draft.settings?.model },
-        skillsEnabled: draft.settings?.skillsEnabled ?? defaults.skillsEnabled
-      }
-      settings.model.timeoutMs = Math.max(settings.model.timeoutMs, defaults.model.timeoutMs)
+      const settings = normalizeSettings(draft.settings)
       this.state = {
         settings,
         policy: {
@@ -81,7 +99,7 @@ export class LocalStore {
   getPolicy(): AgentPolicy { return this.state.policy ?? defaultPolicy }
   getConversations(): Conversation[] { return this.state.conversations }
 
-  async saveSettings(settings: AppSettings): Promise<AppSettings> { this.state.settings = settings; await this.save(); return settings }
+  async saveSettings(settings: AppSettings): Promise<AppSettings> { this.state.settings = normalizeSettings(settings); await this.save(); return this.state.settings }
   async savePolicy(policy: AgentPolicy): Promise<AgentPolicy> { this.state.policy = policy; await this.save(); return policy }
 
   async createConversation(): Promise<Conversation> {
@@ -160,7 +178,7 @@ export class LocalStore {
     const createdAt = tasks[tasks.length - 1]?.createdAt ?? now()
     const messages = tasks.flatMap((task): ChatMessage[] => [
       { id: crypto.randomUUID(), role: 'user', content: task.prompt, createdAt: task.createdAt },
-      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps }
+      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps, artifacts: task.artifacts }
     ])
     return { id: crypto.randomUUID(), title: '历史任务', createdAt, updatedAt: tasks[0]?.createdAt ?? createdAt, messages }
   }
@@ -188,5 +206,6 @@ function normalizeEnabledTools(enabledTools?: string[]): string[] {
   if (!enabledTools) return defaultPolicy.enabledTools
   const isLegacyDefault = enabledTools.length === legacyEnabledTools.length && legacyEnabledTools.every((tool) => enabledTools.includes(tool))
   const isPreviousDefault = enabledTools.length === previousDefaultEnabledTools.length && previousDefaultEnabledTools.every((tool) => enabledTools.includes(tool))
-  return isLegacyDefault || isPreviousDefault ? defaultPolicy.enabledTools : enabledTools
+  const isPreviousOfficeDefault = enabledTools.length === previousOfficeDefaultEnabledTools.length && previousOfficeDefaultEnabledTools.every((tool) => enabledTools.includes(tool))
+  return isLegacyDefault || isPreviousDefault || isPreviousOfficeDefault ? defaultPolicy.enabledTools : enabledTools
 }

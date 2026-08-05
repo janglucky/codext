@@ -1,9 +1,10 @@
-import type { AgentPolicy, AgentTask, AppSettings, ChatAttachment, McpApprovalDetails, TaskStep, UserChoiceDetails } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, McpApprovalDetails, TaskStep, UserChoiceDetails } from '../../shared/types'
 import { isDecryptableAttachmentName, isImageAttachmentType, isOfficeAttachmentType, isTextAttachmentType, MAX_TEXT_ATTACHMENT_CHARACTERS, officeAttachmentTool, type OfficeAttachmentTool } from '../../shared/attachments'
 import { WorkspaceTools } from '../tools/workspace-tools'
 import { getEnabledToolDefinitions, isToolName, type ToolCall } from '../tools/tool-registry'
 import { parseOfficeDocument, type OfficeDocumentKind } from '../tools/office-parser'
 import { PptMcpClient } from '../ppt/ppt-mcp-client'
+import { classifyCommandRisk } from '../tools/command-risk'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
@@ -37,6 +38,7 @@ type ConversationMessage = { role: 'user' | 'assistant'; content: string; attach
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
 type McpApprovalCallback = (request: McpApprovalDetails) => Promise<boolean>
+type CommandApprovalCallback = (request: CommandApprovalDetails) => Promise<boolean>
 type UserChoiceSelection = string | { optionId?: string; workspacePath?: string }
 type UserChoiceCallback = (request: UserChoiceDetails) => Promise<UserChoiceSelection | undefined>
 
@@ -48,7 +50,7 @@ export class ReactAgent {
     private readonly maxReactTurns = MAX_REACT_TURNS
   ) {}
 
-  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback): Promise<AgentTask> {
+  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback): Promise<AgentTask> {
     const task: AgentTask = { id: crypto.randomUUID(), prompt, status: 'reasoning', createdAt: new Date().toISOString(), steps: [] }
     const configuredPolicy = this.getPolicy()
     const policy = workspacePath?.trim() ? { ...configuredPolicy, workspacePath: workspacePath.trim() } : configuredPolicy
@@ -56,7 +58,9 @@ export class ReactAgent {
     task.status = 'acting'
 
     try {
-      task.result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice)
+      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval)
+      task.result = result
+      this.recordServiceArtifacts(task, result, false)
       task.status = 'validating'
       task.status = 'succeeded'
     } catch (error) {
@@ -67,7 +71,7 @@ export class ReactAgent {
     return task
   }
 
-  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback): Promise<string> {
+  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback): Promise<string> {
     throwIfAborted(signal)
     const settings = this.getSettings()
     if (!settings.model.baseUrl || !settings.model.model) {
@@ -100,7 +104,10 @@ export class ReactAgent {
     let previousActionSignature = ''
     let previousActionHadError = false
     let unresolvedCommandFailure = false
+    let incompleteToolCallRetries = 0
+    let modelConnectionRecoveryUsed = false
     const deniedMcpPaths = new Set<string>()
+    const deniedCommandSignatures = new Set<string>()
 
     for (let turn = 1; turn <= this.maxReactTurns + 1; turn++) {
       throwIfAborted(signal)
@@ -111,11 +118,41 @@ export class ReactAgent {
           this.upsertStep(task, thoughtStep, onStep)
         }
       )
-      const content = await this.callModel(messages, (delta) => stream.push(delta), signal)
+      let content: string
+      try {
+        content = await this.callModel(messages, (delta) => stream.push(delta), signal)
+      } catch (error) {
+        const modelError = error instanceof Error ? error : new Error(String(error))
+        const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
+        if (!modelConnectionRecoveryUsed && hasToolProgress && this.isRetryableModelError(modelError)) {
+          modelConnectionRecoveryUsed = true
+          this.compactToolContext(messages)
+          this.addStep(task, step('reason', '模型连接中断，正在恢复', '已保留工具执行结果并压缩上下文，准备继续未完成的任务。'), onStep)
+          await abortableDelay(1000, signal)
+          turn--
+          continue
+        }
+        if (this.isRetryableModelError(modelError)) throw new Error('模型连接中断，自动重试后仍未恢复：' + modelError.message)
+        throw modelError
+      }
+      modelConnectionRecoveryUsed = false
+      const assistantMessageIndex = messages.length
       messages.push({ role: 'assistant', content })
 
       const reply = this.parseReply(content)
       let toolCalls = this.getToolCalls(reply)
+      if (!toolCalls.length && looksLikeIncompleteToolCall(content)) {
+        incompleteToolCallRetries++
+        if (incompleteToolCallRetries > 3 || turn > this.maxReactTurns) throw new Error('模型工具调用连续被截断，无法生成可执行的完整 Action。')
+        messages[messages.length - 1] = { role: 'assistant', content: '[上一条工具调用在 Action JSON 闭合前被截断，未执行。]' }
+        this.addStep(task, step('reason', '工具调用响应不完整', 'Action JSON 在传输完成前被截断，正在请求模型缩小内容后重新生成。'), onStep)
+        messages.push({
+          role: 'user',
+          content: '上一条 Action JSON 在结束前被截断，不能执行，也不能把它作为 Final。请立即重新输出一个完整 Action JSON。若 write_file 的 content 较长，必须精简实现，或把 HTML、CSS、JavaScript 拆成多个文件并逐个调用 write_file；单次 content 不得超过 6000 个字符。不要重复发送同样的超长内容。'
+        })
+        continue
+      }
+      if (toolCalls.length) incompleteToolCallRetries = 0
       const implicitOfficeCall = !toolCalls.length && !pendingDecryptPaths.size
         ? inferOfficeToolCall(prompt, reply, pendingOfficeParses)
         : undefined
@@ -179,6 +216,13 @@ export class ReactAgent {
         previousActionHadError = true
         continue
       }
+      const deniedCommandCall = toolCalls.find((call) => call.name === 'run_command' && call.arguments.command && deniedCommandSignatures.has(commandSignature(call.arguments.command, call.arguments.args ?? [])))
+      if (deniedCommandCall) {
+        messages.push({ role: 'user', content: '用户或安全策略已经拒绝执行相同命令，不得再次申请。请改用只读命令、其他安全方案，或如实说明限制并输出 Final。' })
+        previousActionSignature = ''
+        previousActionHadError = true
+        continue
+      }
       const actionSignature = JSON.stringify(toolCalls)
       if (actionSignature === previousActionSignature && !previousActionHadError) return content
       previousActionSignature = actionSignature
@@ -193,20 +237,38 @@ export class ReactAgent {
         }
         let output: string
         try {
-          output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, signal)
+          output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, requestCommandApproval, signal)
           throwIfAborted(signal)
+          this.recordToolArtifacts(task, call, output)
+          if (call.name === 'write_file' && call.arguments.path) {
+            const contentLength = typeof call.arguments.content === 'string' ? call.arguments.content.length : 0
+            messages[assistantMessageIndex] = {
+              role: 'assistant',
+              content: '已执行 write_file：' + call.arguments.path + '（写入内容 ' + contentLength + ' 个字符，正文已从后续模型上下文省略）。'
+            }
+          }
           if (call.name === 'run_command') unresolvedCommandFailure = false
           if (call.name === 'parse_powerpoint' && call.arguments.path && output.includes('用户未授权')) {
             deniedMcpPaths.add(call.arguments.path)
             currentActionHadError = true
             output += '\n不要再次请求该路径的 MCP 授权，请改用其他解决思路。'
           }
+          if (call.name === 'run_command' && call.arguments.command && output.includes('用户拒绝')) {
+            deniedCommandSignatures.add(commandSignature(call.arguments.command, call.arguments.args ?? []))
+            currentActionHadError = true
+            output += '\n不要再次申请相同命令；请改用只读命令或其他安全方案。'
+          }
         } catch (error) {
           throwIfAborted(signal)
           if (!isRecoverableToolError(error, call.name)) throw error
           currentActionHadError = true
-          if (call.name === 'run_command') unresolvedCommandFailure = true
           output = '工具执行失败：' + (error instanceof Error ? error.message : String(error))
+          const securityBlocked = call.name === 'run_command' && output.includes('安全策略阻止')
+          if (call.name === 'run_command') unresolvedCommandFailure = !securityBlocked
+          if (securityBlocked && call.arguments.command) {
+            deniedCommandSignatures.add(commandSignature(call.arguments.command, call.arguments.args ?? []))
+            output += '\n安全策略已拒绝该命令，不得再次尝试。'
+          }
         }
         const observation = call.name + ': ' + output
         observations.push(observation)
@@ -230,7 +292,7 @@ export class ReactAgent {
   private buildSystemPrompt(policy: AgentPolicy): string {
     const toolSchema = [
       '{',
-      '  "action": { "name": "read_file|write_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command", "arguments": { ... } }',
+      '  "action": { "name": "read_file|write_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command|start_service", "arguments": { ... } }',
       '}'
     ].join('\n')
 
@@ -265,7 +327,7 @@ export class ReactAgent {
       '这里的工具通过文本 Action JSON 协议调用；即使模型 API 的原生 tools 列表为空，也不代表这些工具不可用。禁止声称工具未挂载、无法调用或要求用户重新启用。',
       '当问题需要读取 PowerPoint 内容时，立即输出 parse_powerpoint Action JSON，不要先解释限制。宿主收到该 Action 后会在当前会话向用户请求单次 MCP 授权；授权通过后继续调用，授权拒绝后不得重复申请同一路径，必须考虑其他工具或如实给出替代方案。',
       '禁止使用 run_command 调用 python、PowerShell、tar、unzip 或临时脚本来拆解 Word、Excel、PowerPoint 文件。Office 内容只能使用对应 parse_word、parse_excel、parse_powerpoint 工具；解析失败且疑似加密时使用 decrypt_file，否则根据 Observation 如实说明。',
-      '当需要读取、写入、创建目录、列举文件、解密文件、解析 Office 文档或执行命令时，输出 Action JSON：',
+      '当需要读取、写入、创建目录、列举文件、解密文件、解析 Office 文档、执行命令或启动服务时，输出 Action JSON：',
       toolSchema,
       '当任务完成或不需要工具时，输出 Final JSON：',
       finalSchema,
@@ -277,12 +339,12 @@ export class ReactAgent {
       '工具注册表（只能调用 enabled=true 的工具；严格按 inputSchema 传 arguments）：',
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
-      '所有文件路径必须是工作区内的相对路径。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。',
+      '所有文件路径必须是工作区内的相对路径。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。宿主会识别命令风险：ls、dir、cat、find、grep、git status/diff/log 以及 SSH 远程只读查询可以直接执行；可能写入文件、安装依赖、运行脚本或修改远程状态的命令会在当前会话请求用户单次授权；删除、格式化、关机、终止进程和强制清理命令会直接拒绝。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；但远程写操作仍必须等待宿主授权。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。'
     ].join('\n')
   }
 
-  private async executeTool(call: ToolCall, tools: WorkspaceTools, policy: AgentPolicy, requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal): Promise<string> {
+  private async executeTool(call: ToolCall, tools: WorkspaceTools, policy: AgentPolicy, requestMcpApproval?: McpApprovalCallback, requestCommandApproval?: CommandApprovalCallback, signal?: AbortSignal): Promise<string> {
     throwIfAborted(signal)
     if (!policy.enabledTools.includes(call.name)) throw new Error('工具未启用：' + call.name)
     if (call.name === 'read_file' && call.arguments.path) return tools.readFile(call.arguments.path)
@@ -314,10 +376,18 @@ export class ReactAgent {
       })
     }
     if (call.name === 'run_command' && call.arguments.command) {
+      const args = call.arguments.args ?? []
+      const risk = classifyCommandRisk(call.arguments.command, args)
+      if (risk.level === 'blocked') return tools.runCommand(call.arguments.command, args, signal)
+      const approved = risk.level === 'write' && requestCommandApproval
+        ? await requestCommandApproval({ command: call.arguments.command, args, displayCommand: risk.displayCommand, reason: risk.reason, workspacePath: policy.workspacePath }).catch(() => false)
+        : false
+      if (risk.level === 'write' && !approved) return '用户拒绝执行本次写入类命令，命令已取消。'
       return signal
-        ? tools.runCommand(call.arguments.command, call.arguments.args ?? [], signal)
-        : tools.runCommand(call.arguments.command, call.arguments.args ?? [])
+        ? tools.runCommand(call.arguments.command, args, signal, approved)
+        : tools.runCommand(call.arguments.command, args, undefined, approved)
     }
+    if (call.name === 'start_service' && call.arguments.command) return tools.startService(call.arguments.command, call.arguments.args ?? [], signal)
     throw new Error('工具参数不完整：' + call.name)
   }
 
@@ -363,6 +433,32 @@ export class ReactAgent {
     }
 
     return parts.length ? parts : prompt
+  }
+
+  private recordToolArtifacts(task: AgentTask, call: ToolCall, output: string): void {
+    if (call.name === 'write_file' && call.arguments.path) {
+      this.addArtifact(task, { type: 'file', path: call.arguments.path })
+    }
+    if (call.name === 'decrypt_file') {
+      try {
+        const result = JSON.parse(output) as { output_path?: unknown }
+        if (typeof result.output_path === 'string' && result.output_path.trim()) this.addArtifact(task, { type: 'file', path: result.output_path.trim() })
+      } catch {
+        /* 解密工具的非结构化输出不包含可导航文件。 */
+      }
+    }
+    if (call.name === 'run_command' || call.name === 'start_service') this.recordServiceArtifacts(task, output, true)
+  }
+
+  private recordServiceArtifacts(task: AgentTask, text: string, localOnly: boolean): void {
+    for (const url of extractWebUrls(text, localOnly)) this.addArtifact(task, { type: 'service', url })
+  }
+
+  private addArtifact(task: AgentTask, artifact: AgentArtifact): void {
+    const artifacts = task.artifacts ?? []
+    const key = artifact.type === 'file' ? 'file:' + artifact.path.replaceAll('\\', '/').toLowerCase() : 'service:' + artifact.url
+    const exists = artifacts.some((item) => (item.type === 'file' ? 'file:' + item.path.replaceAll('\\', '/').toLowerCase() : 'service:' + item.url) === key)
+    if (!exists) task.artifacts = [...artifacts, artifact]
   }
 
   private decodeTextAttachment(attachment: ChatAttachment): string {
@@ -443,6 +539,17 @@ export class ReactAgent {
     return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524 ||
       error.name === 'TypeError' || /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(error.message) ||
       (typeof causeCode === 'string' && /ECONNRESET|ETIMEDOUT|UND_ERR|EAI_AGAIN|ENETUNREACH/i.test(causeCode))
+  }
+
+  private compactToolContext(messages: ModelMessage[]): void {
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]
+      if (message.role !== 'user' || typeof message.content !== 'string' || !message.content.startsWith('Observation #') || message.content.length <= 16_000) continue
+      messages[index] = {
+        ...message,
+        content: message.content.slice(0, 12_000) + '\n\n[较长的工具输出已压缩]\n\n' + message.content.slice(-2_000)
+      }
+    }
   }
 
   private async readJsonResponse(response: Response): Promise<string> {
@@ -738,8 +845,47 @@ function isIncompleteFinal(finalText: string): boolean {
   return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目|构建|验证|修复|定位).{0,8}(?:尚未|未).{0,8}(?:完成|结束|通过|解决)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
 }
 
+function looksLikeIncompleteToolCall(content: string): boolean {
+  const payload = stripThoughtTags(content)
+  if (!/"(?:action|tool_calls)"\s*:/.test(payload)) return false
+  const toolName = /"name"\s*:\s*"([^"]+)"/.exec(payload)?.[1]
+  return Boolean(toolName && isToolName(normalizeToolName(toolName)))
+}
+
 function normalizeToolName(name: string): string {
   return name.trim().toLowerCase().replaceAll('-', '_')
+}
+
+function commandSignature(command: string, args: string[]): string {
+  return command.trim().toLowerCase() + '\n' + JSON.stringify(args)
+}
+
+function extractWebUrls(text: string, localOnly: boolean): string[] {
+  const ansiEscapePattern = new RegExp(String.fromCharCode(27) + '\\[[0-?]*[ -/]*[@-~]', 'g')
+  const markdownLinkPattern = /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi
+  const sanitized = text.replace(ansiEscapePattern, '').replace(markdownLinkPattern, '$1')
+  const matches = sanitized.match(/https?:\/\/[^\s<>"'`()\u005b\u005d]+/gi) ?? []
+  const urls = new Set<string>()
+  for (const match of matches) {
+    try {
+      const url = new URL(match.replace(/[),.;\]，。；]+$/, ''))
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') continue
+      if (localOnly && !isLocalServiceHost(url.hostname)) continue
+      if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
+      urls.add(url.toString())
+    } catch {
+      /* 忽略无法解析的模型或命令输出片段。 */
+    }
+  }
+  return [...urls]
+}
+
+function isLocalServiceHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  if (host === 'localhost' || host === '::1' || host === '::' || host === '0.0.0.0' || host.endsWith('.local')) return true
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return true
+  const private172 = /^172\.(\d{1,2})\./.exec(host)
+  return private172 ? Number(private172[1]) >= 16 && Number(private172[1]) <= 31 : false
 }
 
 function inferOfficeToolCall(prompt: string, reply: ReactModelReply, pendingOfficeParses: Map<string, OfficeAttachmentTool>): ToolCall | undefined {
@@ -844,7 +990,7 @@ function abortableDelay(durationMs: number, signal?: AbortSignal): Promise<void>
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {
   const message = error instanceof Error ? error.message : String(error)
   if (/工具未启用|工具参数不完整/.test(message)) return false
-  if (toolName === 'run_command' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
+  if (toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)
 }

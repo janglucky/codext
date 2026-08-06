@@ -1,7 +1,8 @@
 import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation } from '../../shared/types'
+import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, ModelConfig, ModelProfile } from '../../shared/types'
+import { LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
 type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation'> & {
@@ -14,23 +15,57 @@ type PersistedStateDraft = Partial<PersistedState> & {
   tasks?: AgentTask[]
 }
 
+const defaultModelConfig: ModelConfig = { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3 }
+const defaultModelProfile: ModelProfile = { id: LEGACY_MODEL_ID, name: 'OpenAI', provider: 'OpenAI', ...defaultModelConfig }
+
 export const defaults: AppSettings = {
-  model: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3 },
+  model: defaultModelConfig,
+  models: [defaultModelProfile],
+  defaultModelId: defaultModelProfile.id,
   skillsEnabled: true,
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
 
 function normalizeSettings(settings?: SettingsDraft): AppSettings {
+  const legacyConfig = { ...defaultModelConfig, ...settings?.model }
+  const rawProfiles = settings?.models?.length
+    ? settings.models
+    : [{ ...legacyConfig, id: LEGACY_MODEL_ID, name: legacyConfig.model || '默认模型', provider: 'OpenAI 兼容' }]
+  const usedIds = new Set<string>()
+  const profiles = rawProfiles.map((profile, index): ModelProfile => {
+    const requestedId = typeof profile.id === 'string' && profile.id.trim() ? profile.id.trim() : 'model-' + (index + 1)
+    let id = requestedId
+    let suffix = 2
+    while (usedIds.has(id)) id = requestedId + '-' + suffix++
+    usedIds.add(id)
+    const model = {
+      baseUrl: typeof profile.baseUrl === 'string' ? profile.baseUrl : defaultModelConfig.baseUrl,
+      apiKey: typeof profile.apiKey === 'string' ? profile.apiKey : '',
+      model: typeof profile.model === 'string' ? profile.model : '',
+      timeoutMs: Math.max(Number.isFinite(profile.timeoutMs) ? profile.timeoutMs : defaultModelConfig.timeoutMs, defaultModelConfig.timeoutMs),
+      maxRetries: Math.max(Number.isFinite(profile.maxRetries) ? profile.maxRetries : defaultModelConfig.maxRetries, 0)
+    }
+    return { ...model, id, name: typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : model.model || '模型 ' + (index + 1), provider: typeof profile.provider === 'string' && profile.provider.trim() ? profile.provider.trim() : 'OpenAI 兼容' }
+  })
+  const defaultModelId = typeof settings?.defaultModelId === 'string' && profiles.some((profile) => profile.id === settings.defaultModelId)
+    ? settings.defaultModelId
+    : profiles[0].id
+  const selected = profiles.find((profile) => profile.id === defaultModelId) ?? profiles[0]
   const normalized: AppSettings = {
-    model: { ...defaults.model, ...settings?.model },
+    model: modelConfigFromProfile(selected),
+    models: profiles,
+    defaultModelId,
     skillsEnabled: settings?.skillsEnabled ?? defaults.skillsEnabled,
     navigation: {
       fileApplicationPath: typeof settings?.navigation?.fileApplicationPath === 'string' ? settings.navigation.fileApplicationPath : '',
       browserApplicationPath: typeof settings?.navigation?.browserApplicationPath === 'string' ? settings.navigation.browserApplicationPath : ''
     }
   }
-  normalized.model.timeoutMs = Math.max(normalized.model.timeoutMs, defaults.model.timeoutMs)
   return normalized
+}
+
+function modelConfigFromProfile(profile: ModelProfile): ModelConfig {
+  return { baseUrl: profile.baseUrl, apiKey: profile.apiKey, model: profile.model, timeoutMs: profile.timeoutMs, maxRetries: profile.maxRetries }
 }
 const legacySystemPrompt = '你是 Codext Agent。你在 Windows 桌面工作区中协助用户完成任务。优先使用可用工具读取、写入和检查文件；执行命令前说明目的；绝不访问工作区外的文件；遇到危险或破坏性命令必须拒绝。输出简洁、可验证的结果。'
 const previousOfficeMcpSystemPrompt = [
@@ -99,7 +134,15 @@ export class LocalStore {
   getPolicy(): AgentPolicy { return this.state.policy ?? defaultPolicy }
   getConversations(): Conversation[] { return this.state.conversations }
 
-  async saveSettings(settings: AppSettings): Promise<AppSettings> { this.state.settings = normalizeSettings(settings); await this.save(); return this.state.settings }
+  async saveSettings(settings: AppSettings): Promise<AppSettings> {
+    this.state.settings = normalizeSettings(settings)
+    const validModelIds = new Set(getModelProfiles(this.state.settings).map((profile) => profile.id))
+    for (const conversation of this.state.conversations) {
+      if (conversation.modelId && !validModelIds.has(conversation.modelId)) delete conversation.modelId
+    }
+    await this.save()
+    return this.state.settings
+  }
   async savePolicy(policy: AgentPolicy): Promise<AgentPolicy> { this.state.policy = policy; await this.save(); return policy }
 
   async createConversation(): Promise<Conversation> {
@@ -130,6 +173,17 @@ export class LocalStore {
     const conversation = this.ensureConversation(conversationId)
     if (attachments?.length) conversation.activeAttachments = attachments
     else delete conversation.activeAttachments
+    conversation.updatedAt = now()
+    this.bumpConversation(conversation.id)
+    await this.save()
+    return conversation
+  }
+
+  async setConversationModel(conversationId: string, modelId?: string): Promise<Conversation> {
+    const conversation = this.ensureConversation(conversationId)
+    if (modelId && !getModelProfiles(this.state.settings).some((profile) => profile.id === modelId)) throw new Error('找不到指定的模型配置。')
+    if (modelId) conversation.modelId = modelId
+    else delete conversation.modelId
     conversation.updatedAt = now()
     this.bumpConversation(conversation.id)
     await this.save()
@@ -178,7 +232,7 @@ export class LocalStore {
     const createdAt = tasks[tasks.length - 1]?.createdAt ?? now()
     const messages = tasks.flatMap((task): ChatMessage[] => [
       { id: crypto.randomUUID(), role: 'user', content: task.prompt, createdAt: task.createdAt },
-      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps, artifacts: task.artifacts }
+      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps, artifacts: task.artifacts, tokenUsage: task.tokenUsage }
     ])
     return { id: crypto.randomUUID(), title: '历史任务', createdAt, updatedAt: tasks[0]?.createdAt ?? createdAt, messages }
   }

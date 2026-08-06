@@ -1,10 +1,11 @@
-import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, McpApprovalDetails, TaskStep, UserChoiceDetails } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, McpApprovalDetails, ModelConfig, TaskStep, TokenUsage, UserChoiceDetails } from '../../shared/types'
 import { isDecryptableAttachmentName, isImageAttachmentType, isOfficeAttachmentType, isTextAttachmentType, MAX_TEXT_ATTACHMENT_CHARACTERS, officeAttachmentTool, type OfficeAttachmentTool } from '../../shared/attachments'
 import { WorkspaceTools } from '../tools/workspace-tools'
 import { getEnabledToolDefinitions, isToolName, type ToolCall } from '../tools/tool-registry'
 import { parseOfficeDocument, type OfficeDocumentKind } from '../tools/office-parser'
 import { PptMcpClient } from '../ppt/ppt-mcp-client'
 import { classifyCommandRisk } from '../tools/command-risk'
+import { modelFetch } from '../model-fetch'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
@@ -34,6 +35,8 @@ type ModelContentPart =
   | { type: 'image_url'; image_url: { url: string; detail: 'auto' } }
 type ModelContent = string | ModelContentPart[]
 type ModelMessage = { role: 'system' | 'user' | 'assistant'; content: ModelContent }
+type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
+type ModelResponse = { content: string; usage?: RawModelUsage }
 type ConversationMessage = { role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[] }
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
@@ -50,7 +53,7 @@ export class ReactAgent {
     private readonly maxReactTurns = MAX_REACT_TURNS
   ) {}
 
-  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback): Promise<AgentTask> {
+  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig): Promise<AgentTask> {
     const task: AgentTask = { id: crypto.randomUUID(), prompt, status: 'reasoning', createdAt: new Date().toISOString(), steps: [] }
     const configuredPolicy = this.getPolicy()
     const policy = workspacePath?.trim() ? { ...configuredPolicy, workspacePath: workspacePath.trim() } : configuredPolicy
@@ -58,7 +61,7 @@ export class ReactAgent {
     task.status = 'acting'
 
     try {
-      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval)
+      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval, modelOverride)
       task.result = result
       this.recordServiceArtifacts(task, result, false)
       task.status = 'validating'
@@ -71,10 +74,11 @@ export class ReactAgent {
     return task
   }
 
-  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback): Promise<string> {
+  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig): Promise<string> {
     throwIfAborted(signal)
     const settings = this.getSettings()
-    if (!settings.model.baseUrl || !settings.model.model) {
+    const model = modelOverride ?? settings.model
+    if (!model.baseUrl || !model.model) {
       this.addStep(task, step('reason', '演示模式', '模型接口未完整配置，本次不会调用远程模型。'), onStep)
       return this.demoResponse(prompt, policy)
     }
@@ -120,7 +124,7 @@ export class ReactAgent {
       )
       let content: string
       try {
-        content = await this.callModel(messages, (delta) => stream.push(delta), signal)
+        content = await this.callModel(messages, (delta) => stream.push(delta), signal, task, model)
       } catch (error) {
         const modelError = error instanceof Error ? error : new Error(String(error))
         const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
@@ -473,14 +477,16 @@ export class ReactAgent {
     }
   }
 
-  private async callModel(messages: ModelMessage[], onDelta?: DeltaCallback, signal?: AbortSignal): Promise<string> {
-    const { model } = this.getSettings()
+  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig): Promise<string> {
     const maxAttempts = Math.max(1, model.maxRetries + 1)
     let lastError: Error | undefined
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       throwIfAborted(signal)
       try {
-        return await this.callModelOnce(messages, model, onDelta, signal)
+        const startedAt = performance.now()
+        const response = await this.callModelOnce(messages, model, onDelta, signal)
+        this.recordTokenUsage(task, messages, response, Math.max(1, performance.now() - startedAt))
+        return response.content
       } catch (error) {
         throwIfAborted(signal)
         lastError = error instanceof Error ? error : new Error('模型请求失败')
@@ -491,7 +497,7 @@ export class ReactAgent {
     throw lastError ?? new Error('模型请求失败')
   }
 
-  private async callModelOnce(messages: ModelMessage[], model: AppSettings['model'], onDelta?: DeltaCallback, signal?: AbortSignal): Promise<string> {
+  private async callModelOnce(messages: ModelMessage[], model: ModelConfig, onDelta?: DeltaCallback, signal?: AbortSignal): Promise<ModelResponse> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), model.timeoutMs)
     const onAbort = (): void => controller.abort()
@@ -499,11 +505,11 @@ export class ReactAgent {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'text/event-stream' }
       if (model.apiKey.trim()) headers.Authorization = 'Bearer ' + model.apiKey
-      const response = await fetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
+      const response = await modelFetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
         signal: controller.signal,
         headers,
-        body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 16384, stream: true })
+        body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 16384, stream: true, stream_options: { include_usage: true } })
       })
       if (!response.ok) {
         let errorDetail = ''
@@ -518,9 +524,9 @@ export class ReactAgent {
         throw error
       }
       const contentType = response.headers?.get('content-type') ?? ''
-      const content = contentType.includes('text/event-stream') ? await this.readStreamResponse(response, onDelta) : await this.readJsonResponse(response)
-      if (!content) throw new Error('模型返回为空')
-      return content
+      const result = contentType.includes('text/event-stream') ? await this.readStreamResponse(response, onDelta) : await this.readJsonResponse(response)
+      if (!result.content) throw new Error('模型返回为空')
+      return result
     } catch (error) {
       if (signal?.aborted) throw new DOMException('任务已暂停', 'AbortError')
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -552,28 +558,34 @@ export class ReactAgent {
     }
   }
 
-  private async readJsonResponse(response: Response): Promise<string> {
-    const payload = await response.json() as { choices?: Array<{ message?: { content?: string }, delta?: { content?: string } }> }
-    return payload.choices?.[0]?.message?.content ?? payload.choices?.[0]?.delta?.content ?? ''
+  private async readJsonResponse(response: Response): Promise<ModelResponse> {
+    const payload = await response.json() as { choices?: Array<{ message?: { content?: string }, delta?: { content?: string } }>; usage?: RawModelUsage }
+    return {
+      content: payload.choices?.[0]?.message?.content ?? payload.choices?.[0]?.delta?.content ?? '',
+      usage: payload.usage
+    }
   }
 
-  private async readStreamResponse(response: Response, onDelta?: DeltaCallback): Promise<string> {
+  private async readStreamResponse(response: Response, onDelta?: DeltaCallback): Promise<ModelResponse> {
     const reader = response.body?.getReader()
     if (!reader) return this.readJsonResponse(response)
 
     const decoder = new TextDecoder()
     let buffer = ''
     let content = ''
+    let usage: RawModelUsage | undefined
     const processLine = (line: string): void => {
       const trimmed = line.trim()
       if (!trimmed.startsWith('data:')) return
       const data = trimmed.slice(5).trim()
       if (!data || data === '[DONE]') return
 
-      const delta = this.parseStreamDelta(data)
-      if (!delta) return
-      content += delta
-      onDelta?.(delta)
+      const payload = this.parseStreamPayload(data)
+      if (payload.usage) usage = payload.usage
+      if (payload.delta) {
+        content += payload.delta
+        onDelta?.(payload.delta)
+      }
     }
 
     while (true) {
@@ -590,16 +602,37 @@ export class ReactAgent {
 
     buffer += decoder.decode()
     if (buffer.trim()) processLine(buffer)
-    return content
+    return { content, usage }
   }
 
-  private parseStreamDelta(data: string): string {
+  private parseStreamPayload(data: string): { delta: string; usage?: RawModelUsage } {
     try {
-      const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }, message?: { content?: string } }> }
-      return payload.choices?.[0]?.delta?.content ?? payload.choices?.[0]?.message?.content ?? ''
+      const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }, message?: { content?: string } }>; usage?: RawModelUsage }
+      return {
+        delta: payload.choices?.[0]?.delta?.content ?? payload.choices?.[0]?.message?.content ?? '',
+        usage: payload.usage
+      }
     } catch {
-      return ''
+      return { delta: '' }
     }
+  }
+
+  private recordTokenUsage(task: AgentTask, messages: ModelMessage[], response: ModelResponse, durationMs: number): void {
+    const inputTokens = normalizedTokenCount(response.usage?.prompt_tokens ?? response.usage?.input_tokens)
+    const outputTokens = normalizedTokenCount(response.usage?.completion_tokens ?? response.usage?.output_tokens)
+    const current: TokenUsage = {
+      inputTokens: inputTokens ?? estimateMessageTokenCount(messages),
+      outputTokens: outputTokens ?? estimateTokenCount(response.content),
+      durationMs,
+      estimated: inputTokens === undefined || outputTokens === undefined
+    }
+    const previous = task.tokenUsage
+    task.tokenUsage = previous ? {
+      inputTokens: previous.inputTokens + current.inputTokens,
+      outputTokens: previous.outputTokens + current.outputTokens,
+      durationMs: previous.durationMs + current.durationMs,
+      estimated: previous.estimated || current.estimated
+    } : current
   }
 
   private parseReply(content: string): ReactModelReply {
@@ -985,6 +1018,26 @@ function abortableDelay(durationMs: number, signal?: AbortSignal): Promise<void>
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+function normalizedTokenCount(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
+}
+
+function estimateTokenCount(value: unknown): number {
+  const text = typeof value === 'string' ? value : JSON.stringify(value) ?? ''
+  if (!text) return 0
+  const cjkCount = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu)?.length ?? 0
+  return Math.max(1, Math.ceil(cjkCount + (text.length - cjkCount) / 4))
+}
+
+function estimateMessageTokenCount(messages: ModelMessage[]): number {
+  return messages.reduce((total, message) => {
+    const contentTokens = typeof message.content === 'string'
+      ? estimateTokenCount(message.content)
+      : message.content.reduce((sum, part) => sum + (part.type === 'text' ? estimateTokenCount(part.text) : 85), 0)
+    return total + contentTokens + 4
+  }, 2)
 }
 
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {

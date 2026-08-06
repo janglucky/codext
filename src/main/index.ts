@@ -22,6 +22,8 @@ import { CommandApprovalManager } from './command-approval'
 import { UserChoiceManager } from './user-choice'
 import { startPptMcpServer, type RunningPptMcpServer } from './ppt/ppt-mcp-server'
 import { isTextFilePath, launchApplication, normalizeWebUrl, resolveWorkspaceFile, validateApplicationPath } from './navigation'
+import { modelFetch } from './model-fetch'
+import { modelConfig, resolveModelProfile } from '../shared/models'
 
 const store = new LocalStore()
 let pptMcpUrl = ''
@@ -72,6 +74,7 @@ app.whenReady().then(async () => {
     runningTasks.set(key, controller)
     try {
     const conversationAtStart = store.getConversation(conversationId)
+    const modelProfile = resolveModelProfile(store.getSettings(), conversationAtStart.modelId)
     const workspacePath = effectiveWorkspacePath(conversationAtStart)
     const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : ''
     const validatedAttachments = validateAttachments(attachments)
@@ -123,15 +126,16 @@ app.whenReady().then(async () => {
       const globalPath = resolve(store.getPolicy().workspacePath)
       const updated = await store.setConversationWorkspace(conversationId, workspaceKey(selectedPath) === workspaceKey(globalPath) ? undefined : selectedPath)
       return { optionId, workspacePath: effectiveWorkspacePath(updated) }
-    }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }))
+    }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }), modelConfig(modelProfile))
     assistantMessage.content = task.status === 'paused' && assistantMessage.content.trim()
       ? assistantMessage.content.trimEnd() + '\n\n[已暂停]'
       : task.result ?? task.error ?? ''
     assistantMessage.status = task.status
     assistantMessage.steps = task.steps
     assistantMessage.artifacts = task.artifacts?.length ? task.artifacts : undefined
+    assistantMessage.tokenUsage = task.tokenUsage
     assistantMessage.completedAt = new Date().toISOString()
-    event.sender.send('agent:done', { conversationId, messageId: assistantMessage.id, status: assistantMessage.status, content: assistantMessage.content, completedAt: assistantMessage.completedAt })
+    event.sender.send('agent:done', { conversationId, messageId: assistantMessage.id, status: assistantMessage.status, content: assistantMessage.content, completedAt: assistantMessage.completedAt, tokenUsage: assistantMessage.tokenUsage })
     const conversation = await store.updateMessage(conversationId, assistantMessage)
     return { conversation, task }
     } finally {
@@ -164,6 +168,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('conversations:remove-attachment', async (_event, conversationId: string, attachmentId: string) => {
     const conversation = store.getConversation(conversationId)
     return store.setConversationAttachments(conversationId, (conversation.activeAttachments ?? []).filter((attachment) => attachment.id !== attachmentId))
+  })
+  ipcMain.handle('conversations:set-model', (_event, conversationId: unknown, modelId: unknown) => {
+    if (typeof conversationId !== 'string' || (modelId !== undefined && typeof modelId !== 'string')) throw new Error('会话模型参数无效。')
+    return store.setConversationModel(conversationId, modelId)
   })
   ipcMain.handle('workspace:open-file', async (_event, conversationId: unknown, filePath: unknown) => {
     try {
@@ -214,8 +222,9 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('policy:get', () => store.getPolicy())
   ipcMain.handle('policy:save', (_event, policy) => store.savePolicy(policy))
-  ipcMain.handle('settings:test-connection', async (_event, settings: AppSettings) => {
-    const { baseUrl, apiKey, model, timeoutMs } = settings.model
+  ipcMain.handle('settings:test-connection', async (_event, settings: AppSettings, modelId?: unknown) => {
+    const selectedProfile = resolveModelProfile(settings, typeof modelId === 'string' ? modelId : undefined)
+    const { baseUrl, apiKey, model, timeoutMs } = modelConfig(selectedProfile)
     if (!baseUrl.trim() || !model.trim()) return { ok: false, message: '请先填写接口地址和模型名称。' }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -223,7 +232,7 @@ app.whenReady().then(async () => {
       const endpoint = baseUrl.replace(/\/$/, '') + '/chat/completions'
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (apiKey.trim()) headers.Authorization = 'Bearer ' + apiKey
-      const response = await fetch(endpoint, { method: 'POST', signal: controller.signal, headers, body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] }) })
+      const response = await modelFetch(endpoint, { method: 'POST', signal: controller.signal, headers, body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] }) })
       if (!response.ok) return { ok: false, message: '连接失败（HTTP ' + response.status + '）。请检查接口地址、模型和密钥。' }
       return { ok: true, message: '连接成功，模型服务可用。' }
     } catch (error) {

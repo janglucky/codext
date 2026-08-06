@@ -1,8 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, RotateCcw, SquareTerminal } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, TaskStatus, TaskStep, UserChoiceRequest } from '../../shared/types'
+import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, SquareTerminal, Star, Trash2 } from 'lucide-react'
+import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import { getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../../shared/models'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -45,6 +46,7 @@ const paths: Record<IconName, ReactElement> = {
 
 const initialSettings: AppSettings = {
   model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 },
+  models: [],
   skillsEnabled: true,
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
@@ -77,6 +79,7 @@ export function App(): ReactElement {
   const [userChoice, setUserChoice] = useState<UserChoiceRequest | undefined>()
   const [selectedChoiceId, setSelectedChoiceId] = useState('')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
+  const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [view, setView] = useState<View>('chat')
   const [tab, setTab] = useState<SettingTab>('常规')
   const messageListRef = useRef<HTMLElement | null>(null)
@@ -90,7 +93,10 @@ export function App(): ReactElement {
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
   const activeWorkspacePath = activeConversation?.workspacePath || policy?.workspacePath || ''
   const activeAttachments = activeConversation?.activeAttachments ?? []
-  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0].join(':')).join('|') ?? '', [activeConversation])
+  const modelProfiles = useMemo(() => getModelProfiles(settings), [settings])
+  const defaultModel = useMemo(() => getDefaultModelProfile(settings), [settings])
+  const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
+  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
 
   useEffect(() => {
     void Promise.all([window.api.getConversations(), window.api.getSettings(), window.api.getPolicy()]).then(([savedConversations, savedSettings, savedPolicy]) => {
@@ -134,7 +140,7 @@ export function App(): ReactElement {
   }, [])
 
   useEffect(() => {
-    return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt }) => {
+    return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt, tokenUsage }) => {
       setMcpApproval(undefined)
       setCommandApproval(undefined)
       setUserChoice(undefined)
@@ -143,7 +149,7 @@ export function App(): ReactElement {
         if (conversation.id !== conversationId) return conversation
         return {
           ...conversation,
-          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({ ...message, content, completedAt, status }))
+          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({ ...message, content, completedAt, status, tokenUsage }))
         }
       }))
     })
@@ -206,6 +212,7 @@ export function App(): ReactElement {
     setAttachments([])
     setAttachmentError('')
     setWorkspaceMenuOpen(false)
+    setModelMenuOpen(false)
   }, [activeId])
 
   useEffect(() => {
@@ -369,9 +376,31 @@ export function App(): ReactElement {
     setWorkspaceMenuOpen(false)
   }
 
+  async function selectConversationModel(modelId?: string): Promise<void> {
+    if (!activeConversation || running) return
+    try {
+      const conversation = await window.api.setConversationModel(activeConversation.id, modelId)
+      setConversations((current) => [conversation, ...current.filter((item) => item.id !== conversation.id)])
+    } catch {
+      setSettings(await window.api.getSettings())
+    } finally {
+      setModelMenuOpen(false)
+    }
+  }
+
   async function saveSettings(): Promise<void> {
-    await window.api.saveSettings(settings)
+    const savedSettings = await window.api.saveSettings(settings)
+    const validModelIds = new Set(getModelProfiles(savedSettings).map((profile) => profile.id))
+    setSettings(savedSettings)
+    setConversations((current) => current.map((conversation) => conversation.modelId && !validModelIds.has(conversation.modelId) ? { ...conversation, modelId: undefined } : conversation))
     if (policy) await window.api.savePolicy(policy)
+  }
+
+  async function closeSettings(): Promise<void> {
+    const [savedSettings, savedPolicy] = await Promise.all([window.api.getSettings(), window.api.getPolicy()])
+    setSettings(savedSettings)
+    setPolicy(savedPolicy)
+    setView('chat')
   }
 
   function respondToMcpApproval(approved: boolean): void {
@@ -394,7 +423,7 @@ export function App(): ReactElement {
   }
 
   if (view === 'settings' && policy) return <>
-    <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => setView('chat')} onSave={() => void saveSettings()} />
+    <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => void closeSettings()} onSave={saveSettings} />
   </>
 
   return <div className="chat-app">
@@ -413,7 +442,7 @@ export function App(): ReactElement {
         {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
         {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
         <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}><Icon name={running ? 'pause' : 'send'} /></button></div>
-        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => setWorkspaceMenuOpen((open) => !open)}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><span><Icon name="monitor" />本地模式<Icon name="chevron-down" /></span><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
+        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control"><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + activeModel.name} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{activeModel.name}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {defaultModel.model}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{profile.name}</strong><small>{profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
@@ -506,8 +535,20 @@ function MessageView({ conversationId, message, onPreview }: { conversationId: s
         : <div className="message-bubble">{message.content}</div> : null}
       {message.role === 'assistant' && message.artifacts?.length ? <ResultArtifacts conversationId={conversationId} artifacts={message.artifacts} /> : null}
       {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onPreview={() => onPreview(attachment)} />)}</div> : null}
+      {message.role === 'assistant' && message.tokenUsage ? <TokenUsageView usage={message.tokenUsage} /> : null}
     </div>
   </article>
+}
+
+function TokenUsageView({ usage }: { usage: TokenUsage }): ReactElement {
+  const prefix = usage.estimated ? '≈' : ''
+  const speed = usage.durationMs > 0 ? usage.outputTokens / (usage.durationMs / 1000) : 0
+  const inputTitle = (usage.estimated ? '估算输入' : '输入') + ' ' + usage.inputTokens.toLocaleString('zh-CN') + ' tokens'
+  const outputTitle = (usage.estimated ? '估算输出' : '输出') + ' ' + usage.outputTokens.toLocaleString('zh-CN') + ' tokens，平均 ' + formatTokenRate(speed)
+  return <div className={'token-usage ' + (usage.estimated ? 'estimated' : '')} aria-label={inputTitle + '；' + outputTitle}>
+    <span title={inputTitle}><ArrowUp />{prefix}{formatTokenCount(usage.inputTokens)}</span>
+    <span title={outputTitle}><ArrowDown />{prefix}{formatTokenCount(usage.outputTokens)}<small>{formatTokenRate(speed)}</small></span>
+  </div>
 }
 
 function ResultArtifacts({ conversationId, artifacts }: { conversationId: string; artifacts: AgentArtifact[] }): ReactElement {
@@ -675,6 +716,16 @@ function formatBytes(size: number): string {
   return (size / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
+function formatTokenCount(value: number): string {
+  if (value < 1000) return value.toLocaleString('zh-CN')
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
+}
+
+function formatTokenRate(value: number): string {
+  const precision = value >= 100 ? 0 : 1
+  return value.toFixed(precision) + ' tok/s'
+}
+
 function workspaceLabel(workspacePath: string): string {
   const normalized = workspacePath.replace(/[\\/]+$/, '')
   return normalized.split(/[\\/]/).at(-1) || '工作区'
@@ -764,13 +815,13 @@ function formatElapsed(durationMs: number): string {
   return minutes + 'm ' + seconds + 's'
 }
 
-function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => void }): ReactElement {
+function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => Promise<void> }): ReactElement {
   const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['打开方式'] }, { title: '编码', tabs: ['Git', '环境'] }]
   const isGeneral = tab === '常规'
   return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : item === '打开方式' ? 'folder' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : tab === '打开方式' ? <NavigationSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
 }
 
-function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => void }): ReactElement {
+function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
   const [selecting, setSelecting] = useState<'file' | 'browser' | undefined>()
   const [saved, setSaved] = useState(false)
   async function selectApplication(kind: 'file' | 'browser'): Promise<void> {
@@ -800,8 +851,8 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
       }
     })
   }
-  function save(): void {
-    onSave()
+  async function save(): Promise<void> {
+    await onSave()
     setSaved(true)
   }
   const rows = [
@@ -822,27 +873,63 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
         </div>
       </div>)}</div>
     </section>
-    <button className="settings-save" onClick={save}>保存更改</button>
+    <button className="settings-save" onClick={() => void save()}>保存更改</button>
     {saved && <div className="config-notice success"><Check />打开方式已保存到本地。</div>}
   </div>
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
-function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => void }): ReactElement { return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><div className="permission-list"><SettingRow title="默认权限" description="默认情况下，Agent 可以读取并编辑工作区中的文件；需要时可以请求额外访问权限。" checked={true} onChange={() => undefined} /><SettingRow title="自动审核" description="Agent 可以读取和编辑工作区中的文件，并会自动审核额外访问权限请求。" checked={settings.skillsEnabled} onChange={(skillsEnabled) => setSettings({ ...settings, skillsEnabled })} /><SettingRow title="完全访问权限" description="启用后无需每次确认，可使用本地工具来完成复杂任务。" checked={Boolean(settings.model.apiKey)} onChange={() => setSettings({ ...settings, model: { ...settings.model, apiKey: settings.model.apiKey ? '' : 'configured' } })} /></div></section><button className="settings-save" onClick={onSave}>保存更改</button></div> }
+function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement { return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><div className="permission-list"><SettingRow title="默认权限" description="默认情况下，Agent 可以读取并编辑工作区中的文件；需要时可以请求额外访问权限。" checked={true} onChange={() => undefined} /><SettingRow title="自动审核" description="Agent 可以读取和编辑工作区中的文件，并会自动审核额外访问权限请求。" checked={settings.skillsEnabled} onChange={(skillsEnabled) => setSettings({ ...settings, skillsEnabled })} /><SettingRow title="完全访问权限" description="启用后无需每次确认，可使用本地工具来完成复杂任务。" checked={Boolean(settings.model.apiKey)} onChange={() => setSettings({ ...settings, model: { ...settings.model, apiKey: settings.model.apiKey ? '' : 'configured' } })} /></div></section><button className="settings-save" onClick={() => void onSave()}>保存更改</button></div> }
 function SettingRow({ title, description, checked, onChange }: { title: string; description: string; checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <div className="setting-row"><div><strong>{title}</strong><p>{description}</p></div><Toggle checked={checked} onChange={onChange} /></div> }
-function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => void }): ReactElement {
+function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => Promise<void> }): ReactElement {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [apiKeyVisible, setApiKeyVisible] = useState(false)
   const [apiKeyCopied, setApiKeyCopied] = useState(false)
   const copyResetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | undefined>()
+  const profiles = getModelProfiles(settings)
+  const defaultProfile = getDefaultModelProfile(settings)
+  const [selectedModelId, setSelectedModelId] = useState(defaultProfile?.id ?? '')
+  const selectedProfile = profiles.find((profile) => profile.id === selectedModelId) ?? defaultProfile
+  useEffect(() => {
+    if (!profiles.some((profile) => profile.id === selectedModelId)) setSelectedModelId(defaultProfile?.id ?? '')
+  }, [defaultProfile?.id, profiles, selectedModelId])
   useEffect(() => () => { if (copyResetTimer.current) clearTimeout(copyResetTimer.current) }, [])
-  async function save(): Promise<void> { setSaving(true); setNotice(undefined); try { onSave(); await new Promise((resolve) => setTimeout(resolve, 420)); setNotice({ type: 'success', text: '配置已保存到本地。' }) } catch { setNotice({ type: 'error', text: '保存失败，请重试。' }) } finally { setSaving(false) } }
-  async function test(): Promise<void> { setTesting(true); setNotice(undefined); try { const result = await window.api.testConnection(settings); setNotice({ type: result.ok ? 'success' : 'error', text: result.message }) } finally { setTesting(false) } }
+  function commitProfiles(nextProfiles: ModelProfile[], requestedDefaultId = settings.defaultModelId ?? profiles[0]?.id): void {
+    const nextDefault = nextProfiles.find((profile) => profile.id === requestedDefaultId) ?? nextProfiles[0]
+    if (!nextDefault) return
+    setSettings({ ...settings, models: nextProfiles, defaultModelId: nextDefault.id, model: modelConfig(nextDefault) })
+  }
+  function updateSelectedProfile(patch: Partial<ModelProfile>): void {
+    if (!selectedProfile) return
+    commitProfiles(profiles.map((profile) => profile.id === selectedProfile.id ? { ...profile, ...patch } : profile))
+  }
+  function addModel(): void {
+    const source = selectedProfile ?? defaultProfile
+    const profile: ModelProfile = { ...(source ?? { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, provider: 'OpenAI 兼容' }), id: crypto.randomUUID(), name: '新模型' }
+    commitProfiles([...profiles, profile], settings.defaultModelId ?? profiles[0]?.id)
+    setSelectedModelId(profile.id)
+    setNotice({ type: 'success', text: '已添加模型配置，请填写连接信息。' })
+  }
+  function removeSelectedModel(): void {
+    if (!selectedProfile || profiles.length <= 1) {
+      setNotice({ type: 'error', text: '至少保留一个模型配置。' })
+      return
+    }
+    const nextProfiles = profiles.filter((profile) => profile.id !== selectedProfile.id)
+    const nextDefaultId = selectedProfile.id === defaultProfile.id ? nextProfiles[0].id : settings.defaultModelId
+    commitProfiles(nextProfiles, nextDefaultId)
+    setSelectedModelId(nextDefaultId === selectedProfile.id ? nextProfiles[0].id : nextDefaultId ?? nextProfiles[0].id)
+  }
+  function setDefaultModel(): void {
+    if (selectedProfile) commitProfiles(profiles, selectedProfile.id)
+  }
+  async function save(): Promise<void> { setSaving(true); setNotice(undefined); try { await onSave(); setNotice({ type: 'success', text: '配置已保存到本地。' }) } catch { setNotice({ type: 'error', text: '保存失败，请重试。' }) } finally { setSaving(false) } }
+  async function test(): Promise<void> { setTesting(true); setNotice(undefined); try { const result = await window.api.testConnection(settings, selectedProfile?.id); setNotice({ type: result.ok ? 'success' : 'error', text: result.message }) } finally { setTesting(false) } }
   function copyApiKey(): void {
-    if (!settings.model.apiKey) return
-    window.api.copyText(settings.model.apiKey)
+    if (!selectedProfile?.apiKey) return
+    window.api.copyText(selectedProfile.apiKey)
     setApiKeyCopied(true)
     if (copyResetTimer.current) clearTimeout(copyResetTimer.current)
     copyResetTimer.current = setTimeout(() => setApiKeyCopied(false), 1600)
@@ -864,21 +951,30 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
   return <div className="settings-inner">
     <h1>{title}</h1>
     <section className="settings-section compact">
-      <h2>模型连接</h2>
-      <p>这些配置保存在本地，用于 OpenAI 兼容接口调用。</p>
-      <label>接口地址<input value={settings.model.baseUrl} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, baseUrl: event.target.value } })} placeholder="https://api.openai.com/v1" /></label>
-      <label>模型名称<input value={settings.model.model} onChange={(event) => setSettings({ ...settings, model: { ...settings.model, model: event.target.value } })} placeholder="gpt-4.1-mini" /></label>
+      <div className="model-settings-heading"><div><h2>模型配置</h2><p>保存多个 OpenAI 兼容模型，并在每个会话中独立选择。</p></div><button type="button" className="model-add-button" onClick={addModel} title="添加模型" aria-label="添加模型"><Plus /></button></div>
+      <div className="model-profile-list">{profiles.map((profile) => <div className={'model-profile-row ' + (profile.id === selectedProfile?.id ? 'selected' : '')} key={profile.id}><button type="button" className="model-profile-select" onClick={() => { setSelectedModelId(profile.id); setApiKeyVisible(false); setApiKeyCopied(false) }}><Bot /><span><strong>{profile.name}</strong><small>{profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span></button><button type="button" className={'model-default-button ' + (profile.id === defaultProfile?.id ? 'active' : '')} onClick={() => { setSelectedModelId(profile.id); commitProfiles(profiles, profile.id) }} title={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'} aria-label={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'}>{profile.id === defaultProfile?.id ? <Star fill="currentColor" /> : <Star />}</button></div>)}</div>
+      {selectedProfile ? <>
+        <div className="model-profile-toolbar"><span>编辑模型</span><button type="button" className="model-delete-button" onClick={removeSelectedModel} title="删除当前模型" aria-label="删除当前模型"><Trash2 />删除</button></div>
+        <label>显示名称<input value={selectedProfile.name} onChange={(event) => updateSelectedProfile({ name: event.target.value })} placeholder="例如：生产 GPT" /></label>
+        <label>模型厂商 / 提供方<input list="model-provider-options" value={selectedProfile.provider || ''} onChange={(event) => updateSelectedProfile({ provider: event.target.value })} placeholder="例如：OpenAI、DeepSeek、内部网关" /></label>
+        <datalist id="model-provider-options"><option value="OpenAI" /><option value="Azure OpenAI" /><option value="DeepSeek" /><option value="通义千问" /><option value="OpenRouter" /><option value="OpenAI 兼容" /></datalist>
+        <label>接口地址<input value={selectedProfile.baseUrl} onChange={(event) => updateSelectedProfile({ baseUrl: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
+        <label>模型名称<input value={selectedProfile.model} onChange={(event) => updateSelectedProfile({ model: event.target.value })} placeholder="gpt-4.1-mini" /></label>
       <div className="api-key-field">
         <label htmlFor="model-api-key">API Key <small className="optional-field">（可选）</small></label>
         <div className="api-key-input">
-          <input id="model-api-key" type={apiKeyVisible ? 'text' : 'password'} value={settings.model.apiKey} onChange={(event) => { setApiKeyCopied(false); setSettings({ ...settings, model: { ...settings.model, apiKey: event.target.value } }) }} placeholder="无需鉴权的自定义接口可留空" autoComplete="off" spellCheck={false} />
+          <input id="model-api-key" type={apiKeyVisible ? 'text' : 'password'} value={selectedProfile.apiKey} onChange={(event) => { setApiKeyCopied(false); updateSelectedProfile({ apiKey: event.target.value }) }} placeholder="无需鉴权的自定义接口可留空" autoComplete="off" spellCheck={false} />
           <div className="api-key-actions">
-            <button type="button" className="api-key-action" disabled={!settings.model.apiKey} aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} aria-pressed={apiKeyVisible} title={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} onClick={() => setApiKeyVisible((visible) => !visible)}>{apiKeyVisible ? <EyeOff /> : <Eye />}</button>
-            <button type="button" className={'api-key-action ' + (apiKeyCopied ? 'copied' : '')} disabled={!settings.model.apiKey} aria-label={apiKeyCopied ? 'API Key 已复制' : '复制 API Key'} title={apiKeyCopied ? '已复制' : '复制 API Key'} onClick={copyApiKey}>{apiKeyCopied ? <Check /> : <Copy />}</button>
+            <button type="button" className="api-key-action" disabled={!selectedProfile.apiKey} aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} aria-pressed={apiKeyVisible} title={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} onClick={() => setApiKeyVisible((visible) => !visible)}>{apiKeyVisible ? <EyeOff /> : <Eye />}</button>
+            <button type="button" className={'api-key-action ' + (apiKeyCopied ? 'copied' : '')} disabled={!selectedProfile.apiKey} aria-label={apiKeyCopied ? 'API Key 已复制' : '复制 API Key'} title={apiKeyCopied ? '已复制' : '复制 API Key'} onClick={copyApiKey}>{apiKeyCopied ? <Check /> : <Copy />}</button>
           </div>
         </div>
       </div>
+      <div className="model-protocol-note"><Bot /><span><strong>接口协议</strong><small>OpenAI 兼容 · POST /chat/completions</small></span></div>
+      </> : null}
     </section>
+    <div className="config-actions model-config-actions"><button className="connection-test" onClick={() => void test()} disabled={testing || saving || !selectedProfile}>{testing ? '正在测试…' : '测试当前模型'}</button>{selectedProfile && selectedProfile.id !== defaultProfile?.id ? <button type="button" className="set-default-button" onClick={setDefaultModel}><Star />设为默认</button> : null}<button className={'settings-save ' + (saving ? 'is-loading' : '')} onClick={() => void save()} disabled={saving || testing}>{saving ? '保存中…' : '保存更改'}</button></div>
+    {notice && <div className="model-config-notice"><div className={'config-notice ' + notice.type}><Icon name={notice.type === 'success' ? 'check' : 'settings'} />{notice.text}</div></div>}
     <section className="settings-section compact">
       <h2>系统提示词</h2>
       <p>每次请求模型时都会携带这段系统级约束。</p>
@@ -889,7 +985,5 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
       <p>工具仅能在工作区 <code>{policy.workspacePath}</code> 内访问；危险命令会被阻止。</p>
       <div className="tool-list">{Object.entries(toolLabels).map(([name, label]) => <label key={name} className="tool-toggle"><span><strong>{label}</strong><small>{name}</small></span><Toggle checked={policy.enabledTools.includes(name)} onChange={() => toggleTool(name)} /></label>)}</div>
     </section>
-    <div className="config-actions"><button className="connection-test" onClick={() => void test()} disabled={testing || saving}>{testing ? '正在测试…' : '测试连接'}</button><button className={'settings-save ' + (saving ? 'is-loading' : '')} onClick={() => void save()} disabled={saving || testing}>{saving ? '保存中…' : '保存更改'}</button></div>
-    {notice && <div className={'config-notice ' + notice.type}><Icon name={notice.type === 'success' ? 'check' : 'settings'} />{notice.text}</div>}
   </div>
 }

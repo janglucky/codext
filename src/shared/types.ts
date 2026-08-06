@@ -1,19 +1,21 @@
 export type TaskStatus = 'pending' | 'reasoning' | 'acting' | 'validating' | 'succeeded' | 'failed' | 'paused'
 export type AgentArtifact = { type: 'file'; path: string } | { type: 'service'; url: string }
 export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number }
+export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
 export interface TaskStep { id: string; phase: 'reason' | 'skill' | 'act' | 'validate'; title: string; detail: string; timestamp: string }
-export interface AgentTask { id: string; prompt: string; status: TaskStatus; result?: string; error?: string; createdAt: string; steps: TaskStep[]; artifacts?: AgentArtifact[] }
+export interface TokenUsage { inputTokens: number; outputTokens: number; durationMs: number; estimated: boolean }
+export interface AgentTask { id: string; prompt: string; status: TaskStatus; result?: string; error?: string; createdAt: string; steps: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
 export interface ChatAttachment { id: string; name: string; mimeType: string; size: number; dataUrl: string; workspacePath?: string }
-export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[] }
-export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; activeAttachments?: ChatAttachment[] }
-export interface AppSettings { model: ModelConfig; skillsEnabled: boolean; navigation: NavigationSettings }
+export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
+export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; activeAttachments?: ChatAttachment[]; modelId?: string }
+export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings }
 export interface AgentPolicy { systemPrompt: string; workspacePath: string; enabledTools: string[] }
 export interface ConnectionTestResult { ok: boolean; message: string }
 export interface NavigationResult { ok: boolean; message?: string }
 export interface AgentStepEvent { conversationId: string; messageId: string; step: TaskStep }
 export interface AgentDeltaEvent { conversationId: string; messageId: string; delta: string }
-export interface AgentDoneEvent { conversationId: string; messageId: string; status: TaskStatus; content: string; completedAt: string }
+export interface AgentDoneEvent { conversationId: string; messageId: string; status: TaskStatus; content: string; completedAt: string; tokenUsage?: TokenUsage }
 export interface AgentRunResult { conversation: Conversation; task: AgentTask }
 export interface McpApprovalDetails { toolName: string; serverUrl: string; path?: string; workspacePath?: string; conversationId?: string }
 export interface McpApprovalRequest extends McpApprovalDetails { id: string; expiresAt: string }
@@ -33,7 +35,8 @@ export interface DesktopApi {
   removeConversationAttachment(conversationId: string, attachmentId: string): Promise<Conversation>
   getSettings(): Promise<AppSettings>
   saveSettings(settings: AppSettings): Promise<AppSettings>
-  testConnection(settings: AppSettings): Promise<ConnectionTestResult>
+  testConnection(settings: AppSettings, modelId?: string): Promise<ConnectionTestResult>
+  setConversationModel(conversationId: string, modelId?: string): Promise<Conversation>
   selectApplication(kind: 'file' | 'browser'): Promise<string | undefined>
   getPolicy(): Promise<AgentPolicy>
   savePolicy(policy: AgentPolicy): Promise<AgentPolicy>

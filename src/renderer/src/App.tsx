@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, SquareTerminal, Star, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
 import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../../shared/models'
 import {
@@ -17,7 +17,7 @@ import {
   MAX_TOTAL_ATTACHMENT_SIZE
 } from '../../shared/attachments'
 
-type IconName = 'panel' | 'chevron-left' | 'chevron-right' | 'message' | 'search' | 'skills' | 'clock' | 'folder' | 'settings' | 'plus' | 'shield' | 'chevron-down' | 'send' | 'pause' | 'monitor' | 'branch' | 'search-small' | 'check' | 'trash' | 'file' | 'close'
+type IconName = 'panel' | 'chevron-left' | 'chevron-right' | 'message' | 'search' | 'skills' | 'clock' | 'folder' | 'plus' | 'shield' | 'chevron-down' | 'send' | 'monitor' | 'branch' | 'search-small' | 'check' | 'trash' | 'file' | 'close'
 type IconProps = SVGProps<SVGSVGElement> & { name: IconName }
 
 const paths: Record<IconName, ReactElement> = {
@@ -29,12 +29,10 @@ const paths: Record<IconName, ReactElement> = {
   skills: <><path d="M8 3h8v5h5v8h-5v5H8v-5H3V8h5z" /><path d="M8 8h8v8H8z" /></>,
   clock: <><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></>,
   folder: <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />,
-  settings: <><path d="M4 7h16M4 12h16M4 17h16" /><circle cx="9" cy="7" r="1.8" /><circle cx="15" cy="12" r="1.8" /><circle cx="11" cy="17" r="1.8" /></>,
   plus: <path d="M12 5v14M5 12h14" />,
   shield: <path d="M12 3 19 6v5c0 4.3-2.7 7.7-7 10-4.3-2.3-7-5.7-7-10V6z" />,
   'chevron-down': <path d="m7 10 5 5 5-5" />,
   send: <path d="m5 12 14-7-4 14-3-5zM12 12l3-3" />,
-  pause: <><rect x="7" y="6" width="3" height="12" rx="1" fill="currentColor" stroke="none" /><rect x="14" y="6" width="3" height="12" rx="1" fill="currentColor" stroke="none" /></>,
   monitor: <><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></>,
   branch: <><path d="M6 3v12" /><circle cx="6" cy="3" r="2" /><circle cx="6" cy="15" r="2" /><circle cx="18" cy="7" r="2" /><path d="M8 15c6 0 2-8 8-8" /></>,
   'search-small': <><circle cx="11" cy="11" r="6" /><path d="m20 20-4-4" /></>,
@@ -88,6 +86,7 @@ export function App(): ReactElement {
   const activeAttachmentsRef = useRef<ChatAttachment[]>([])
   const pendingAttachmentReadsRef = useRef<Promise<void> | null>(null)
   const runningConversationIdRef = useRef('')
+  const modelControlRef = useRef<HTMLDivElement | null>(null)
 
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
@@ -122,6 +121,22 @@ export function App(): ReactElement {
       }))
     })
   }, [])
+
+  useEffect(() => {
+    if (!modelMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent): void => {
+      if (!modelControlRef.current?.contains(event.target as Node)) setModelMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setModelMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [modelMenuOpen])
 
   useEffect(() => {
     return window.api.onAgentDelta(({ conversationId, messageId, delta }) => {
@@ -427,11 +442,11 @@ export function App(): ReactElement {
   </>
 
   return <div className="chat-app">
-    <header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span><div className="bar-spacer" /><button className="top-settings" onClick={() => setView('settings')}><Icon name="settings" />设置</button></header>
+    <header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span><div className="bar-spacer" /><button className="top-settings" onClick={() => setView('settings')}><SettingsIcon />设置</button></header>
     <aside className="sidebar">
       <nav className="quick-nav"><button className="quick-nav-active"><Icon name="message" /><span>快速对话</span></button><button><Icon name="search" /><span>搜索</span></button><button><Icon name="skills" /><span>技能</span></button><button><Icon name="clock" /><span>自动化</span></button></nav>
       <section className="project-list"><p>会话</p><button className="new-chat" onClick={() => void createConversation()}><Icon name="plus" />新对话</button><div className="task-list">{visibleConversations.map((conversation) => <div className={'conversation-row ' + (conversation.id === activeConversation?.id ? 'selected' : '')} key={conversation.id}><button onClick={() => setActiveId(conversation.id)}><span>{conversation.title}</span><small>{conversation.messages.length}</small></button><button className="delete-chat" onClick={() => void deleteConversation(conversation.id)} title="删除会话"><Icon name="trash" /></button></div>)}</div></section>
-      <button className="sidebar-settings" onClick={() => setView('settings')}><Icon name="settings" /><span>设置</span></button>
+      <button className="sidebar-settings" onClick={() => setView('settings')}><SettingsIcon /><span>设置</span></button>
     </aside>
     <main className="chat-main">
       <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
@@ -441,8 +456,8 @@ export function App(): ReactElement {
         <textarea aria-label="向 Agent 描述任务" value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => { const files = getClipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); queueFiles(files) } }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="输入任务，或直接粘贴截图；Enter 发送，Shift+Enter 换行" />
         {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
         {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
-        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}><Icon name={running ? 'pause' : 'send'} /></button></div>
-        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control"><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + activeModel.name} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{activeModel.name}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {defaultModel.model}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{profile.name}</strong><small>{profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
+        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
+        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + activeModel.name} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{activeModel.name}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {defaultModel.model}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{profile.name}</strong><small>{profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
@@ -818,7 +833,7 @@ function formatElapsed(durationMs: number): string {
 function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => Promise<void> }): ReactElement {
   const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['打开方式'] }, { title: '编码', tabs: ['Git', '环境'] }]
   const isGeneral = tab === '常规'
-  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === '常规' ? 'settings' : item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : item === '打开方式' ? 'folder' : 'shield'} />{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : tab === '打开方式' ? <NavigationSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
+  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === '常规' ? <SettingsIcon /> : <Icon name={item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : item === '打开方式' ? 'folder' : 'shield'} />}{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : tab === '打开方式' ? <NavigationSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
 }
 
 function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
@@ -974,7 +989,7 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
       </> : null}
     </section>
     <div className="config-actions model-config-actions"><button className="connection-test" onClick={() => void test()} disabled={testing || saving || !selectedProfile}>{testing ? '正在测试…' : '测试当前模型'}</button>{selectedProfile && selectedProfile.id !== defaultProfile?.id ? <button type="button" className="set-default-button" onClick={setDefaultModel}><Star />设为默认</button> : null}<button className={'settings-save ' + (saving ? 'is-loading' : '')} onClick={() => void save()} disabled={saving || testing}>{saving ? '保存中…' : '保存更改'}</button></div>
-    {notice && <div className="model-config-notice"><div className={'config-notice ' + notice.type}><Icon name={notice.type === 'success' ? 'check' : 'settings'} />{notice.text}</div></div>}
+    {notice && <div className="model-config-notice"><div className={'config-notice ' + notice.type}>{notice.type === 'success' ? <Icon name="check" /> : <SettingsIcon />}{notice.text}</div></div>}
     <section className="settings-section compact">
       <h2>系统提示词</h2>
       <p>每次请求模型时都会携带这段系统级约束。</p>

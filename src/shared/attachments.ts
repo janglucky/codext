@@ -3,7 +3,7 @@ export const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024
 export const MAX_TEXT_ATTACHMENT_SIZE = 1024 * 1024
 export const MAX_OFFICE_ATTACHMENT_SIZE = 30 * 1024 * 1024
 export const MAX_TOTAL_ATTACHMENT_SIZE = 60 * 1024 * 1024
-export const MAX_TEXT_ATTACHMENT_CHARACTERS = 60_000
+export const MAX_TEXT_ATTACHMENT_CHARACTERS = 120_000
 
 export type OfficeAttachmentTool = 'parse_word' | 'parse_excel' | 'parse_powerpoint'
 

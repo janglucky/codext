@@ -1034,8 +1034,8 @@ describe('ReactAgent.execute', () => {
       expect(callCount).toBe(3)
       expect(writeFile).toHaveBeenCalledOnce()
       expect(task.steps.some((item) => item.title === '模型连接中断，正在恢复')).toBe(true)
-      expect(requestBodies[1]).toContain('已执行 write_file：generated-page.html')
-      expect(requestBodies[1]).not.toContain(largeContent)
+      expect(requestBodies[1]).toContain('generated-page.html')
+      expect(requestBodies[1]).toContain(largeContent)
     })
 
     it('streams thought tags before executing tool calls', async () => {
@@ -1390,7 +1390,7 @@ describe('ReactAgent.execute', () => {
             headers: { get: () => 'text/event-stream' },
             body: new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content: 'I am still analyzing. ' + 'x'.repeat(2100) } }] }) + '\n\n'))
+                controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content: 'I am still analyzing. ' + 'x'.repeat(65_000) } }] }) + '\n\n'))
               }
             })
           })

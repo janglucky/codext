@@ -8,6 +8,7 @@
 - 标准 ReAct：Reason → Skill → Act → Validate
 - ReAct 输出协议校验与自动纠正，兼容 JSON、Thought/Action/Action Input 文本及 OpenAI `tool_calls`
 - 模型首包和 SSE 流停顿检测，自动降级非流式请求；重试共享总超时预算并显示状态
+- 保留完整工具 Observation、附件和写入内容供后续轮次使用，仅在连接恢复时压缩较早的超大结果
 - OpenAI 兼容 chat/completions 适配与演示模式
 - 本地配置、任务历史持久化，以及模型配置面板
 - 多模型配置档案、默认模型管理，以及会话级模型切换

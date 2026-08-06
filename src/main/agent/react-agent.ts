@@ -12,7 +12,11 @@ const MAX_ACTIONS_PER_TURN = 1
 const MAX_REACT_FORMAT_RETRIES = 2
 const MAX_REPEATED_ACTION_RETRIES = 2
 const MODEL_INACTIVITY_TIMEOUT_MS = 60_000
-const MAX_UNSTRUCTURED_RESPONSE_CHARACTERS = 2000
+const MAX_HISTORY_MESSAGES = 24
+// The model output is limited by max_tokens already. Keep this guard above the
+// normal response budget so a long but valid reasoning field is not cut off
+// before its Action JSON arrives.
+const MAX_UNSTRUCTURED_RESPONSE_CHARACTERS = 64_000
 const MAX_DISPLAYED_THOUGHT_CHARACTERS = 800
 
 const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep => ({
@@ -115,7 +119,7 @@ export class ReactAgent {
       { role: 'system', content: this.buildSystemPrompt(currentPolicy) },
       ...history
         .filter((message) => message.content.trim() || message.attachments?.length)
-        .slice(-12)
+        .slice(-MAX_HISTORY_MESSAGES)
         .map((message): ModelMessage => ({
           role: message.role,
           content: message.role === 'user' ? this.buildUserContent(message.content, message.attachments) : message.content
@@ -129,6 +133,7 @@ export class ReactAgent {
     let repeatedActionRetries = 0
     let finalizationOnly = false
     let modelConnectionRecoveryUsed = false
+    const observationsForFallback: string[] = []
     const deniedMcpPaths = new Set<string>()
     const deniedCommandSignatures = new Set<string>()
     const toolIntentPrompt = resolveToolIntentPrompt(prompt, history)
@@ -191,11 +196,11 @@ export class ReactAgent {
           onDelta?.(forcedFinal)
           return forcedFinal
         }
-        return this.fallbackFinalAfterRepeatedAction(task)
+        return this.fallbackFinalAfterRepeatedAction(task, observationsForFallback)
       }
       if (turn > this.maxReactTurns && toolCalls.length) {
         if (task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))) {
-          return this.fallbackFinalAfterRepeatedAction(task)
+          return this.fallbackFinalAfterRepeatedAction(task, observationsForFallback)
         }
         throw new Error('ReAct 已达到最大工具轮数，收尾轮不能继续调用工具。')
       }
@@ -332,13 +337,6 @@ export class ReactAgent {
           output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, requestCommandApproval, signal)
           throwIfAborted(signal)
           this.recordToolArtifacts(task, call, output)
-          if (call.name === 'write_file' && call.arguments.path) {
-            const contentLength = typeof call.arguments.content === 'string' ? call.arguments.content.length : 0
-            messages[assistantMessageIndex] = {
-              role: 'assistant',
-              content: '已执行 write_file：' + call.arguments.path + '（写入内容 ' + contentLength + ' 个字符，正文已从后续模型上下文省略）。'
-            }
-          }
           if (call.name === 'run_command') unresolvedCommandFailure = false
           if (call.name === 'parse_powerpoint' && call.arguments.path && output.includes('用户未授权')) {
             deniedMcpPaths.add(call.arguments.path)
@@ -366,6 +364,7 @@ export class ReactAgent {
 
       const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n')
       messages.push({ role: 'user', content: observationText })
+      observationsForFallback.push(observationText)
       if (turn === this.maxReactTurns) {
         messages.push({
           role: 'user',
@@ -377,12 +376,13 @@ export class ReactAgent {
     throw new Error('ReAct 达到最大工具轮数，并在追加收尾轮后仍未得到 Final。')
   }
 
-  private fallbackFinalAfterRepeatedAction(task: AgentTask): string {
-    const observations = task.steps
-      .filter((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
-      .map((item) => item.title + '\n' + item.detail)
-      .join('\n\n')
-      .slice(-8000)
+  private fallbackFinalAfterRepeatedAction(task: AgentTask, observationTexts: string[] = []): string {
+    const observations = observationTexts.length
+      ? observationTexts.join('\n\n')
+      : task.steps
+        .filter((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
+        .map((item) => item.title + '\n' + item.detail)
+        .join('\n\n')
     return '已基于已获得的工具结果整理当前结果：\n\n' + (observations || '暂无可用工具结果。')
   }
 
@@ -675,12 +675,14 @@ export class ReactAgent {
   }
 
   private compactToolContext(messages: ModelMessage[]): void {
+    const observationIndexes = messages.flatMap((message, index) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith('Observation #') ? [index] : [])
+    const latestObservationIndex = observationIndexes.at(-1)
     for (let index = 0; index < messages.length; index++) {
       const message = messages[index]
-      if (message.role !== 'user' || typeof message.content !== 'string' || !message.content.startsWith('Observation #') || message.content.length <= 16_000) continue
+      if (index === latestObservationIndex || message.role !== 'user' || typeof message.content !== 'string' || !message.content.startsWith('Observation #') || message.content.length <= 64_000) continue
       messages[index] = {
         ...message,
-        content: message.content.slice(0, 12_000) + '\n\n[较长的工具输出已压缩]\n\n' + message.content.slice(-2_000)
+        content: message.content.slice(0, 48_000) + '\n\n[较长的工具输出已压缩]\n\n' + message.content.slice(-16_000)
       }
     }
   }

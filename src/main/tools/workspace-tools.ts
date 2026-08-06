@@ -335,7 +335,7 @@ export class WorkspaceTools {
       .map((value) => Buffer.isBuffer(value) ? this.decodeCommandOutput(value) : typeof value === 'string' ? value : '')
       .filter(Boolean)
       .join('\n') || (typeof details.message === 'string' ? details.message : '')
-    return output.length > 8000 ? output.slice(0, 5000) + '\n...输出已截断...\n' + output.slice(-2000) : output.trim()
+    return output.length > 32_000 ? output.slice(0, 24_000) + '\n...输出已截断...\n' + output.slice(-8_000) : output.trim()
   }
 
   private commandExitCode(error: unknown): string {

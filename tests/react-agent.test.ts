@@ -357,7 +357,7 @@ describe('ReactAgent.execute', () => {
       })
 
       const { execute } = makeAgent(makeSettings())
-      await execute('inspect files', makeTask())
+      await execute('explain ReAct briefly', makeTask())
 
       const request = vi.mocked(globalThis.fetch).mock.calls[0]?.[1]
       const body = JSON.parse(String(request?.body)) as { messages: Array<{ role: string; content: string }> }
@@ -379,6 +379,19 @@ describe('ReactAgent.execute', () => {
       expect(result).toBe('plain answer')
       // no act steps should be added for tools
       expect(task.steps.filter(s => s.phase === 'act')).toHaveLength(0)
+    })
+
+    it('strips thought tags from a final response before displaying it', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: '<think>internal reasoning</think>visible answer' }) } }] })
+      })
+
+      const { execute } = makeAgent(makeSettings())
+      const result = await execute('what is 2+2', makeTask())
+
+      expect(result).toBe('visible answer')
+      expect(result).not.toContain('<think>')
     })
 
     it('sends image and text attachments as multimodal user content', async () => {
@@ -721,6 +734,141 @@ describe('ReactAgent.execute', () => {
       expect(actSteps.some(s => s.title.startsWith('Observation #'))).toBe(true)
     })
 
+    it('executes a standard Thought Action Action Input response', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? 'Thought: I need to inspect the workspace.\nAction: list_files\nAction Input: {"path":".","recursive":false}'
+          : JSON.stringify({ thought: 'The directory was inspected.', final: 'workspace inspected' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('inspect project files')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('workspace inspected')
+      expect(listFiles).toHaveBeenCalledWith('.', false)
+      expect(task.steps.some((item) => item.title.includes('list_files'))).toBe(true)
+    })
+
+    it('executes a Chinese ReAct text response', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? '思考：需要先读取配置。\n行动：read_file\n行动输入：{"path":"package.json"}'
+          : JSON.stringify({ thought: '已读取配置。', final: '配置读取完成' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('配置读取完成')
+      expect(readFile).toHaveBeenCalledWith('package.json')
+    })
+
+    it('recovers a read_file action from a concise narrative response', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? 'Looking at the backend code in src/api/server.py, the error is probably from FastAPI. I need to read ui/src/components/ConfigPanel.tsx to see how the frontend calls the endpoint. Let me also check src/core/llm.py later.'
+          : JSON.stringify({ final: '继续处理' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('from fastapi import FastAPI')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('检查 API 报错')
+
+      expect(task.status).toBe('succeeded')
+      expect(readFile).toHaveBeenCalledWith('ui/src/components/ConfigPanel.tsx')
+      expect(task.result).toBe('继续处理')
+    })
+
+    it('rejects a premature final and asks for an executable ReAct action', async () => {
+      let callCount = 0
+      const requestBodies: string[] = []
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(String(init?.body ?? ''))
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ thought: 'I can answer directly.', final: 'The files look fine.' })
+          : callCount === 2
+            ? JSON.stringify({ thought: 'I need an Observation.', action: { name: 'list_files', arguments: { path: '.' } } })
+            : JSON.stringify({ thought: 'The directory was inspected.', final: 'The files were inspected.' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('inspect project files')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('The files were inspected.')
+      expect(callCount).toBe(3)
+      expect(task.steps.some((item) => item.title === '模型尚未执行所需工具')).toBe(true)
+      expect(requestBodies[1]).toContain('FORMAT_ERROR')
+      expect(requestBodies[1]).toContain('需要实际读取、写入、检查或执行')
+    })
+
+    it('inherits tool intent from the previous user request when asked to continue', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ final: 'I will continue later.' })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'list_files', arguments: { path: '.' } } })
+            : JSON.stringify({ final: 'continued and inspected' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('继续', [
+        { role: 'user', content: '查看这个项目的文件' },
+        { role: 'assistant', content: '我准备检查。' }
+      ])
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('continued and inspected')
+      expect(listFiles).toHaveBeenCalledWith('.', false)
+      expect(task.steps.some((item) => item.title === '模型尚未执行所需工具')).toBe(true)
+    })
+
+    it('normalizes native OpenAI tool_calls into the ReAct loop', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 1) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ choices: [{ message: {
+              content: null,
+              reasoning_content: '需要查看目录。',
+              tool_calls: [{ function: { name: 'list_files', arguments: '{"path":"."}' } }]
+            } }] })
+          })
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'done' }) } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('inspect project files')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('done')
+      expect(listFiles).toHaveBeenCalledWith('.', false)
+    })
+
     it('executes action when model returns adjacent JSON objects', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
@@ -742,6 +890,47 @@ describe('ReactAgent.execute', () => {
       expect(callCount).toBe(2)
       expect(task.steps.some(s => s.title.includes('run_command'))).toBe(true)
       expect(task.result).toBeUndefined()
+    })
+
+    it('does not expose raw thought text when the model repeats a successful action', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount <= 2
+          ? '<think>I should read the same file again.</think>' + JSON.stringify({ action: { name: 'list_files', arguments: { path: '.' } } })
+          : JSON.stringify({ final: 'used the existing observation' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('inspect project files')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('used the existing observation')
+      expect(task.result).not.toContain('<think>')
+      expect(listFiles).toHaveBeenCalledOnce()
+      expect(task.steps.some((item) => item.title === '整理已有结果')).toBe(true)
+    })
+
+    it('forces a user-facing result after repeated actions never produce a final', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = '<think>我会再次读取相同目录。</think>' + JSON.stringify({ action: { name: 'list_files', arguments: { path: '.' } } })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('inspect project files')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toContain('已基于已获得的工具结果整理当前结果')
+      expect(task.result).not.toContain('<think>')
+      expect(listFiles).toHaveBeenCalledOnce()
+      expect(callCount).toBe(5)
+      expect(task.steps.some((item) => item.title === '整理已有结果')).toBe(true)
     })
 
     it('removes completion claims from thought before action', async () => {
@@ -1119,10 +1308,12 @@ describe('ReactAgent.execute', () => {
       })
 
       const { execute } = makeAgent(makeSettings({ maxRetries: 1 }))
-      const result = await execute('retry fetch', makeTask())
+      const task = makeTask()
+      const result = await execute('retry fetch', task)
 
       expect(result).toBe('network recovered')
       expect(callCount).toBe(2)
+      expect(task.steps.some((item) => item.title === '模型响应中断，正在重试')).toBe(true)
     })
 
     it('throws when model returns empty content', async () => {
@@ -1149,9 +1340,101 @@ describe('ReactAgent.execute', () => {
       const abortError = new DOMException('The operation was aborted', 'AbortError')
       globalThis.fetch = vi.fn().mockRejectedValue(abortError)
 
-      const s = makeSettings({ timeoutMs: 3000 })
+      const s = makeSettings({ timeoutMs: 3000, maxRetries: 0 })
       const { execute } = makeAgent(s)
       await expect(execute('test', makeTask())).rejects.toThrow('模型请求超时（3秒）')
+    })
+
+    it('fails quickly when the model does not return response headers', async () => {
+      globalThis.fetch = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      }))
+      const settings = makeSettings({ timeoutMs: 5000, maxRetries: 0 })
+      const agent = new ReactAgent(() => settings, () => basePolicy, () => '', 100, 20)
+
+      const task = await agent.run('hello')
+
+      expect(task.status).toBe('failed')
+      expect(task.error).toContain('模型连接超时')
+      expect(task.steps.some((item) => item.title.includes('ReAct 第'))).toBe(false)
+    })
+
+    it('fails when an SSE stream stops producing model data', async () => {
+      const encoder = new TextEncoder()
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        headers: { get: () => 'text/event-stream' },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content: '{"thought":"working' } }] }) + '\n\n'))
+          }
+        })
+      })
+      const settings = makeSettings({ timeoutMs: 5000, maxRetries: 0 })
+      const agent = new ReactAgent(() => settings, () => basePolicy, () => '', 100, 20)
+
+      const task = await agent.run('hello')
+
+      expect(task.status).toBe('failed')
+      expect(task.error).toContain('没有新数据')
+    })
+
+    it('stops an unstructured reasoning stream before the total timeout', async () => {
+      const encoder = new TextEncoder()
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 1) {
+          return Promise.resolve({
+            ok: true,
+            headers: { get: () => 'text/event-stream' },
+            body: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content: 'I am still analyzing. ' + 'x'.repeat(2100) } }] }) + '\n\n'))
+              }
+            })
+          })
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'protocol recovered' }) } }] }) })
+      })
+      const settings = makeSettings({ timeoutMs: 5000, maxRetries: 0 })
+      const agent = new ReactAgent(() => settings, () => basePolicy, () => '', 100, 20)
+
+      const task = await agent.run('hello')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('protocol recovered')
+      expect(callCount).toBe(2)
+      expect(task.steps.some((item) => item.title === '模型输出格式不正确')).toBe(true)
+      expect(JSON.stringify(task)).not.toContain('REACT_PROTOCOL_DRIFT')
+    })
+
+    it('falls back to a non-streaming request after an SSE stall', async () => {
+      const requestBodies: Array<{ stream?: boolean }> = []
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(String(init?.body ?? '{}')) as { stream?: boolean })
+        if (requestBodies.length === 1) {
+          return Promise.resolve({
+            ok: true,
+            headers: { get: () => 'text/event-stream' },
+            body: new ReadableStream<Uint8Array>({ start() {} })
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => 'application/json' },
+          json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'fallback succeeded' }) } }] })
+        })
+      })
+      const settings = makeSettings({ timeoutMs: 5000, maxRetries: 1 })
+      const agent = new ReactAgent(() => settings, () => basePolicy, () => '', 100, 20)
+
+      const task = await agent.run('hello')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('fallback succeeded')
+      expect(requestBodies.map((body) => body.stream)).toEqual([true, false])
+      expect(task.steps.some((item) => item.title === '流式响应停顿，改用非流式重试')).toBe(true)
     })
 
     it('propagates tool execution errors upward', async () => {
@@ -1226,20 +1509,20 @@ describe('ReactAgent.execute', () => {
       expect(callCount).toBe(2)
     })
 
-    it('handles empty tool_calls array', async () => {
-      globalThis.fetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({
-          choices: [{ message: { content: JSON.stringify({ tool_calls: [] }) } }]
-        })
+    it('repairs an empty tool_calls response instead of accepting it as final', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1 ? JSON.stringify({ tool_calls: [] }) : JSON.stringify({ final: 'recovered' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
       })
 
       const { execute } = makeAgent(makeSettings())
       const task = makeTask()
       const result = await execute('test', task)
-      // empty tool_calls means no tools executed, parseToolCalls returns []
-      // but the content IS valid JSON with tool_calls, so it's returned directly
-      expect(result).toContain('tool_calls')
+      expect(result).toBe('recovered')
+      expect(callCount).toBe(2)
+      expect(task.steps.some((item) => item.title === '模型输出格式不正确')).toBe(true)
     })
 
     it('truncates long tool output in step detail to 800 chars', async () => {

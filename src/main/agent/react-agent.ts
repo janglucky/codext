@@ -9,6 +9,11 @@ import { modelFetch } from '../model-fetch'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
+const MAX_REACT_FORMAT_RETRIES = 2
+const MAX_REPEATED_ACTION_RETRIES = 2
+const MODEL_INACTIVITY_TIMEOUT_MS = 60_000
+const MAX_UNSTRUCTURED_RESPONSE_CHARACTERS = 2000
+const MAX_DISPLAYED_THOUGHT_CHARACTERS = 800
 
 const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep => ({
   id: crypto.randomUUID(),
@@ -29,6 +34,7 @@ type ReactModelReply = {
   tool_calls?: ToolCall[]
   choice?: UserChoiceDetails
   final?: string
+  unparsed?: string
 }
 type ModelContentPart =
   | { type: 'text'; text: string }
@@ -36,7 +42,7 @@ type ModelContentPart =
 type ModelContent = string | ModelContentPart[]
 type ModelMessage = { role: 'system' | 'user' | 'assistant'; content: ModelContent }
 type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
-type ModelResponse = { content: string; usage?: RawModelUsage }
+type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean }
 type ConversationMessage = { role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[] }
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
@@ -45,12 +51,23 @@ type CommandApprovalCallback = (request: CommandApprovalDetails) => Promise<bool
 type UserChoiceSelection = string | { optionId?: string; workspacePath?: string }
 type UserChoiceCallback = (request: UserChoiceDetails) => Promise<UserChoiceSelection | undefined>
 
+function normalizeModelContent(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value.map((part) => {
+    if (typeof part === 'string') return part
+    if (typeof part === 'object' && part !== null && 'text' in part && typeof part.text === 'string') return part.text
+    return ''
+  }).join('')
+}
+
 export class ReactAgent {
   constructor(
     private readonly getSettings: () => AppSettings,
     private readonly getPolicy: () => AgentPolicy,
     private readonly getPptMcpUrl: () => string = () => '',
-    private readonly maxReactTurns = MAX_REACT_TURNS
+    private readonly maxReactTurns = MAX_REACT_TURNS,
+    private readonly modelInactivityTimeoutMs = MODEL_INACTIVITY_TIMEOUT_MS
   ) {}
 
   async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig): Promise<AgentTask> {
@@ -106,12 +123,15 @@ export class ReactAgent {
       { role: 'user', content: this.buildUserContent(prompt, attachments) }
     ]
     let previousActionSignature = ''
-    let previousActionHadError = false
     let unresolvedCommandFailure = false
     let incompleteToolCallRetries = 0
+    let reactFormatRetries = 0
+    let repeatedActionRetries = 0
+    let finalizationOnly = false
     let modelConnectionRecoveryUsed = false
     const deniedMcpPaths = new Set<string>()
     const deniedCommandSignatures = new Set<string>()
+    const toolIntentPrompt = resolveToolIntentPrompt(prompt, history)
 
     for (let turn = 1; turn <= this.maxReactTurns + 1; turn++) {
       throwIfAborted(signal)
@@ -123,8 +143,10 @@ export class ReactAgent {
         }
       )
       let content: string
+      let modelResponse: ModelResponse
       try {
-        content = await this.callModel(messages, (delta) => stream.push(delta), signal, task, model)
+        modelResponse = await this.callModel(messages, (delta) => stream.push(delta), signal, task, model, onStep)
+        content = modelResponse.content
       } catch (error) {
         const modelError = error instanceof Error ? error : new Error(String(error))
         const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
@@ -161,12 +183,50 @@ export class ReactAgent {
         ? inferOfficeToolCall(prompt, reply, pendingOfficeParses)
         : undefined
       if (implicitOfficeCall) toolCalls = [implicitOfficeCall]
+      if (finalizationOnly) {
+        const forcedFinal = !toolCalls.length && typeof reply.final === 'string' && !isIncompleteFinal(reply.final)
+          ? sanitizeThoughtText(reply.final)
+          : ''
+        if (forcedFinal) {
+          onDelta?.(forcedFinal)
+          return forcedFinal
+        }
+        return this.fallbackFinalAfterRepeatedAction(task)
+      }
       if (turn > this.maxReactTurns && toolCalls.length) {
+        if (task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))) {
+          return this.fallbackFinalAfterRepeatedAction(task)
+        }
         throw new Error('ReAct 已达到最大工具轮数，收尾轮不能继续调用工具。')
       }
       const choiceRequest = !toolCalls.length ? normalizeChoiceRequest(reply.choice) ?? inferChoiceRequest(reply.final) : undefined
+      const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
+      const hasUserChoiceProgress = task.steps.some((item) => item.title === '用户已选择方案')
+      const malformedReply = reply.unparsed !== undefined && (modelResponse.protocolDrift || looksLikeMalformedReactReply(content))
+      const missingRequiredAction = !toolCalls.length && !choiceRequest && !hasToolProgress && !hasUserChoiceProgress && promptRequiresToolUse(toolIntentPrompt) &&
+        (reply.unparsed !== undefined || typeof reply.final === 'string')
+      if (malformedReply || missingRequiredAction) {
+        reactFormatRetries++
+        if (reactFormatRetries > MAX_REACT_FORMAT_RETRIES) {
+          throw new Error('模型连续未按 ReAct 协议返回可执行 Action。请检查模型是否支持指令遵循，或切换其他模型后重试。')
+        }
+        messages[assistantMessageIndex] = {
+          role: 'assistant',
+          content: missingRequiredAction
+            ? '[上一条响应在没有任何工具 Observation 的情况下提前结束，未作为 Final 接受。]'
+            : '[上一条响应不符合 ReAct 输出协议，未执行也未作为 Final 接受。]'
+        }
+        this.addStep(task, step(
+          'reason',
+          missingRequiredAction ? '模型尚未执行所需工具' : '模型输出格式不正确',
+          '正在要求模型改用单个 JSON ReAct 对象继续本次任务。'
+        ), onStep)
+        messages.push({ role: 'user', content: buildReactCorrectionPrompt(missingRequiredAction) })
+        continue
+      }
+      reactFormatRetries = 0
       if (reply.thought) {
-        thoughtStep.detail = toolCalls.length ? sanitizeThoughtBeforeAction(reply.thought) : reply.thought
+        thoughtStep.detail = formatThoughtDetail(toolCalls.length ? sanitizeThoughtBeforeAction(reply.thought) : sanitizeThoughtText(reply.thought))
         this.upsertStep(task, thoughtStep, onStep)
       } else if (implicitOfficeCall) {
         thoughtStep.detail = '检测到需要读取 Office 附件，准备立即调用 ' + implicitOfficeCall.name + '。'
@@ -208,31 +268,59 @@ export class ReactAgent {
           messages.push({ role: 'user', content: '任务尚未完成。不要等待用户提供工具结果；如果需要检查、读取、写入或执行命令，请立即输出下一步 Action JSON。只有完成全部目标后才能输出 Final。' })
           continue
         }
-        onDelta?.(reply.final)
-        return reply.final
+        const finalText = sanitizeAssistantText(reply.final)
+        onDelta?.(finalText)
+        return finalText
       }
 
-      if (!toolCalls.length) return content
+      if (!toolCalls.length) {
+        const finalText = sanitizeAssistantText(reply.unparsed ?? content)
+        onDelta?.(finalText)
+        return finalText
+      }
       const deniedMcpCall = toolCalls.find((call) => call.name === 'parse_powerpoint' && call.arguments.path && deniedMcpPaths.has(call.arguments.path))
       if (deniedMcpCall) {
         messages.push({ role: 'user', content: '用户已经拒绝对该文件的 PPT MCP 授权，不得再次请求同一路径。请立即改用其他可用工具或给出不依赖 MCP 的解决思路；如果没有可靠替代方案，如实说明限制并输出 Final。' })
         previousActionSignature = ''
-        previousActionHadError = true
         continue
       }
       const deniedCommandCall = toolCalls.find((call) => call.name === 'run_command' && call.arguments.command && deniedCommandSignatures.has(commandSignature(call.arguments.command, call.arguments.args ?? [])))
       if (deniedCommandCall) {
         messages.push({ role: 'user', content: '用户或安全策略已经拒绝执行相同命令，不得再次申请。请改用只读命令、其他安全方案，或如实说明限制并输出 Final。' })
         previousActionSignature = ''
-        previousActionHadError = true
         continue
       }
       const actionSignature = JSON.stringify(toolCalls)
-      if (actionSignature === previousActionSignature && !previousActionHadError) return content
+      if (actionSignature === previousActionSignature) {
+        repeatedActionRetries++
+        if (repeatedActionRetries > MAX_REPEATED_ACTION_RETRIES) {
+          finalizationOnly = true
+          messages[0] = {
+            role: 'system',
+            content: this.buildSystemPrompt(currentPolicy) + '\n\n强制收尾：工具已经返回结果，本轮只允许输出一个 Final JSON，禁止输出任何 Action、Choice、Thought 标签或分析正文。'
+          }
+          messages[assistantMessageIndex] = { role: 'assistant', content: '[模型重复调用已成功执行的工具，已停止重复执行。]' }
+          this.addStep(task, step('reason', '整理已有结果', '工具结果已经足够继续，本轮只请求最终答复。'), onStep)
+          const latestObservation = [...messages].reverse().find((message) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith('Observation #'))
+          messages.push({
+            role: 'user',
+            content: '强制收尾请求：请只输出 Final JSON，不得调用工具。最近一次 Observation 如下：\n' + (latestObservation?.content ?? '工具已成功执行，但 Observation 未能保留。')
+          })
+          previousActionSignature = actionSignature
+          continue
+        }
+        messages[assistantMessageIndex] = { role: 'assistant', content: '[上一条 Action 与已成功执行的 Action 重复，未再次执行。]' }
+        this.addStep(task, step('reason', '整理已有结果', '工具已执行过，正在要求模型使用已有结果继续。'), onStep)
+        messages.push({
+          role: 'user',
+          content: 'REPEATED_ACTION：该 Action 已经成功执行并返回 Observation，不能再次调用，也不能输出原始思考文本。请直接依据最近 Observation 继续；如果任务已完成，只输出 Final JSON。最近一次 Observation：\n' + ([...messages].reverse().find((message) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith('Observation #'))?.content ?? '工具已成功执行。')
+        })
+        continue
+      }
+      repeatedActionRetries = 0
       previousActionSignature = actionSignature
 
       const observations: string[] = []
-      let currentActionHadError = false
       for (const call of toolCalls.slice(0, MAX_ACTIONS_PER_TURN)) {
         this.addStep(task, step('act', '正在执行工具：' + call.name, this.toolDetail(call)), onStep)
         if (call.name === 'decrypt_file' && call.arguments.path) pendingDecryptPaths.delete(call.arguments.path)
@@ -254,18 +342,15 @@ export class ReactAgent {
           if (call.name === 'run_command') unresolvedCommandFailure = false
           if (call.name === 'parse_powerpoint' && call.arguments.path && output.includes('用户未授权')) {
             deniedMcpPaths.add(call.arguments.path)
-            currentActionHadError = true
             output += '\n不要再次请求该路径的 MCP 授权，请改用其他解决思路。'
           }
           if (call.name === 'run_command' && call.arguments.command && output.includes('用户拒绝')) {
             deniedCommandSignatures.add(commandSignature(call.arguments.command, call.arguments.args ?? []))
-            currentActionHadError = true
             output += '\n不要再次申请相同命令；请改用只读命令或其他安全方案。'
           }
         } catch (error) {
           throwIfAborted(signal)
           if (!isRecoverableToolError(error, call.name)) throw error
-          currentActionHadError = true
           output = '工具执行失败：' + (error instanceof Error ? error.message : String(error))
           const securityBlocked = call.name === 'run_command' && output.includes('安全策略阻止')
           if (call.name === 'run_command') unresolvedCommandFailure = !securityBlocked
@@ -287,27 +372,38 @@ export class ReactAgent {
           content: '已达到本次任务的最大工具轮数。你还有一个不允许调用工具的收尾轮次：请完整读取最后一个 Observation；如果任务和验证已经完成，立即输出 Final JSON，总结实际完成内容和验证结果。禁止再次输出 Action 或 Choice。'
         })
       }
-      previousActionHadError = currentActionHadError
     }
 
     throw new Error('ReAct 达到最大工具轮数，并在追加收尾轮后仍未得到 Final。')
   }
 
+  private fallbackFinalAfterRepeatedAction(task: AgentTask): string {
+    const observations = task.steps
+      .filter((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
+      .map((item) => item.title + '\n' + item.detail)
+      .join('\n\n')
+      .slice(-8000)
+    return '已基于已获得的工具结果整理当前结果：\n\n' + (observations || '暂无可用工具结果。')
+  }
+
   private buildSystemPrompt(policy: AgentPolicy): string {
     const toolSchema = [
       '{',
+      '  "thought": "简短说明下一步及原因",',
       '  "action": { "name": "read_file|write_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command|start_service", "arguments": { ... } }',
       '}'
     ].join('\n')
 
     const finalSchema = [
       '{',
+      '  "thought": "简短说明为何可以结束",',
       '  "final": "给用户的最终答复"',
       '}'
     ].join('\n')
 
     const choiceSchema = [
       '{',
+      '  "thought": "简短说明为何必须由用户选择",',
       '  "choice": {',
       '    "title": "需要用户确认的简短标题",',
       '    "description": "为什么必须选择",',
@@ -323,10 +419,10 @@ export class ReactAgent {
       policy.systemPrompt,
       '',
       '你必须遵循 ReAct 循环：Thought -> Action -> Observation -> Thought -> ... -> Final。',
-      '每一轮先输出一段可展示的简短思考过程，必须包裹在 <think>...</think> 或 <thought>...</thought> 标签中；标签内容会被实时流式展示给用户。',
+      '输出协议是最高优先级约束：每轮只能输出一个合法 JSON 对象，thought 必须作为 JSON 字符串字段；不要输出 Markdown、代码块、XML 标签、JSON 前后说明或第二个 JSON 对象。',
+      'thought 只能是 300 字以内的行动摘要，禁止在 thought 中长篇排查、逐段分析代码或反复自问自答；一旦需要查看文件或运行检查，立即结束 thought 并输出 action。',
       '如果本轮需要工具，思考内容只能描述将要执行的计划和原因，必须使用“准备、将要、需要”等未完成措辞；在工具 Observation 返回前，严禁声称文件已经创建、已经写入、已经修改、已经运行、已经完成或已经确认。',
       '只有收到对应工具的 Observation 后，下一轮 Thought 才能描述该工具确实完成的结果；不得在 Action 之前提前编造工具结果。',
-      '思考标签结束后，只能输出一个 JSON 对象，不要输出 Markdown，不要包裹代码块，不要把 JSON 放进思考标签里。',
       '如果本轮输出 Action JSON，就必须立刻停止输出，等待工具 Observation；同一轮绝不能再输出 Final 或第二个 JSON 对象。',
       '这里的工具通过文本 Action JSON 协议调用；即使模型 API 的原生 tools 列表为空，也不代表这些工具不可用。禁止声称工具未挂载、无法调用或要求用户重新启用。',
       '当问题需要读取 PowerPoint 内容时，立即输出 parse_powerpoint Action JSON，不要先解释限制。宿主收到该 Action 后会在当前会话向用户请求单次 MCP 授权；授权通过后继续调用，授权拒绝后不得重复申请同一路径，必须考虑其他工具或如实给出替代方案。',
@@ -344,7 +440,8 @@ export class ReactAgent {
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
       '所有文件路径必须是工作区内的相对路径。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。宿主会识别命令风险：ls、dir、cat、find、grep、git status/diff/log 以及 SSH 远程只读查询可以直接执行；可能写入文件、安装依赖、运行脚本或修改远程状态的命令会在当前会话请求用户单次授权；删除、格式化、关机、终止进程和强制清理命令会直接拒绝。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；但远程写操作仍必须等待宿主授权。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
-      '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。'
+      '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。',
+      '再次确认输出契约：只返回一个 JSON 对象，并且只包含 thought + action、thought + choice 或 thought + final 三种结构之一。需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
     ].join('\n')
   }
 
@@ -477,40 +574,65 @@ export class ReactAgent {
     }
   }
 
-  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig): Promise<string> {
+  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback): Promise<ModelResponse> {
     const maxAttempts = Math.max(1, model.maxRetries + 1)
+    const totalTimeoutMs = Math.max(1000, model.timeoutMs)
+    const deadline = Date.now() + totalTimeoutMs
     let lastError: Error | undefined
+    let useStreaming = true
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       throwIfAborted(signal)
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) throw new Error('模型请求超时（' + totalTimeoutMs / 1000 + '秒）')
       try {
         const startedAt = performance.now()
-        const response = await this.callModelOnce(messages, model, onDelta, signal)
+        const response = await this.callModelOnce(messages, model, onDelta, signal, remainingMs, useStreaming)
         this.recordTokenUsage(task, messages, response, Math.max(1, performance.now() - startedAt))
-        return response.content
+        return response
       } catch (error) {
         throwIfAborted(signal)
         lastError = error instanceof Error ? error : new Error('模型请求失败')
         if (!this.isRetryableModelError(lastError) || attempt === maxAttempts) throw lastError
-        await abortableDelay(Math.min(1000 * 2 ** (attempt - 1), 5000), signal)
+        const retryDelayMs = Math.min(1000 * 2 ** (attempt - 1), 5000)
+        if (Date.now() + retryDelayMs >= deadline) throw new Error('模型请求超时（' + totalTimeoutMs / 1000 + '秒）')
+        const stalledStream = useStreaming && /模型连接超时|没有新数据/.test(lastError.message)
+        if (stalledStream) useStreaming = false
+        this.addStep(task, step(
+          'reason',
+          stalledStream ? '流式响应停顿，改用非流式重试' : '模型响应中断，正在重试',
+          '第 ' + attempt + ' 次请求失败：' + lastError.message
+        ), onStep)
+        await abortableDelay(retryDelayMs, signal)
       }
     }
     throw lastError ?? new Error('模型请求失败')
   }
 
-  private async callModelOnce(messages: ModelMessage[], model: ModelConfig, onDelta?: DeltaCallback, signal?: AbortSignal): Promise<ModelResponse> {
+  private async callModelOnce(messages: ModelMessage[], model: ModelConfig, onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, remainingMs: number, useStreaming: boolean): Promise<ModelResponse> {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), model.timeoutMs)
+    const totalTimeoutMs = Math.max(1000, remainingMs)
+    const inactivityTimeoutMs = Math.min(totalTimeoutMs, Math.max(10, this.modelInactivityTimeoutMs))
+    let timeoutKind: 'total' | 'inactivity' | undefined
+    const abortForTimeout = (kind: 'total' | 'inactivity'): void => {
+      if (!timeoutKind) timeoutKind = kind
+      controller.abort()
+    }
+    const totalTimer = setTimeout(() => abortForTimeout('total'), totalTimeoutMs)
+    const firstByteTimer = setTimeout(() => abortForTimeout('inactivity'), inactivityTimeoutMs)
     const onAbort = (): void => controller.abort()
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'text/event-stream' }
+      const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: useStreaming ? 'text/event-stream' : 'application/json' }
       if (model.apiKey.trim()) headers.Authorization = 'Bearer ' + model.apiKey
+      const requestBody: Record<string, unknown> = { model: model.model, messages, temperature: 0, max_tokens: 16384, stream: useStreaming }
+      if (useStreaming) requestBody.stream_options = { include_usage: true }
       const response = await modelFetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
         signal: controller.signal,
         headers,
-        body: JSON.stringify({ model: model.model, messages, temperature: 0, max_tokens: 16384, stream: true, stream_options: { include_usage: true } })
+        body: JSON.stringify(requestBody)
       })
+      clearTimeout(firstByteTimer)
       if (!response.ok) {
         let errorDetail = ''
         try {
@@ -524,17 +646,22 @@ export class ReactAgent {
         throw error
       }
       const contentType = response.headers?.get('content-type') ?? ''
-      const result = contentType.includes('text/event-stream') ? await this.readStreamResponse(response, onDelta) : await this.readJsonResponse(response)
+      const result = contentType.includes('text/event-stream')
+        ? await this.readStreamResponse(response, onDelta, inactivityTimeoutMs)
+        : await this.readJsonResponse(response)
       if (!result.content) throw new Error('模型返回为空')
       return result
     } catch (error) {
       if (signal?.aborted) throw new DOMException('任务已暂停', 'AbortError')
+      if (timeoutKind === 'inactivity') throw new Error('模型连接超时（' + inactivityTimeoutMs / 1000 + '秒内未收到响应）')
+      if (timeoutKind === 'total') throw new Error('模型请求超时（' + totalTimeoutMs / 1000 + '秒）')
       if (error instanceof DOMException && error.name === 'AbortError') {
-        throw new Error('模型请求超时（' + model.timeoutMs / 1000 + '秒）')
+        throw new Error('模型请求超时（' + totalTimeoutMs / 1000 + '秒）')
       }
       throw error
     } finally {
-      clearTimeout(timer)
+      clearTimeout(totalTimer)
+      clearTimeout(firstByteTimer)
       signal?.removeEventListener('abort', onAbort)
     }
   }
@@ -543,7 +670,7 @@ export class ReactAgent {
     const status = (error as Error & { status?: number }).status
     const causeCode = (error as Error & { cause?: { code?: unknown } }).cause?.code
     return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524 ||
-      error.name === 'TypeError' || /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|UND_ERR/i.test(error.message) ||
+      error.name === 'TypeError' || /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|UND_ERR|超时|中断|无数据|没有新数据|timeout|timed out/i.test(error.message) ||
       (typeof causeCode === 'string' && /ECONNRESET|ETIMEDOUT|UND_ERR|EAI_AGAIN|ENETUNREACH/i.test(causeCode))
   }
 
@@ -559,14 +686,35 @@ export class ReactAgent {
   }
 
   private async readJsonResponse(response: Response): Promise<ModelResponse> {
-    const payload = await response.json() as { choices?: Array<{ message?: { content?: string }, delta?: { content?: string } }>; usage?: RawModelUsage }
+    const payload = await response.json() as {
+      choices?: Array<{
+        message?: {
+          content?: unknown
+          reasoning_content?: string
+          tool_calls?: Array<{ function?: { name?: string; arguments?: unknown }; name?: string; arguments?: unknown }>
+        }
+        delta?: { content?: unknown }
+      }>
+      usage?: RawModelUsage
+    }
+    const message = payload.choices?.[0]?.message
+    const nativeToolCalls = message?.tool_calls?.flatMap((item) => {
+      const source = item.function ?? item
+      return typeof source.name === 'string' ? [{ name: source.name, arguments: source.arguments ?? {} }] : []
+    }) ?? []
+    const messageContent = normalizeModelContent(message?.content ?? payload.choices?.[0]?.delta?.content)
+    const content = nativeToolCalls.length
+      ? JSON.stringify({ thought: message?.reasoning_content ?? '准备执行模型返回的工具调用。', tool_calls: nativeToolCalls })
+      : message?.reasoning_content
+        ? '<think>' + message.reasoning_content + '</think>' + messageContent
+        : messageContent
     return {
-      content: payload.choices?.[0]?.message?.content ?? payload.choices?.[0]?.delta?.content ?? '',
+      content,
       usage: payload.usage
     }
   }
 
-  private async readStreamResponse(response: Response, onDelta?: DeltaCallback): Promise<ModelResponse> {
+  private async readStreamResponse(response: Response, onDelta: DeltaCallback | undefined, inactivityTimeoutMs: number): Promise<ModelResponse> {
     const reader = response.body?.getReader()
     if (!reader) return this.readJsonResponse(response)
 
@@ -574,42 +722,96 @@ export class ReactAgent {
     let buffer = ''
     let content = ''
     let usage: RawModelUsage | undefined
-    const processLine = (line: string): void => {
+    let reasoningOpen = false
+    let streamDone = false
+    let protocolDrift = false
+    let lastActivityAt = Date.now()
+    const processLine = (line: string): boolean => {
       const trimmed = line.trim()
-      if (!trimmed.startsWith('data:')) return
+      if (!trimmed.startsWith('data:')) return false
       const data = trimmed.slice(5).trim()
-      if (!data || data === '[DONE]') return
+      if (!data) return false
+      if (data === '[DONE]') {
+        streamDone = true
+        return true
+      }
 
       const payload = this.parseStreamPayload(data)
       if (payload.usage) usage = payload.usage
+      if (payload.reasoningDelta) {
+        if (!reasoningOpen) {
+          reasoningOpen = true
+          content += '<think>'
+          onDelta?.('<think>')
+        }
+        content += payload.reasoningDelta
+        onDelta?.(payload.reasoningDelta)
+      }
       if (payload.delta) {
+        if (reasoningOpen) {
+          reasoningOpen = false
+          content += '</think>'
+          onDelta?.('</think>')
+        }
         content += payload.delta
         onDelta?.(payload.delta)
       }
+      return Boolean(payload.delta || payload.reasoningDelta || payload.usage)
     }
 
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() ?? ''
-
-      for (const line of lines) {
-        processLine(line)
+    const readWithTimeout = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+      const remainingIdleMs = Math.max(1, inactivityTimeoutMs - (Date.now() - lastActivityAt))
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('模型响应流超过 ' + inactivityTimeoutMs / 1000 + ' 秒没有新数据。')), remainingIdleMs)
+          })
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
       }
     }
 
+    try {
+      while (!streamDone) {
+        const { value, done } = await readWithTimeout()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() ?? ''
+
+        let hadActivity = false
+        for (const line of lines) hadActivity = processLine(line) || hadActivity
+        if (hadActivity) lastActivityAt = Date.now()
+        if (!streamDone && content.length >= MAX_UNSTRUCTURED_RESPONSE_CHARACTERS && !hasReactProtocolPayload(content)) {
+          protocolDrift = true
+          streamDone = true
+        }
+      }
+    } catch (error) {
+      void reader.cancel().catch(() => undefined)
+      throw error
+    }
+    if (streamDone) void reader.cancel().catch(() => undefined)
+
     buffer += decoder.decode()
     if (buffer.trim()) processLine(buffer)
-    return { content, usage }
+    if (reasoningOpen) {
+      content += '</think>'
+      onDelta?.('</think>')
+    }
+    return { content, usage, protocolDrift }
   }
 
-  private parseStreamPayload(data: string): { delta: string; usage?: RawModelUsage } {
+  private parseStreamPayload(data: string): { delta: string; reasoningDelta?: string; usage?: RawModelUsage } {
     try {
-      const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string }, message?: { content?: string } }>; usage?: RawModelUsage }
+      const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown; thinking?: unknown }, message?: { content?: unknown } }>; usage?: RawModelUsage }
+      const delta = payload.choices?.[0]?.delta
       return {
-        delta: payload.choices?.[0]?.delta?.content ?? payload.choices?.[0]?.message?.content ?? '',
+        delta: normalizeModelContent(delta?.content ?? payload.choices?.[0]?.message?.content),
+        reasoningDelta: normalizeModelContent(delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking) || undefined,
         usage: payload.usage
       }
     } catch {
@@ -637,22 +839,87 @@ export class ReactAgent {
 
   private parseReply(content: string): ReactModelReply {
     const thought = extractThoughtTags(content).trim()
-    const payload = stripThoughtTags(content).trim()
+    const payload = stripCodeFences(stripThoughtTags(content)).trim()
 
     try {
-      return this.attachThought(JSON.parse(payload) as ReactModelReply, thought)
+      const parsed = this.normalizeReplyCandidate(JSON.parse(payload), thought)
+      if (parsed) return parsed
     } catch {
-      const objects = this.parseJsonObjects(payload)
-      const actionReply = objects.find((item) => this.getToolCalls(item).length > 0)
-      if (actionReply) return this.attachThought(actionReply, thought)
-      const recoveredAction = this.recoverAction(payload)
-      if (recoveredAction) return { thought: thought || undefined, action: recoveredAction }
-      const finalReply = objects.find((item) => typeof item.final === 'string')
-      if (finalReply) return this.attachThought(finalReply, thought)
-      const recoveredFinal = this.recoverFinal(payload)
-      if (recoveredFinal !== undefined) return this.attachThought({ final: recoveredFinal }, thought)
-      return { thought: thought || undefined, final: payload || content }
+      /* 继续尝试从带说明文字、相邻 JSON 或标准 ReAct 文本中恢复。 */
     }
+
+    const objects = this.parseJsonObjects(payload)
+    for (const object of objects) {
+      const parsed = this.normalizeReplyCandidate(object, thought)
+      if (parsed) return parsed
+    }
+    const recoveredAction = this.recoverAction(payload)
+    if (recoveredAction) return { thought: thought || undefined, action: recoveredAction }
+    const textReply = this.parseTextReactReply(payload, thought)
+    if (textReply) return textReply
+    const narrativeAction = inferNarrativeReadCall(thought || payload)
+    if (narrativeAction) return { thought: thought || undefined, action: narrativeAction }
+    const recoveredFinal = this.recoverFinal(payload)
+    if (recoveredFinal !== undefined) return this.attachThought({ final: recoveredFinal }, thought)
+    return { thought: thought || undefined, unparsed: payload || content }
+  }
+
+  private normalizeReplyCandidate(value: unknown, thought: string): ReactModelReply | undefined {
+    if (!value || typeof value !== 'object') return undefined
+    const candidate = value as ReactModelReply
+    const calls = this.getToolCalls(candidate)
+    if (calls.length) {
+      const normalized = candidate.action ? { ...candidate, action: calls[0], tool_calls: undefined } : { ...candidate, tool_calls: calls }
+      return this.attachThought(normalized, thought)
+    }
+    if (typeof candidate.final === 'string') return this.attachThought({ ...candidate, final: candidate.final }, thought)
+    if (candidate.choice && typeof candidate.choice === 'object') return this.attachThought(candidate, thought)
+    return undefined
+  }
+
+  private parseTextReactReply(content: string, taggedThought: string): ReactModelReply | undefined {
+    const actionMatch = /(?:^|\n)\s*(?:thoughtful\s+)?(?:action|行动|动作)\s*[:：]\s*([^\n]*)/im.exec(content)
+    const finalMatch = /(?:^|\n)\s*(?:final\s+answer|final|最终答案|最终回复)\s*[:：]\s*([\s\S]*)$/im.exec(content)
+    const thought = taggedThought || extractReactSection(content, /(?:thought|思考|计划)\s*[:：]/i, /(?:action|行动|动作|action\s+input|行动输入|observation|观察|final|最终答案)\s*[:：]/i)
+
+    if (actionMatch) {
+      const actionLine = actionMatch[1].trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+      const inputMatch = /(?:^|\n)\s*(?:action\s*input|actioninput|行动输入|动作输入|参数|输入)\s*[:：]\s*([\s\S]*)/im.exec(content)
+      const input = inputMatch?.[1]
+        ?.split(/\n\s*(?:observation|观察|thought|思考|final(?:\s+answer)?|最终答案)\s*[:：]/i)[0]
+        .trim()
+      const action = this.parseLooseAction(actionLine, input)
+      if (action) return { thought: thought || undefined, action }
+    }
+    if (finalMatch) return { thought: thought || undefined, final: finalMatch[1].trim() }
+    return undefined
+  }
+
+  private parseLooseAction(actionLine: string, input?: string): ToolCall | undefined {
+    const actionObject = actionLine.startsWith('{') ? this.extractBalancedObject(actionLine, 0) : undefined
+    if (actionObject) {
+      try {
+        const parsed = JSON.parse(this.normalizeJsonControlCharacters(actionObject)) as ReactModelReply
+        const parsedCalls = this.getToolCalls(parsed)
+        const calls = parsedCalls.length ? parsedCalls : this.getToolCalls({ action: parsed as unknown as ToolCall })
+        if (calls.length) return calls[0]
+        if (typeof (parsed as unknown as { name?: unknown }).name === 'string') {
+          const name = normalizeToolName(String((parsed as unknown as { name: string }).name))
+          if (isToolName(name)) return { name, arguments: normalizeToolArguments((parsed as unknown as { arguments?: unknown }).arguments) ?? {} }
+        }
+      } catch {
+        return undefined
+      }
+    }
+
+    const name = normalizeToolName(actionLine.match(/^[a-zA-Z_][\w-]*/)?.[0] ?? '')
+    if (!isToolName(name)) return undefined
+    const inlineObjectStart = actionLine.indexOf('{')
+    const rawInput = inlineObjectStart >= 0 ? actionLine.slice(inlineObjectStart) : input
+    const object = rawInput ? this.extractBalancedObject(rawInput, 0) : undefined
+    const args = object ? parseLooseArguments(this.normalizeJsonControlCharacters(object)) : normalizeLooseArguments(rawInput, name)
+    if (args) return { name, arguments: args }
+    return undefined
   }
 
   private attachThought(reply: ReactModelReply, thought: string): ReactModelReply {
@@ -787,11 +1054,16 @@ export class ReactAgent {
   }
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {
-    const calls = reply.action ? [reply.action] : reply.tool_calls ?? []
+    const calls: unknown[] = reply.action ? [reply.action] : reply.tool_calls ?? []
     return calls.flatMap((item) => {
-      const name = typeof item?.name === 'string' ? normalizeToolName(item.name) : ''
-      if (!isToolName(name) || !item.arguments || typeof item.arguments !== 'object') return []
-      return [{ ...item, name }]
+      if (!item || typeof item !== 'object') return []
+      const raw = item as { name?: unknown; arguments?: unknown; function?: { name?: unknown; arguments?: unknown } }
+      const source = raw.function ?? raw
+      const name = typeof source.name === 'string' ? normalizeToolName(source.name) : ''
+      if (!isToolName(name)) return []
+      const argumentsValue = normalizeToolArguments(source.arguments)
+      if (!argumentsValue) return []
+      return [{ name, arguments: argumentsValue }]
     })
   }
 
@@ -854,6 +1126,126 @@ function stripThoughtTags(content: string): string {
     .replace(UNCLOSED_THOUGHT_PATTERN, '')
 }
 
+function stripCodeFences(content: string): string {
+  return content
+    .replace(/^\s*```(?:json|re?act)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim()
+}
+
+function extractReactSection(content: string, startPattern: RegExp, stopPattern: RegExp): string {
+  const start = startPattern.exec(content)
+  if (!start) return ''
+  const remainder = content.slice(start.index + start[0].length)
+  const stop = stopPattern.exec(remainder)
+  return (stop ? remainder.slice(0, stop.index) : remainder).trim()
+}
+
+function normalizeToolArguments(value: unknown): ToolCall['arguments'] | undefined {
+  if (value === undefined || value === null || value === '') return {}
+  if (typeof value === 'string') return parseLooseArguments(value)
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined
+  const source = value as Record<string, unknown>
+  const args: ToolCall['arguments'] = {}
+  if (typeof source.path === 'string') args.path = source.path
+  if (typeof source.content === 'string') args.content = source.content
+  if (typeof source.command === 'string') args.command = source.command
+  if (Array.isArray(source.args) && source.args.every((item) => typeof item === 'string')) args.args = source.args as string[]
+  if (typeof source.recursive === 'boolean') args.recursive = source.recursive
+  if (typeof source.output_path === 'string') args.output_path = source.output_path
+  if (typeof source.max_characters === 'number') args.max_characters = source.max_characters
+  if (typeof source.include_notes === 'boolean') args.include_notes = source.include_notes
+  return args
+}
+
+function parseLooseArguments(value: string): ToolCall['arguments'] | undefined {
+  const normalized = value.trim()
+  if (!normalized) return {}
+  try {
+    return normalizeToolArguments(JSON.parse(normalized))
+  } catch {
+    return undefined
+  }
+}
+
+function normalizeLooseArguments(value: string | undefined, name: string): ToolCall['arguments'] | undefined {
+  const normalized = value?.trim().replace(/^['"]|['"]$/g, '')
+  if (!normalized) return {}
+  const parsed = parseLooseArguments(normalized)
+  if (parsed) return parsed
+  const keyValue = /^(?:path|file|文件|路径)\s*[:=：]\s*["']?(.+?)["']?$/i.exec(normalized)
+  if (keyValue && ['read_file', 'list_files', 'create_directory', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint'].includes(name)) return { path: keyValue[1].trim() }
+  if (['read_file', 'list_files', 'create_directory', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint'].includes(name)) return { path: normalized }
+  if (name === 'run_command') {
+    const pieces = normalized.split(/\s+/).filter(Boolean)
+    return pieces.length ? { command: pieces[0], args: pieces.slice(1) } : undefined
+  }
+  return undefined
+}
+
+function promptRequiresToolUse(prompt: string): boolean {
+  if (!prompt.trim()) return false
+  const chineseAction = /(?:读取|查看|看一下|检查|列出|遍历|搜索|查找|打开|修改|编辑|写入|创建|新建|生成|保存|删除|重命名|移动|复制).{0,20}(?:文件|目录|文件夹|代码|仓库|项目|配置|脚本|工作区|文档)/i.test(prompt)
+  const chineseReverseAction = /(?:文件|目录|文件夹|代码|仓库|项目|配置|脚本|工作区|文档).{0,20}(?:读取|查看|检查|列出|搜索|修改|编辑|写入|创建|生成|保存|提交|推送|启动|运行|构建|测试)/i.test(prompt)
+  const chineseCommand = /(?:运行|执行|启动|构建|编译|测试|安装|提交|推送|拉取|下载).{0,20}(?:命令|服务|项目|测试|构建|依赖|代码|仓库)/i.test(prompt)
+  const englishAction = /\b(?:read|inspect|list|find|search|open|edit|write|create|update|build|compile|test|run|start|install|clone|push|pull)\b.{0,28}\b(?:file|files|folder|directory|project|repo|repository|command|service|app|package|code)\b/i.test(prompt)
+  const fileMention = /\b[\w.-]+\.(?:json|ya?ml|md|txt|csv|ts|tsx|js|jsx|py|java|kt|html|css|docx?|xlsx?|pptx?)\b/i.test(prompt)
+  return chineseAction || chineseReverseAction || chineseCommand || englishAction || fileMention
+}
+
+function hasReactProtocolPayload(content: string): boolean {
+  const payload = stripThoughtTags(content)
+  return /"(?:action|tool_calls|choice|final)"\s*:/i.test(payload) ||
+    /(?:^|\n)\s*(?:action|行动|动作|final|最终答案)\s*[:：]/im.test(payload)
+}
+
+function resolveToolIntentPrompt(prompt: string, history: ConversationMessage[]): string {
+  if (!/^\s*(?:继续|接着|接着做|继续执行|继续处理|重试|再试一次|continue|go on|retry)\s*[。.!！]?\s*$/i.test(prompt)) return prompt
+  const previousRequest = [...history].reverse().find((message) => message.role === 'user' && message.content.trim() && message.content.trim() !== prompt.trim())
+  return previousRequest ? previousRequest.content + '\n' + prompt : prompt
+}
+
+function looksLikeMalformedReactReply(content: string): boolean {
+  return /(?:^|\n)\s*(?:thought|action|action\s*input|observation|final\s*answer|思考|行动|动作|行动输入|观察|最终答案)\s*[:：]/im.test(content) ||
+    /```(?:json|react)?\s*\{/i.test(content) ||
+    /"(?:action|tool_calls|choice|final)"\s*:/i.test(content) ||
+    (/<\s*(?:think|thought)\s*>/i.test(content) && !hasReactProtocolPayload(content))
+}
+
+function inferNarrativeReadCall(text: string): ToolCall | undefined {
+  const pathPattern = /(?:^|[\s`"'(])((?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+|(?:package\.json|requirements\.txt|pyproject\.toml|tsconfig\.json))(?=$|[\s`"'),:;])/gim
+  const readIntent = /(?:read|inspect|check|look\s+at|open|查看|读取|检查|先看|查看当前|需要了解)/i
+  const explicitNextStep = /(?:need\s+to|must|should|let\s+me|first|next|需要|必须|让我|先|接下来).{0,100}(?:read|inspect|check|look\s+at|open|查看|读取|检查)/is
+  const candidates: Array<{ path: string; index: number; score: number }> = []
+  for (const match of text.matchAll(pathPattern)) {
+    const path = match[1].replaceAll('\\', '/')
+    if (path.startsWith('/') || /^[A-Za-z]:\//.test(path) || path.includes('..')) continue
+    const index = (match.index ?? 0) + match[0].lastIndexOf(match[1])
+    const before = text.slice(Math.max(0, index - 300), index)
+    const around = text.slice(Math.max(0, index - 300), Math.min(text.length, index + path.length + 180))
+    let score = 0
+    if (explicitNextStep.test(before)) score += 4
+    if (readIntent.test(around)) score += 2
+    if (/haven't\s+(?:read|checked)|尚未|还没/i.test(around)) score += 1
+    if (score) candidates.push({ path, index, score })
+  }
+  const selected = candidates.sort((left, right) => right.score - left.score || left.index - right.index)[0]
+  return selected ? { name: 'read_file', arguments: { path: selected.path } } : undefined
+}
+
+function buildReactCorrectionPrompt(missingRequiredAction: boolean): string {
+  return [
+    'FORMAT_ERROR：上一条响应没有被宿主执行。',
+    missingRequiredAction
+      ? '当前用户任务需要实际读取、写入、检查或执行，但你还没有输出 Action，也没有收到任何 Observation。'
+      : '上一条响应不是可解析的 ReAct JSON，不能把计划、解释或未验证结果当作 Final。',
+    '请立刻只返回一个合法 JSON 对象，不要 Markdown、代码块、XML、前后解释，也不要返回多个对象。',
+    '需要工具时严格使用：{"thought":"准备执行的简短计划","action":{"name":"工具名","arguments":{}}}',
+    '任务完成时严格使用：{"thought":"已根据 Observation 完成验证","final":"给用户的答复"}',
+    '每轮只能有 action、choice、final 三者之一；输出 action 后立即停止，等待宿主发送 Observation。'
+  ].join('\n')
+}
+
 function trimTrailingPartialThoughtTag(content: string): string {
   const lastOpen = content.lastIndexOf('<')
   if (lastOpen < 0) return content
@@ -868,10 +1260,26 @@ function trimTrailingPartialThoughtTag(content: string): string {
 
 function sanitizeThoughtBeforeAction(thought: string): string {
   const completionPattern = /(?:已(?:经)?(?:成功)?(?:创建|写入|生成|完成|修改|实现|运行|确认)|(?:创建|写入|生成|修改|实现|运行)成功|任务已完成)/i
-  const segments = thought.split(/[。！？.!?\n]/)
+  const segments = sanitizeThoughtText(thought).split(/[。！？.!?\n]/)
   const planned = segments.filter((segment) => !completionPattern.test(segment))
   const result = planned.join('。').trim()
   return result || '准备执行所需工具。'
+}
+
+function sanitizeThoughtText(thought: string): string {
+  return stripThoughtTags(thought).replace(THOUGHT_TAG_PATTERN, '').trim()
+}
+
+function sanitizeAssistantText(text: string): string {
+  const sanitized = sanitizeThoughtText(text)
+  return sanitized || '模型未按 ReAct 协议返回最终结果，原始思考内容已隐藏。'
+}
+
+function formatThoughtDetail(thought: string): string {
+  const normalized = thought.trim()
+  return normalized.length <= MAX_DISPLAYED_THOUGHT_CHARACTERS
+    ? normalized
+    : normalized.slice(0, MAX_DISPLAYED_THOUGHT_CHARACTERS) + '\n\n[思考过程过长，已截断]'
 }
 
 function isIncompleteFinal(finalText: string): boolean {
@@ -1072,7 +1480,7 @@ class ReactFieldStream {
   private emitThought(): void {
     if (!this.onThoughtDelta) return
     const taggedThought = extractThoughtTags(this.buffer)
-    const thoughtText = taggedThought || this.extractStringField('thought')
+    const thoughtText = formatThoughtDetail(taggedThought || this.extractStringField('thought'))
     if (thoughtText.length <= this.emittedThought.length) return
 
     this.onThoughtDelta(thoughtText.slice(this.emittedThought.length))

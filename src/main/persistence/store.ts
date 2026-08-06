@@ -99,6 +99,48 @@ export const defaultPolicy: AgentPolicy = {
 
 /** 返回当前时间的 ISO 8601 字符串，用于时间戳字段的统一格式。 */
 export const now = (): string => new Date().toISOString()
+const activeTaskStatuses = new Set(['pending', 'reasoning', 'acting', 'validating'])
+
+function normalizePersistedMessage(message: ChatMessage): ChatMessage {
+  const filteredSteps = message.steps?.filter((item) => item.title !== '等待模型响应')
+  const normalized = filteredSteps?.length !== message.steps?.length ? { ...message, steps: filteredSteps } : message
+  if (normalized.role !== 'assistant') return normalized
+  const protocolError = '模型未按 ReAct 协议返回最终结果，原始思考内容已隐藏。'
+  if (normalized.content.trim() === '[REACT_PROTOCOL_DRIFT]') {
+    return { ...normalized, content: protocolError, status: 'failed', completedAt: normalized.completedAt ?? now() }
+  }
+
+  if (normalized.status && activeTaskStatuses.has(normalized.status)) {
+    const interruptionNotice = '[应用重启，未完成的任务已暂停]'
+    return {
+      ...normalized,
+      content: interruptionNotice,
+      status: 'paused',
+      completedAt: normalized.completedAt ?? now()
+    }
+  }
+
+  if (!/^\s*<(?:think|thought)>/i.test(normalized.content)) return normalized
+  if (!/<\s*\/\s*(?:think|thought)\s*>/i.test(normalized.content)) {
+    return { ...normalized, content: protocolError, status: 'failed', completedAt: normalized.completedAt ?? now() }
+  }
+  const withoutThought = normalized.content
+    .replace(/<\s*(?:think|thought)\s*>[\s\S]*?<\s*\/\s*(?:think|thought)\s*>/gi, '')
+    .trim()
+  let finalContent = withoutThought
+  if (withoutThought.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(withoutThought) as { final?: unknown }
+      if (typeof parsed.final === 'string') finalContent = parsed.final
+    } catch {
+      /* 旧消息可能包含非 JSON 的最终文本。 */
+    }
+  }
+  if (finalContent) return { ...normalized, content: finalContent }
+
+  return { ...normalized, content: protocolError, status: 'failed', completedAt: normalized.completedAt ?? now() }
+}
+
 const newConversation = (title = '新对话'): Conversation => {
   const createdAt = now()
   return { id: crypto.randomUUID(), title, createdAt, updatedAt: createdAt, messages: [] }
@@ -218,12 +260,16 @@ export class LocalStore {
   }
 
   private normalizeConversations(draft: PersistedStateDraft): Conversation[] {
-    if (draft.conversations?.length) return draft.conversations.map((conversation) => ({
-      ...conversation,
-      activeAttachments: conversation.activeAttachments?.length
-        ? conversation.activeAttachments
-        : [...conversation.messages].reverse().find((message) => message.role === 'user' && message.attachments?.length)?.attachments
-    }))
+    if (draft.conversations?.length) return draft.conversations.map((conversation) => {
+      const messages = conversation.messages.map(normalizePersistedMessage)
+      return {
+        ...conversation,
+        messages,
+        activeAttachments: conversation.activeAttachments?.length
+          ? conversation.activeAttachments
+          : [...messages].reverse().find((message) => message.role === 'user' && message.attachments?.length)?.attachments
+      }
+    })
     if (draft.tasks?.length) return [this.conversationFromTasks(draft.tasks)]
     return [newConversation()]
   }

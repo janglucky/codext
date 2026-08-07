@@ -752,7 +752,7 @@ function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
 function AgentStepView({ step: taskStep, steps, index }: { step: TaskStep; steps: TaskStep[]; index: number }): ReactElement {
   if (taskStep.phase === 'reason' && taskStep.title === THINKING_TITLE) {
     if (taskStep.detail === THINKING_PLACEHOLDER) return <AgentStatusLine status="thinking" text={THINKING_PLACEHOLDER} />
-    return <p className="agent-flow-text">{taskStep.detail}</p>
+    return <p className="agent-flow-text">{conciseThought(taskStep.detail)}</p>
   }
 
   if (taskStep.phase === 'act' && taskStep.title.startsWith('正在执行工具')) {
@@ -771,6 +771,17 @@ function AgentStepView({ step: taskStep, steps, index }: { step: TaskStep; steps
   }
 
   return <AgentStatusLine status={taskStep.phase === 'validate' ? 'done' : 'info'} text={taskStep.title + (taskStep.detail ? ' ' + taskStep.detail : '')} />
+}
+
+function conciseThought(detail: string): string {
+  const withoutReasoning = detail
+    .replace(/<\s*(?:think|thought)\s*>[\s\S]*?<\s*\/\s*(?:think|thought)\s*>/gi, '')
+    .replace(/<\s*(?:think|thought)\s*>[\s\S]*$/gi, '')
+    .replace(/<\s*\/?\s*(?:think|thought)\s*>/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!withoutReasoning) return '已完成本轮思考。'
+  return withoutReasoning.length <= 240 ? withoutReasoning : withoutReasoning.slice(0, 239).trimEnd() + '…'
 }
 
 function AgentStatusLine({ status, text }: { status: 'thinking' | 'running' | 'done' | 'observe' | 'info'; text: string }): ReactElement {

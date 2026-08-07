@@ -554,7 +554,7 @@ describe('ReactAgent.execute', () => {
       expect(streamed).toBe('Hello')
     })
 
-    it('streams think tags into the same reasoning step', async () => {
+    it('hides tagged reasoning when the JSON final has no thought', async () => {
       const encoder = new TextEncoder()
       const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')
       globalThis.fetch = vi.fn().mockResolvedValue({
@@ -582,10 +582,61 @@ describe('ReactAgent.execute', () => {
 
       expect(result).toBe('完成')
       expect(streamed).toBe('完成')
-      expect(stepSnapshots).toContain('先分析')
-      expect(stepSnapshots).toContain('先分析需求')
-      expect(stepSnapshots.some((item) => item.includes('</thi'))).toBe(false)
-      expect(task.steps.filter((item) => item.title === '思考过程')).toHaveLength(1)
+      expect(stepSnapshots).toEqual([])
+      expect(stepSnapshots.some((item) => item.includes('先分析') || item.includes('<think>'))).toBe(false)
+      expect(task.steps.filter((item) => item.title === '思考过程')).toHaveLength(0)
+    })
+
+    it('discards provider reasoning and keeps only JSON thought in UI and follow-up context', async () => {
+      const encoder = new TextEncoder()
+      const ssePayload = (payload: unknown): Uint8Array => encoder.encode('data: ' + JSON.stringify(payload) + '\n\n')
+      const requestBodies: Array<{ messages?: Array<{ content?: string }> }> = []
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(String(init?.body)))
+        callCount++
+        if (callCount === 2) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ choices: [{ message: {
+              reasoning_content: '第二轮不应进入展示的原始长思考。',
+              content: JSON.stringify({ thought: '已完成文件检查。', final: 'done' })
+            } }] })
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => 'text/event-stream' },
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(ssePayload({ choices: [{ delta: { reasoning: '这是厂商独立返回的原始长思考，不应进入 UI 或上下文。' } }] }))
+              controller.enqueue(ssePayload({ choices: [{ delta: { content: '<think>正文里兼容的长思考也不应保留。</think>' } }] }))
+              controller.enqueue(ssePayload({ choices: [{ delta: { content: '{"thought":"准备读取项目配置。","action":{"name":"read_file","arguments":{"path":"package.json"}}}' } }] }))
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+            }
+          })
+        })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{"name":"codext-agent"}')
+
+      const stepSnapshots: string[] = []
+      const { agent } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: (step: { title: string; detail: string }) => void) => Promise<string> })
+        .execute('read package', basePolicy, task, [], (taskStep) => {
+          if (taskStep.title === '思考过程') stepSnapshots.push(taskStep.detail)
+        })
+
+      const followUpContext = JSON.stringify(requestBodies[1]?.messages ?? [])
+      expect(result).toBe('done')
+      expect(stepSnapshots).toContain('准备读取项目配置。')
+      expect(stepSnapshots).toContain('已完成文件检查。')
+      expect(stepSnapshots.some((item) => item.includes('原始长思考') || item.includes('正文里兼容'))).toBe(false)
+      expect(followUpContext).not.toContain('原始长思考')
+      expect(followUpContext).not.toContain('正文里兼容')
+      expect(followUpContext).not.toContain('<think>')
+      expect(followUpContext).toContain('准备读取项目配置。')
     })
   })
 
@@ -1065,7 +1116,7 @@ describe('ReactAgent.execute', () => {
       expect(requestBodies[1]).toContain(largeContent)
     })
 
-    it('streams thought tags before executing tool calls', async () => {
+    it('accepts thought tags before JSON without exposing the tagged reasoning', async () => {
       const encoder = new TextEncoder()
       const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')
       let callCount = 0
@@ -1104,8 +1155,8 @@ describe('ReactAgent.execute', () => {
       expect(result).toBe('done')
       expect(streamed).toBe('done')
       expect(callCount).toBe(2)
-      expect(stepSnapshots).toContain('需要查看')
-      expect(stepSnapshots).toContain('需要查看项目配置')
+      expect(stepSnapshots).toContain('准备执行所需工具。')
+      expect(stepSnapshots.some((item) => item.includes('需要查看项目配置'))).toBe(false)
       expect(task.steps.some(s => s.title.includes('read_file'))).toBe(true)
     })
 

@@ -28,10 +28,10 @@ const MAX_TOOL_ARGUMENT_REPAIRS = 2
 const MAX_INCOMPLETE_ACTION_REPAIRS = 2
 const MODEL_INACTIVITY_TIMEOUT_MS = 60_000
 // The model output is limited by max_tokens already. Keep this guard above the
-// normal response budget so a long but valid reasoning field is not cut off
-// before its Action JSON arrives.
+// normal response budget so a long response is not cut off before its Action
+// JSON arrives. Provider reasoning fields are discarded before this check.
 const MAX_UNSTRUCTURED_RESPONSE_CHARACTERS = 64_000
-const MAX_DISPLAYED_THOUGHT_CHARACTERS = 800
+const MAX_DISPLAYED_THOUGHT_CHARACTERS = 240
 
 const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep => ({
   id: crypto.randomUUID(),
@@ -44,7 +44,6 @@ const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep
 const THOUGHT_TAG_PATTERN = /<\s*\/?\s*(think|thought)\s*>/gi
 const THOUGHT_BLOCK_PATTERN = /<\s*(think|thought)\s*>[\s\S]*?<\s*\/\s*(?:think|thought)\s*>/gi
 const UNCLOSED_THOUGHT_PATTERN = /<\s*(think|thought)\s*>[\s\S]*$/i
-const PARTIAL_THOUGHT_TAGS = ['<think>', '<thought>', '</think>', '</thought>']
 
 type ReactModelReply = {
   thought?: string
@@ -188,10 +187,9 @@ export class ReactAgent {
         throw modelError
       }
       modelConnectionRecoveryUsed = false
-      const assistantMessageIndex = messages.length
-      messages.push({ role: 'assistant', content })
-
       const reply = this.parseReply(content)
+      const assistantMessageIndex = messages.length
+      messages.push({ role: 'assistant', content: modelReplyForHistory(reply, content) })
       let toolCalls = this.getToolCalls(reply)
       let toolIssue = reply.toolIssue
       if (toolIssue && modelResponse.streamToolCallAssemblyError) toolIssue = asStreamAssemblyIssue(toolIssue)
@@ -792,7 +790,9 @@ export class ReactAgent {
       choices?: Array<{
         message?: {
           content?: unknown
-          reasoning_content?: string
+          reasoning_content?: unknown
+          reasoning?: unknown
+          thinking?: unknown
           tool_calls?: Array<{ function?: { name?: string; arguments?: unknown }; name?: string; arguments?: unknown }>
         }
         delta?: { content?: unknown }
@@ -806,10 +806,8 @@ export class ReactAgent {
     }) ?? []
     const messageContent = normalizeModelContent(message?.content ?? payload.choices?.[0]?.delta?.content)
     const content = nativeToolCalls.length
-      ? JSON.stringify({ thought: message?.reasoning_content ?? '准备执行模型返回的工具调用。', tool_calls: nativeToolCalls })
-      : message?.reasoning_content
-        ? '<think>' + message.reasoning_content + '</think>' + messageContent
-        : messageContent
+      ? JSON.stringify({ thought: '准备执行模型返回的工具调用。', tool_calls: nativeToolCalls })
+      : messageContent
     return {
       content,
       usage: payload.usage
@@ -824,7 +822,6 @@ export class ReactAgent {
     let buffer = ''
     let content = ''
     let usage: RawModelUsage | undefined
-    let reasoningOpen = false
     let streamDone = false
     let protocolDrift = false
     let lastActivityAt = Date.now()
@@ -847,21 +844,7 @@ export class ReactAgent {
         current.arguments += toolCall.arguments ?? ''
         streamedToolCalls.set(toolCall.index, current)
       }
-      if (payload.reasoningDelta) {
-        if (!reasoningOpen) {
-          reasoningOpen = true
-          content += '<think>'
-          onDelta?.('<think>')
-        }
-        content += payload.reasoningDelta
-        onDelta?.(payload.reasoningDelta)
-      }
       if (payload.delta) {
-        if (reasoningOpen) {
-          reasoningOpen = false
-          content += '</think>'
-          onDelta?.('</think>')
-        }
         content += payload.delta
         onDelta?.(payload.delta)
       }
@@ -907,10 +890,6 @@ export class ReactAgent {
 
     buffer += decoder.decode()
     if (buffer.trim()) processLine(buffer)
-    if (reasoningOpen) {
-      content += '</think>'
-      onDelta?.('</think>')
-    }
     if (streamedToolCalls.size) {
       const toolCalls = [...streamedToolCalls.entries()]
         .sort(([left], [right]) => left - right)
@@ -926,7 +905,7 @@ export class ReactAgent {
         }
       })
       content = JSON.stringify({
-        thought: extractThoughtTags(content).trim() || '准备执行模型返回的工具调用。',
+        thought: explicitJsonThought(content) || '准备执行模型返回的工具调用。',
         tool_calls: toolCalls
       })
       return { content, usage, protocolDrift, streamToolCallAssemblyError }
@@ -995,11 +974,10 @@ export class ReactAgent {
   }
 
   private parseReply(content: string): ReactModelReply {
-    const thought = extractThoughtTags(content).trim()
     const payload = stripCodeFences(stripThoughtTags(content)).trim()
 
     try {
-      const parsed = this.normalizeReplyCandidate(JSON.parse(payload), thought)
+      const parsed = this.normalizeReplyCandidate(JSON.parse(payload))
       if (parsed) return parsed
     } catch {
       /* 继续尝试从带说明文字、相邻 JSON 或标准 ReAct 文本中恢复。 */
@@ -1007,39 +985,39 @@ export class ReactAgent {
 
     const objects = this.parseJsonObjects(payload)
     for (const object of objects) {
-      const parsed = this.normalizeReplyCandidate(object, thought)
+      const parsed = this.normalizeReplyCandidate(object)
       if (parsed) return parsed
     }
     const recoveredAction = this.recoverAction(payload)
-    if (recoveredAction) return { thought: thought || undefined, action: recoveredAction }
-    const textReply = this.parseTextReactReply(payload, thought)
+    if (recoveredAction) return this.attachThought({ action: recoveredAction })
+    const textReply = this.parseTextReactReply(payload)
     if (textReply) return textReply
-    const narrativeAction = inferNarrativeReadCall(thought || payload)
-    if (narrativeAction) return { thought: thought || undefined, action: narrativeAction }
+    const narrativeAction = inferNarrativeReadCall(payload)
+    if (narrativeAction) return this.attachThought({ action: narrativeAction })
     const recoveredFinal = this.recoverFinal(payload)
-    if (recoveredFinal !== undefined) return this.attachThought({ final: recoveredFinal }, thought)
-    return { thought: thought || undefined, unparsed: payload || content }
+    if (recoveredFinal !== undefined) return this.attachThought({ final: recoveredFinal })
+    return { unparsed: payload || stripThoughtTags(content).trim() }
   }
 
-  private normalizeReplyCandidate(value: unknown, thought: string): ReactModelReply | undefined {
+  private normalizeReplyCandidate(value: unknown): ReactModelReply | undefined {
     if (!value || typeof value !== 'object') return undefined
     const candidate = value as ReactModelReply
     const calls = this.getToolCalls(candidate)
     if (calls.length) {
       const normalized = candidate.action ? { ...candidate, action: calls[0], tool_calls: undefined } : { ...candidate, tool_calls: calls }
-      return this.attachThought(normalized, thought)
+      return this.attachThought(normalized)
     }
     const toolIssue = this.getToolCallIssue(candidate)
-    if (toolIssue) return this.attachThought({ toolIssue }, thought)
-    if (typeof candidate.final === 'string') return this.attachThought({ ...candidate, final: candidate.final }, thought)
-    if (candidate.choice && typeof candidate.choice === 'object') return this.attachThought(candidate, thought)
+    if (toolIssue) return this.attachThought({ toolIssue })
+    if (typeof candidate.final === 'string') return this.attachThought({ ...candidate, final: candidate.final })
+    if (candidate.choice && typeof candidate.choice === 'object') return this.attachThought(candidate)
     return undefined
   }
 
-  private parseTextReactReply(content: string, taggedThought: string): ReactModelReply | undefined {
+  private parseTextReactReply(content: string): ReactModelReply | undefined {
     const actionMatch = /(?:^|\n)\s*(?:thoughtful\s+)?(?:action|行动|动作)\s*[:：]\s*([^\n]*)/im.exec(content)
     const finalMatch = /(?:^|\n)\s*(?:final\s+answer|final|最终答案|最终回复)\s*[:：]\s*([\s\S]*)$/im.exec(content)
-    const thought = taggedThought || extractReactSection(content, /(?:thought|思考|计划)\s*[:：]/i, /(?:action|行动|动作|action\s+input|行动输入|observation|观察|final|最终答案)\s*[:：]/i)
+    const thought = extractReactSection(content, /(?:thought|思考|计划)\s*[:：]/i, /(?:action|行动|动作|action\s+input|行动输入|observation|观察|final|最终答案)\s*[:：]/i)
 
     if (actionMatch) {
       const actionLine = actionMatch[1].trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
@@ -1048,11 +1026,11 @@ export class ReactAgent {
         ?.split(/\n\s*(?:observation|观察|thought|思考|final(?:\s+answer)?|最终答案)\s*[:：]/i)[0]
         .trim()
       const action = this.parseLooseAction(actionLine, input)
-      if (action) return { thought: thought || undefined, action }
+      if (action) return this.attachThought({ thought: thought || undefined, action })
       const toolIssue = this.parseLooseActionIssue(actionLine, input)
-      if (toolIssue) return { thought: thought || undefined, toolIssue }
+      if (toolIssue) return this.attachThought({ thought: thought || undefined, toolIssue })
     }
-    if (finalMatch) return { thought: thought || undefined, final: finalMatch[1].trim() }
+    if (finalMatch) return this.attachThought({ thought: thought || undefined, final: finalMatch[1].trim() })
     return undefined
   }
 
@@ -1099,9 +1077,13 @@ export class ReactAgent {
     return normalizeRawToolCall({ name: rawName, arguments: rawInput ?? {} }).issue
   }
 
-  private attachThought(reply: ReactModelReply, thought: string): ReactModelReply {
-    if (!thought || reply.thought) return reply
-    return { ...reply, thought }
+  private attachThought(reply: ReactModelReply): ReactModelReply {
+    const explicitThought = typeof reply.thought === 'string' ? formatThoughtDetail(sanitizeThoughtText(reply.thought)) : ''
+    if (explicitThought) return { ...reply, thought: explicitThought }
+    if (reply.action || reply.tool_calls?.length) return { ...reply, thought: '准备执行所需工具。' }
+    if (reply.toolIssue) return { ...reply, thought: '正在修复工具调用参数。' }
+    if (reply.choice) return { ...reply, thought: '需要确认下一步方案。' }
+    return reply
   }
 
   private parseJsonObjects(content: string): ReactModelReply[] {
@@ -1294,31 +1276,6 @@ function formatToolIssueDetail(issue: ToolCallIssue, attempt: number, maximum: n
   return fields.filter(Boolean).join(' · ')
 }
 
-function extractThoughtTags(content: string): string {
-  let result = ''
-  let activeStart = -1
-  const matcher = new RegExp(THOUGHT_TAG_PATTERN.source, THOUGHT_TAG_PATTERN.flags)
-
-  for (let match = matcher.exec(content); match; match = matcher.exec(content)) {
-    const isClosingTag = /^<\s*\//.test(match[0])
-    if (activeStart < 0) {
-      if (!isClosingTag) activeStart = matcher.lastIndex
-      continue
-    }
-
-    if (isClosingTag) {
-      result += content.slice(activeStart, match.index)
-      activeStart = -1
-    }
-  }
-
-  if (activeStart >= 0) {
-    result += trimTrailingPartialThoughtTag(content.slice(activeStart))
-  }
-
-  return result
-}
-
 function stripThoughtTags(content: string): string {
   return content
     .replace(THOUGHT_BLOCK_PATTERN, '')
@@ -1428,18 +1385,6 @@ function buildReactCorrectionPrompt(missingRequiredAction: boolean): string {
   ].join('\n')
 }
 
-function trimTrailingPartialThoughtTag(content: string): string {
-  const lastOpen = content.lastIndexOf('<')
-  if (lastOpen < 0) return content
-
-  const suffix = content.slice(lastOpen).toLowerCase().replace(/\s+/g, '')
-  if (!suffix || PARTIAL_THOUGHT_TAGS.some((tag) => tag.startsWith(suffix))) {
-    return content.slice(0, lastOpen)
-  }
-
-  return content
-}
-
 function sanitizeThoughtBeforeAction(thought: string): string {
   const completionPattern = /(?:已(?:经)?(?:成功)?(?:创建|写入|生成|完成|修改|实现|运行|确认)|(?:创建|写入|生成|修改|实现|运行)成功|任务已完成)/i
   const segments = sanitizeThoughtText(thought).split(/[。！？.!?\n]/)
@@ -1458,10 +1403,30 @@ function sanitizeAssistantText(text: string): string {
 }
 
 function formatThoughtDetail(thought: string): string {
-  const normalized = thought.trim()
+  const normalized = thought.replace(/\s+/g, ' ').trim()
   return normalized.length <= MAX_DISPLAYED_THOUGHT_CHARACTERS
     ? normalized
-    : normalized.slice(0, MAX_DISPLAYED_THOUGHT_CHARACTERS) + '\n\n[思考过程过长，已截断]'
+    : normalized.slice(0, MAX_DISPLAYED_THOUGHT_CHARACTERS - 1).trimEnd() + '…'
+}
+
+function explicitJsonThought(content: string): string {
+  const payload = stripCodeFences(stripThoughtTags(content)).trim()
+  try {
+    const value = JSON.parse(payload) as { thought?: unknown }
+    return typeof value.thought === 'string' ? formatThoughtDetail(sanitizeThoughtText(value.thought)) : ''
+  } catch {
+    return ''
+  }
+}
+
+function modelReplyForHistory(reply: ReactModelReply, originalContent: string): string {
+  const thought = typeof reply.thought === 'string' ? formatThoughtDetail(sanitizeThoughtText(reply.thought)) : ''
+  const prefix = thought ? { thought } : {}
+  if (reply.action) return JSON.stringify({ ...prefix, action: reply.action })
+  if (reply.tool_calls?.length) return JSON.stringify({ ...prefix, tool_calls: reply.tool_calls })
+  if (reply.choice) return JSON.stringify({ ...prefix, choice: reply.choice })
+  if (typeof reply.final === 'string') return JSON.stringify({ ...prefix, final: reply.final })
+  return stripThoughtTags(originalContent).trim()
 }
 
 function isIncompleteFinal(finalText: string): boolean {
@@ -1652,8 +1617,7 @@ class ReactFieldStream {
 
   private emitThought(): void {
     if (!this.onThoughtDelta) return
-    const taggedThought = extractThoughtTags(this.buffer)
-    const thoughtText = formatThoughtDetail(taggedThought || this.extractStringField('thought'))
+    const thoughtText = formatThoughtDetail(this.extractStringField('thought', stripThoughtTags(this.buffer)))
     if (thoughtText.length <= this.emittedThought.length) return
 
     this.onThoughtDelta(thoughtText.slice(this.emittedThought.length))

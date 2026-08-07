@@ -381,9 +381,9 @@ export class ReactAgent {
         previousActionSignature = ''
         continue
       }
-      const deniedCommandCall = toolCalls.find((call) => call.name === 'run_command' && call.arguments.command && deniedCommandSignatures.has(commandSignature(call.arguments.command, call.arguments.args ?? [])))
+      const deniedCommandCall = toolCalls.find((call) => (call.name === 'run_command' || call.name === 'start_service') && call.arguments.command && deniedCommandSignatures.has(commandSignature(call.arguments.command, call.arguments.args ?? [])))
       if (deniedCommandCall) {
-        messages.push({ role: 'user', content: '用户或安全策略已经拒绝执行相同命令，不得再次申请。请改用只读命令、其他安全方案，或如实说明限制并输出 Final。' })
+        messages.push({ role: 'user', content: '用户或安全策略已经拒绝执行相同命令，不得再次申请。请改用其他工具或安全方案，或如实说明限制并输出 Final。' })
         previousActionSignature = ''
         continue
       }
@@ -434,15 +434,15 @@ export class ReactAgent {
             deniedMcpPaths.add(call.arguments.path)
             output += '\n不要再次请求该路径的 MCP 授权，请改用其他解决思路。'
           }
-          if (call.name === 'run_command' && call.arguments.command && output.includes('用户拒绝')) {
+          if ((call.name === 'run_command' || call.name === 'start_service') && call.arguments.command && output.includes('用户拒绝')) {
             deniedCommandSignatures.add(commandSignature(call.arguments.command, call.arguments.args ?? []))
-            output += '\n不要再次申请相同命令；请改用只读命令或其他安全方案。'
+            output += '\n不要再次申请相同命令；请改用其他工具或安全方案。'
           }
         } catch (error) {
           throwIfAborted(signal)
           if (!isRecoverableToolError(error, call.name)) throw error
           output = '工具执行失败：' + (error instanceof Error ? error.message : String(error))
-          const securityBlocked = call.name === 'run_command' && output.includes('安全策略阻止')
+          const securityBlocked = (call.name === 'run_command' || call.name === 'start_service') && output.includes('安全策略阻止')
           if (call.name === 'run_command') unresolvedCommandFailure = !securityBlocked
           if (securityBlocked && call.arguments.command) {
             deniedCommandSignatures.add(commandSignature(call.arguments.command, call.arguments.args ?? []))
@@ -534,7 +534,7 @@ export class ReactAgent {
       '工具注册表（只能调用 enabled=true 的工具；严格按 inputSchema 传 arguments）：',
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
-      '所有文件路径必须是工作区内的相对路径。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。宿主会识别命令风险：ls、dir、cat、find、grep、git status/diff/log 以及 SSH 远程只读查询可以直接执行；可能写入文件、安装依赖、运行脚本或修改远程状态的命令会在当前会话请求用户单次授权；删除、格式化、关机、终止进程和强制清理命令会直接拒绝。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；但远程写操作仍必须等待宿主授权。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
+      '所有文件路径必须是工作区内的相对路径。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。任何 run_command 和 start_service 在执行前都会弹出交互，由用户决定是否允许本次命令；用户拒绝后不得重复申请相同命令。删除、格式化、关机、终止进程和强制清理命令会被安全策略直接拒绝，不能通过授权绕过。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；远程只读命令也必须等待用户确认。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。',
       '再次确认输出契约：只返回一个 JSON 对象，并且只包含 thought + action、thought + choice 或 thought + final 三种结构之一。需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
     ].join('\n')
@@ -578,15 +578,24 @@ export class ReactAgent {
       const args = call.arguments.args ?? []
       const risk = classifyCommandRisk(call.arguments.command, args)
       if (risk.level === 'blocked') return tools.runCommand(call.arguments.command, args, signal)
-      const approved = risk.level === 'write' && requestCommandApproval
+      const approved = requestCommandApproval
         ? await requestCommandApproval({ command: call.arguments.command, args, displayCommand: risk.displayCommand, reason: risk.reason, workspacePath: policy.workspacePath }).catch(() => false)
         : false
-      if (risk.level === 'write' && !approved) return '用户拒绝执行本次写入类命令，命令已取消。'
+      if (!approved) return '用户拒绝执行本次命令，命令已取消。'
       return signal
         ? tools.runCommand(call.arguments.command, args, signal, approved)
         : tools.runCommand(call.arguments.command, args, undefined, approved)
     }
-    if (call.name === 'start_service' && call.arguments.command) return tools.startService(call.arguments.command, call.arguments.args ?? [], signal)
+    if (call.name === 'start_service' && call.arguments.command) {
+      const args = call.arguments.args ?? []
+      const risk = classifyCommandRisk(call.arguments.command, args)
+      if (risk.level === 'blocked') throw new Error('安全策略阻止了危险命令：' + risk.reason)
+      const approved = requestCommandApproval
+        ? await requestCommandApproval({ command: call.arguments.command, args, displayCommand: risk.displayCommand, reason: '准备启动长驻服务。' + risk.reason, workspacePath: policy.workspacePath }).catch(() => false)
+        : false
+      if (!approved) return '用户拒绝执行本次服务启动命令，命令已取消。'
+      return tools.startService(call.arguments.command, args, signal)
+    }
     throw new Error('工具调用无法执行：' + call.name)
   }
 

@@ -119,8 +119,8 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   },
   run_command: {
     name: 'run_command',
-    description: '执行命令行程序并返回 stdout/stderr。只读查询可直接运行；可能写入本地或远程状态的命令会请求用户单次授权；高危命令直接拒绝。',
-    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。远程 ls、find、cat、grep 等只读查询可以直接执行，不受本地工作区路径限制；写入、安装、脚本和状态修改命令必须等待用户授权。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机、终止进程或修改注册表。',
+    description: '执行命令行程序并返回 stdout/stderr。每次执行都必须由用户在交互界面单次确认；高危命令直接拒绝。',
+    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。包括只读查询在内的所有命令都必须等待用户确认。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机、终止进程或修改注册表。',
     inputSchema: {
       type: 'object',
       required: ['command'],
@@ -133,8 +133,8 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   },
   start_service: {
     name: 'start_service',
-    description: '在工作区以独立进程启动长驻 Web 服务，检测到 HTTP(S) 地址后立即返回；关闭应用后服务仍会继续运行。',
-    whenToUse: '需要启动开发服务器、预览服务或本地 HTTP 服务时调用。禁止用 run_command 启动不会自行退出的服务。服务必须在 30 秒内向 stdout 或 stderr 输出完整访问地址。',
+    description: '经用户单次确认后，在工作区以独立进程启动长驻 Web 服务；检测到 HTTP(S) 地址后立即返回，关闭应用后服务仍会继续运行。',
+    whenToUse: '需要启动开发服务器、预览服务或本地 HTTP 服务时调用。调用后必须等待用户确认。禁止用 run_command 启动不会自行退出的服务。服务必须在 30 秒内向 stdout 或 stderr 输出完整访问地址。',
     inputSchema: {
       type: 'object',
       required: ['command'],

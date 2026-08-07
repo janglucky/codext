@@ -465,11 +465,11 @@ function McpApprovalMessage({ request, onRespond }: { request: McpApprovalReques
 
 function CommandApprovalMessage({ request, onRespond }: { request: CommandApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
   return <article className="message-item assistant mcp-approval-message" role="group" aria-labelledby="command-approval-title">
-    <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">等待命令授权</b></div>
+    <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">等待确认</b></div>
     <section className="mcp-approval-inline command-approval-inline">
-      <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">命令可能修改状态</h2><p>{request.reason}</p></div></div>
+      <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">执行命令确认</h2><p>{request.reason}</p></div></div>
       <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
-      <div className="mcp-approval-footer"><span>仅授权本次命令</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>允许一次</button></div></div>
+      <div className="mcp-approval-footer"><span>仅确认本次命令</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>执行一次</button></div></div>
     </section>
   </article>
 }

@@ -38,9 +38,9 @@ function makeAgent(settings: AppSettings, policy: AgentPolicy = basePolicy) {
   const agent = new ReactAgent(() => settings, () => policy)
   return {
     agent,
-    execute(prompt: string, task: AgentTask) {
-      return (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask) => Promise<string> })
-        .execute(prompt, policy, task)
+    execute(prompt: string, task: AgentTask, requestCommandApproval?: (details: CommandApprovalDetails) => Promise<boolean>) {
+      return (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: undefined, onDelta?: undefined, attachments?: [], requestMcpApproval?: undefined, signal?: undefined, requestUserChoice?: undefined, requestCommandApproval?: (details: CommandApprovalDetails) => Promise<boolean>) => Promise<string> })
+        .execute(prompt, policy, task, [], undefined, undefined, [], undefined, undefined, undefined, requestCommandApproval)
     }
   }
 }
@@ -673,16 +673,18 @@ describe('ReactAgent.execute', () => {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
       })
       const startService = vi.spyOn(WorkspaceTools.prototype, 'startService').mockResolvedValue(JSON.stringify({ ok: true, url: 'http://127.0.0.1:3000/', pid: 123 }))
+      const approval = vi.fn(async () => true)
       const { agent } = makeAgent(makeSettings())
 
-      const task = await agent.run('启动服务')
+      const task = await runWithCommandApproval(agent, '启动服务', approval)
 
       expect(task.status).toBe('succeeded')
+      expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'node', args: ['server.js'], displayCommand: 'node server.js' }))
       expect(startService).toHaveBeenCalledWith('node', ['server.js'], undefined)
       expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/' }])
     })
 
-    it('runs an SSH read-only command without requesting approval', async () => {
+    it('requests approval before running an SSH read-only command', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
         callCount++
@@ -698,8 +700,30 @@ describe('ReactAgent.execute', () => {
       const task = await runWithCommandApproval(agent, '查看远程目录', approval)
 
       expect(task.status).toBe('succeeded')
-      expect(approval).not.toHaveBeenCalled()
-      expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, false)
+      expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'ssh', args: ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'] }))
+      expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, true)
+    })
+
+    it('does not start a service when the user rejects its command', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount <= 2
+          ? JSON.stringify({ action: { name: 'start_service', arguments: { command: 'npm', args: ['run', 'dev'] } } })
+          : JSON.stringify({ final: 'service start cancelled' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const startService = vi.spyOn(WorkspaceTools.prototype, 'startService')
+      const approval = vi.fn(async () => false)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '启动开发服务', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('service start cancelled')
+      expect(callCount).toBe(3)
+      expect(approval).toHaveBeenCalledOnce()
+      expect(startService).not.toHaveBeenCalled()
     })
 
     it('requests single-use approval before executing a write command', async () => {
@@ -962,10 +986,12 @@ describe('ReactAgent.execute', () => {
 
       const { execute } = makeAgent(makeSettings())
       const task = makeTask()
-      const result = await execute('list files', task)
+      const approval = vi.fn(async () => true)
+      const result = await execute('list files', task, approval)
 
       expect(result).toBe('done after observation')
       expect(callCount).toBe(2)
+      expect(approval).toHaveBeenCalledOnce()
       expect(task.steps.some(s => s.title.includes('run_command'))).toBe(true)
       expect(task.result).toBeUndefined()
     })
@@ -1262,12 +1288,14 @@ describe('ReactAgent.execute', () => {
       let streamed = ''
       const { agent } = makeAgent(makeSettings())
       const task = makeTask()
-      const result = await (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: undefined, onDelta?: (delta: string) => void) => Promise<string> })
-        .execute('list files', basePolicy, task, [], undefined, (delta) => { streamed += delta })
+      const approval = vi.fn(async () => true)
+      const result = await (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: undefined, onDelta?: (delta: string) => void, attachments?: [], requestMcpApproval?: undefined, signal?: undefined, requestUserChoice?: undefined, requestCommandApproval?: (details: CommandApprovalDetails) => Promise<boolean>) => Promise<string> })
+        .execute('list files', basePolicy, task, [], undefined, (delta) => { streamed += delta }, [], undefined, undefined, undefined, approval)
 
       expect(result).toBe('real final')
       expect(streamed).toBe('real final')
       expect(callCount).toBe(2)
+      expect(approval).toHaveBeenCalledOnce()
     })
 
     it('continues when model returns an incomplete final asking for observations', async () => {

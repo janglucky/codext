@@ -9,7 +9,6 @@ import {
   isOfficeAttachmentType,
   isSupportedAttachmentType,
   isTextAttachmentType,
-  MAX_ATTACHMENT_COUNT,
   MAX_IMAGE_ATTACHMENT_SIZE,
   MAX_OFFICE_ATTACHMENT_SIZE,
   MAX_TEXT_ATTACHMENT_SIZE,
@@ -284,7 +283,6 @@ function mergeConversationAttachments(current: ChatAttachment[], added: ChatAtta
     if (duplicateIndex >= 0) merged[duplicateIndex] = attachment
     else merged.push(attachment)
   }
-  if (merged.length > MAX_ATTACHMENT_COUNT) throw new Error('当前会话最多只能保留 ' + MAX_ATTACHMENT_COUNT + ' 个附件，请先移除不需要的附件。')
   if (merged.reduce((total, attachment) => total + attachment.size, 0) > MAX_TOTAL_ATTACHMENT_SIZE) throw new Error('当前会话附件总大小不能超过限制，请先移除不需要的附件。')
   return merged
 }
@@ -306,7 +304,6 @@ function historyContent(message: ChatMessage): string {
 
 function validateAttachments(value: unknown): ChatAttachment[] {
   if (!Array.isArray(value)) return []
-  if (value.length > MAX_ATTACHMENT_COUNT) throw new Error('附件最多只能添加 ' + MAX_ATTACHMENT_COUNT + ' 个')
 
   let totalSize = 0
   return value.map((item, index) => {

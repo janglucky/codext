@@ -10,7 +10,6 @@ import {
   isImageAttachmentType,
   isOfficeAttachmentType,
   isSupportedAttachmentType,
-  MAX_ATTACHMENT_COUNT,
   MAX_IMAGE_ATTACHMENT_SIZE,
   MAX_OFFICE_ATTACHMENT_SIZE,
   MAX_TEXT_ATTACHMENT_SIZE,
@@ -254,12 +253,9 @@ export function App(): ReactElement {
   async function addFiles(files: File[]): Promise<void> {
     if (!files.length) return
     const errors: string[] = []
-    const remainingCount = MAX_ATTACHMENT_COUNT - activeAttachmentsRef.current.length - attachmentsRef.current.length
-    const selectedFiles = files.slice(0, Math.max(0, remainingCount))
-    if (files.length > remainingCount) errors.push('附件最多只能添加 ' + MAX_ATTACHMENT_COUNT + ' 个')
 
     let totalSize = [...activeAttachmentsRef.current, ...attachmentsRef.current].reduce((sum, attachment) => sum + attachment.size, 0)
-    const readableFiles = selectedFiles.filter((file) => {
+    const readableFiles = files.filter((file) => {
       const mimeType = inferAttachmentMimeType(file.type, file.name)
       if (!isSupportedAttachmentType(mimeType, file.name)) {
         errors.push('不支持的文件类型：' + file.name)
@@ -289,7 +285,7 @@ export function App(): ReactElement {
       else errors.push('无法读取文件：' + readableFiles[index].name)
     })
     if (nextAttachments.length) {
-      const mergedAttachments = [...attachmentsRef.current, ...nextAttachments].slice(0, MAX_ATTACHMENT_COUNT)
+      const mergedAttachments = [...attachmentsRef.current, ...nextAttachments]
       attachmentsRef.current = mergedAttachments
       setAttachments(mergedAttachments)
     }

@@ -119,8 +119,8 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   },
   run_command: {
     name: 'run_command',
-    description: '执行命令行程序并返回 stdout/stderr。每次执行都必须由用户在交互界面单次确认；高危命令直接拒绝。',
-    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。包括只读查询在内的所有命令都必须等待用户确认。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。不要用来删除、格式化、关机、终止进程或修改注册表。',
+    description: '执行命令行程序并返回 stdout/stderr。每次执行都必须由用户在交互界面单次确认；高风险命令会显示强化警告并由用户决定。',
+    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。包括只读查询和重启、终止进程等高风险操作在内的所有命令都必须等待用户确认；用户明确要求命令时应输出 Action，由宿主交互决定是否执行。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。',
     inputSchema: {
       type: 'object',
       required: ['command'],

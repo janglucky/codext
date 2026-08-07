@@ -680,7 +680,7 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'node', args: ['server.js'], displayCommand: 'node server.js' }))
-      expect(startService).toHaveBeenCalledWith('node', ['server.js'], undefined)
+      expect(startService).toHaveBeenCalledWith('node', ['server.js'], undefined, false)
       expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/' }])
     })
 
@@ -701,7 +701,7 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'ssh', args: ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'] }))
-      expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, true)
+      expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, true, false)
     })
 
     it('recovers an executable-style npx action and requests command approval', async () => {
@@ -722,7 +722,7 @@ describe('ReactAgent.execute', () => {
       expect(task.status).toBe('succeeded')
       expect(task.result).toBe('vite version checked')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'npx', args: ['vite', '--version'], displayCommand: 'npx vite --version' }))
-      expect(runCommand).toHaveBeenCalledWith('npx', ['vite', '--version'], undefined, true)
+      expect(runCommand).toHaveBeenCalledWith('npx', ['vite', '--version'], undefined, true, false)
       expect(task.steps.some((item) => item.title === '修复工具调用参数')).toBe(false)
     })
 
@@ -765,7 +765,7 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'npm', args: ['install'], displayCommand: 'npm install' }))
-      expect(runCommand).toHaveBeenCalledWith('npm', ['install'], undefined, true)
+      expect(runCommand).toHaveBeenCalledWith('npm', ['install'], undefined, true, false)
     })
 
     it('does not request the same write command again after the user denies it', async () => {
@@ -789,24 +789,28 @@ describe('ReactAgent.execute', () => {
       expect(runCommand).not.toHaveBeenCalled()
     })
 
-    it('blocks a destructive command without requesting approval', async () => {
+    it('corrects a restart refusal and requests explicit approval for the high-risk command', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
         callCount++
         const content = callCount === 1
-          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'cmd', args: ['/c', 'del important.txt'] } } })
-          : JSON.stringify({ final: 'dangerous command refused' })
+          ? JSON.stringify({ final: '不能直接重启，因为需要终止进程。' })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'kill', args: ['-TERM', '1234'] } } })
+            : JSON.stringify({ final: 'client restarted' })
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
       })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockResolvedValue('terminated')
       const approval = vi.fn(async () => true)
       const { agent } = makeAgent(makeSettings())
 
-      const task = await runWithCommandApproval(agent, '删除文件', approval)
+      const task = await runWithCommandApproval(agent, '帮我直接重启', approval)
 
       expect(task.status).toBe('succeeded')
-      expect(task.result).toBe('dangerous command refused')
-      expect(approval).not.toHaveBeenCalled()
-      expect(task.steps.some((item) => item.detail.includes('安全策略阻止'))).toBe(true)
+      expect(task.result).toBe('client restarted')
+      expect(task.steps.some((item) => item.title === '模型尚未执行所需工具')).toBe(true)
+      expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'kill', args: ['-TERM', '1234'], riskLevel: 'blocked' }))
+      expect(runCommand).toHaveBeenCalledWith('kill', ['-TERM', '1234'], undefined, true, true)
     })
 
     it('adds a finalization turn after the last allowed tool observation', async () => {

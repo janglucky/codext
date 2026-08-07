@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
@@ -51,6 +51,8 @@ const initialSettings: AppSettings = {
 const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败', paused: '已暂停' }
 const THINKING_TITLE = '思考过程'
 const THINKING_PLACEHOLDER = '思考中…'
+const SCROLL_BOTTOM_THRESHOLD = 96
+const SHOW_SCROLL_BUTTON_THRESHOLD = 220
 const LOCAL_ASSISTANT_PREFIX = 'local-agent-'
 const LOCAL_STEP_PREFIX = 'local-step-'
 type View = 'chat' | 'settings'
@@ -78,6 +80,7 @@ export function App(): ReactElement {
   const [selectedChoiceId, setSelectedChoiceId] = useState('')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [view, setView] = useState<View>('chat')
   const [tab, setTab] = useState<SettingTab>('常规')
   const messageListRef = useRef<HTMLElement | null>(null)
@@ -86,6 +89,7 @@ export function App(): ReactElement {
   const pendingAttachmentReadsRef = useRef<Promise<void> | null>(null)
   const runningConversationIdRef = useRef('')
   const modelControlRef = useRef<HTMLDivElement | null>(null)
+  const stickToBottomRef = useRef(true)
 
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
@@ -93,7 +97,7 @@ export function App(): ReactElement {
   const modelProfiles = useMemo(() => getModelProfiles(settings), [settings])
   const defaultModel = useMemo(() => getDefaultModelProfile(settings), [settings])
   const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
-  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
+  const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.steps?.reduce((total, step) => total + step.detail.length, 0) ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
 
   useEffect(() => {
     void Promise.all([window.api.getConversations(), window.api.getSettings(), window.api.getPolicy()]).then(([savedConversations, savedSettings, savedPolicy]) => {
@@ -205,11 +209,43 @@ export function App(): ReactElement {
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [commandApproval])
 
+  useLayoutEffect(() => {
+    const list = messageListRef.current
+    if (!list || view !== 'chat') return
+    const jumpToBottom = (): void => {
+      list.scrollTop = list.scrollHeight
+      stickToBottomRef.current = true
+      setShowScrollToBottom(false)
+    }
+    jumpToBottom()
+    const frame = requestAnimationFrame(jumpToBottom)
+    return () => cancelAnimationFrame(frame)
+  }, [activeConversation?.id, view])
+
   useEffect(() => {
     const list = messageListRef.current
-    if (!list) return
-    list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' })
-  }, [activeConversation?.id, scrollKey, mcpApproval?.id, commandApproval?.id, userChoice?.id])
+    if (!list || view !== 'chat') return
+    if (stickToBottomRef.current) {
+      list.scrollTop = list.scrollHeight
+      setShowScrollToBottom(false)
+      return
+    }
+    const distance = Math.max(0, list.scrollHeight - list.clientHeight - list.scrollTop)
+    setShowScrollToBottom(distance > SHOW_SCROLL_BUTTON_THRESHOLD)
+  }, [scrollKey, mcpApproval?.id, commandApproval?.id, userChoice?.id, view])
+
+  useEffect(() => {
+    const list = messageListRef.current
+    if (!list || view !== 'chat') return
+    const updateScrollState = (): void => {
+      const distance = Math.max(0, list.scrollHeight - list.clientHeight - list.scrollTop)
+      stickToBottomRef.current = distance <= SCROLL_BOTTOM_THRESHOLD
+      setShowScrollToBottom(distance > SHOW_SCROLL_BUTTON_THRESHOLD)
+    }
+    updateScrollState()
+    list.addEventListener('scroll', updateScrollState, { passive: true })
+    return () => list.removeEventListener('scroll', updateScrollState)
+  }, [activeConversation?.id, view])
 
   useEffect(() => {
     if (!previewAttachment) return
@@ -425,6 +461,14 @@ export function App(): ReactElement {
     setSelectedChoiceId('')
   }
 
+  function scrollToLatest(): void {
+    const list = messageListRef.current
+    if (!list) return
+    list.scrollTop = list.scrollHeight
+    stickToBottomRef.current = true
+    setShowScrollToBottom(false)
+  }
+
   if (view === 'settings' && policy) return <>
     <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => void closeSettings()} onSave={saveSettings} />
   </>
@@ -438,6 +482,7 @@ export function App(): ReactElement {
     </aside>
     <main className="chat-main">
       <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
+      {showScrollToBottom ? <button type="button" className="scroll-to-bottom" title="回到底部" aria-label="回到底部" onClick={scrollToLatest}><ArrowDown /></button> : null}
       <form className="chat-composer" onSubmit={submit}>
         <input ref={fileInputRef} className="attachment-input" type="file" accept={ATTACHMENT_ACCEPT} multiple onChange={(event) => { queueFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = '' }} />
         {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onRemove={() => removeAttachment(attachment.id)} onPreview={() => setPreviewAttachment(attachment)} />)}</div> : null}
@@ -464,12 +509,13 @@ function McpApprovalMessage({ request, onRespond }: { request: McpApprovalReques
 }
 
 function CommandApprovalMessage({ request, onRespond }: { request: CommandApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
-  return <article className="message-item assistant mcp-approval-message" role="group" aria-labelledby="command-approval-title">
-    <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">等待确认</b></div>
-    <section className="mcp-approval-inline command-approval-inline">
+  const highRisk = request.riskLevel === 'blocked'
+  return <article className={'message-item assistant mcp-approval-message ' + (highRisk ? 'high-risk-command' : '')} role="group" aria-labelledby="command-approval-title">
+    <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">{highRisk ? '等待高风险确认' : '等待确认'}</b></div>
+    <section className={'mcp-approval-inline command-approval-inline ' + (highRisk ? 'high-risk' : '')}>
       <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">执行命令确认</h2><p>{request.reason}</p></div></div>
       <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
-      <div className="mcp-approval-footer"><span>仅确认本次命令</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className="mcp-allow" autoFocus onClick={() => onRespond(true)}>执行一次</button></div></div>
+      <div className="mcp-approval-footer"><span>{highRisk ? '高风险操作，仅确认本次' : '仅确认本次命令'}</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className={'mcp-allow ' + (highRisk ? 'danger' : '')} autoFocus={!highRisk} onClick={() => onRespond(true)}>{highRisk ? '仍然执行' : '执行一次'}</button></div></div>
     </section>
   </article>
 }

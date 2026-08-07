@@ -157,11 +157,11 @@ export class WorkspaceTools {
     }
   }
 
-  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false): Promise<string> {
+  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false, dangerousApproved = false): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('命令不能为空。')
     const risk = classifyCommandRisk(executable, args)
-    if (risk.level === 'blocked' || blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令：' + risk.reason)
+    if ((risk.level === 'blocked' || blockedCommands.test([executable, ...args].join(' '))) && !dangerousApproved) throw new Error('高风险命令需要用户明确确认：' + risk.reason)
     if (risk.level === 'write' && !writeApproved) throw new Error('该命令可能修改状态，需要用户授权后执行。')
     const timeoutMs = this.commandTimeout(executable, args)
 
@@ -179,10 +179,10 @@ export class WorkspaceTools {
     }
   }
 
-  async startService(command: string, args: string[] = [], signal?: AbortSignal): Promise<string> {
+  async startService(command: string, args: string[] = [], signal?: AbortSignal, dangerousApproved = false): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('服务命令不能为空。')
-    if (blockedCommands.test([executable, ...args].join(' '))) throw new Error('安全策略阻止了危险命令。')
+    if (blockedCommands.test([executable, ...args].join(' ')) && !dangerousApproved) throw new Error('高风险命令需要用户明确确认。')
 
     const invocation = await this.resolveServiceInvocation(executable, args, signal)
     const serviceKey = resolve(this.workspacePath) + '\n' + JSON.stringify(invocation)

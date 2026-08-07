@@ -79,7 +79,7 @@ describe('WorkspaceTools.runCommand', () => {
     await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stdout.write('script')"]))
       .rejects.toThrow('需要用户授权')
     await expect(workspaceTools.runCommand('cmd', ['/c', 'del important.txt'], undefined, true))
-      .rejects.toThrow('安全策略')
+      .rejects.toThrow('高风险命令需要用户明确确认')
   })
 
   it('includes stderr when a command exits unsuccessfully', async () => {

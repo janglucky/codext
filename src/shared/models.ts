@@ -30,3 +30,7 @@ export function modelConfig(profile: ModelProfile): ModelConfig {
     maxOutputTokens: profile.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
   }
 }
+
+export function modelDisplayName(profile: ModelProfile): string {
+  return profile.model.trim() || profile.name.trim() || '未配置模型'
+}

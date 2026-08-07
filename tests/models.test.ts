@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../src/shared/models'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../src/shared/models'
 import type { AppSettings } from '../src/shared/types'
 
 const baseSettings: AppSettings = {
@@ -9,6 +9,10 @@ const baseSettings: AppSettings = {
 }
 
 describe('model profiles', () => {
+  it('uses the actual request model as the primary display value', () => {
+    expect(modelDisplayName({ id: 'one', name: '旧显示名', provider: 'OpenAI 兼容', ...baseSettings.model, model: 'gpt-5.5' })).toBe('gpt-5.5')
+  })
+
   it('migrates a legacy single model into one profile', () => {
     const profiles = getModelProfiles(baseSettings)
     expect(profiles).toHaveLength(1)

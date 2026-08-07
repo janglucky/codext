@@ -1082,6 +1082,79 @@ describe('ReactAgent.execute', () => {
       expect(task.steps.some(s => s.title.includes('read_file'))).toBe(true)
     })
 
+    it('assembles native streaming tool-call argument fragments before execution', async () => {
+      const encoder = new TextEncoder()
+      const ssePayload = (payload: unknown): Uint8Array => encoder.encode('data: ' + JSON.stringify(payload) + '\n\n')
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 2) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'stream tool done' }) } }] })
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => 'text/event-stream' },
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(ssePayload({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'read_file', arguments: '{"path":"pack' } }] } }] }))
+              controller.enqueue(ssePayload({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'age.json"}' } }] } }] }))
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+            }
+          })
+        })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{"name":"codext-agent"}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('stream tool done')
+      expect(readFile).toHaveBeenCalledWith('package.json')
+      expect(task.steps.some((item) => item.title === '修复工具调用参数')).toBe(false)
+      expect(callCount).toBe(2)
+    })
+
+    it('classifies an interrupted native tool-call stream and repairs it with a focused request', async () => {
+      const encoder = new TextEncoder()
+      const ssePayload = (payload: unknown): Uint8Array => encoder.encode('data: ' + JSON.stringify(payload) + '\n\n')
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        if (callCount === 1) {
+          return Promise.resolve({
+            ok: true,
+            headers: { get: () => 'text/event-stream' },
+            body: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(ssePayload({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'read_file', arguments: '{"path":' } }] } }] }))
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+                controller.close()
+              }
+            })
+          })
+        }
+        const content = callCount === 2
+          ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'package.json' } } })
+          : JSON.stringify({ final: 'repaired stream tool' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('repaired stream tool')
+      expect(readFile).toHaveBeenCalledWith('package.json')
+      expect(task.steps.some((item) => item.title === '修复工具调用参数' && item.detail.includes('STREAM_ASSEMBLY_ERROR'))).toBe(true)
+      expect(callCount).toBe(3)
+    })
+
     it('does not stream fake final when action appears before final', async () => {
       const encoder = new TextEncoder()
       const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')
@@ -1437,23 +1510,96 @@ describe('ReactAgent.execute', () => {
       expect(task.steps.some((item) => item.title === '流式响应停顿，改用非流式重试')).toBe(true)
     })
 
-    it('propagates tool execution errors upward', async () => {
-      // model returns tool_call with write_file but no content → executeTool throws
-      globalThis.fetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({
-          choices: [{
-            message: {
-              content: JSON.stringify({
-                tool_calls: [{ name: 'write_file', arguments: { path: 'test.txt' } }]
-              })
-            }
-          }]
-        })
+    it('repairs missing tool arguments with a focused context before execution', async () => {
+      let callCount = 0
+      const requestBodies: string[] = []
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        callCount++
+        requestBodies.push(String(init?.body ?? ''))
+        const content = callCount === 1
+          ? JSON.stringify({ tool_calls: [{ name: 'write_file', arguments: { path: 'test.txt' } }] })
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'write_file', arguments: { path: 'test.txt', content: 'fixed' } } })
+            : JSON.stringify({ final: 'done' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const writeFile = vi.spyOn(WorkspaceTools.prototype, 'writeFile').mockResolvedValue('已写入 test.txt')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('更新 test.txt', [{ role: 'user', content: 'UNRELATED_HISTORY_MARKER' }])
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('done')
+      expect(writeFile).toHaveBeenCalledOnce()
+      expect(callCount).toBe(3)
+      expect(requestBodies[1]).toContain('TOOL_ARGUMENT_ERROR')
+      const repairMessages = (JSON.parse(requestBodies[1]) as { messages: Array<{ content: unknown }> }).messages
+        .map((message) => typeof message.content === 'string' ? message.content : '')
+        .join('\n')
+      expect(repairMessages).toContain('"missing": [\n    "content"')
+      expect(requestBodies[1]).not.toContain('UNRELATED_HISTORY_MARKER')
+      expect(task.steps.some((item) => item.title === '修复工具调用参数')).toBe(true)
+      expect(task.steps.some((item) => item.title === '正在执行工具：write_file')).toBe(true)
+    })
+
+    it('repairs invalid arguments from a standard Thought Action response', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? 'Thought: inspect config\nAction: read_file\nAction Input: {"file_path":123}'
+          : callCount === 2
+            ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'package.json' } } })
+            : JSON.stringify({ final: 'text action repaired' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('text action repaired')
+      expect(readFile).toHaveBeenCalledWith('package.json')
+      expect(task.steps.some((item) => item.title === '修复工具调用参数' && item.detail.includes('ARGUMENT_TYPE_ERROR'))).toBe(true)
+    })
+
+    it('stops when the model repeats the same incomplete tool arguments', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = JSON.stringify({ action: { name: 'write_file', arguments: { path: 'test.txt' } } })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const { execute } = makeAgent(makeSettings())
+
+      await expect(execute('更新 test.txt', makeTask())).rejects.toThrow('[ARGUMENT_MISSING]')
+      expect(callCount).toBe(2)
+    })
+
+    it('asks the user to resolve an ambiguous path after a repeated repair failure', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount <= 2
+          ? JSON.stringify({ action: { name: 'read_file', arguments: {} } })
+          : JSON.stringify({ final: 'compared' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{}')
+      const choices: string[][] = []
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('比较 package.json 和 tsconfig.json', [], undefined, undefined, [], undefined, undefined, undefined, async (request) => {
+        choices.push(request.options.map((option) => option.label))
+        return request.options.find((option) => option.label === 'tsconfig.json')?.id
       })
 
-      const { execute } = makeAgent(makeSettings())
-      await expect(execute('test', makeTask())).rejects.toThrow('工具参数不完整')
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('compared')
+      expect(choices).toEqual([['package.json', 'tsconfig.json', '暂不执行']])
+      expect(readFile).toHaveBeenCalledWith('tsconfig.json')
+      expect(task.steps.some((item) => item.title === '用户已补充工具参数')).toBe(true)
     })
 
     it('throws when tool is not enabled', async () => {

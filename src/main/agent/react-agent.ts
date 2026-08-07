@@ -8,11 +8,23 @@ import { classifyCommandRisk } from '../tools/command-risk'
 import { modelFetch } from '../model-fetch'
 import { prepareContext, estimateContextTokens, type ContextContent as ModelContent, type ContextContentPart as ModelContentPart, type ContextMessage as ModelMessage } from './context-manager'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from '../../shared/models'
+import {
+  applyPathCandidate,
+  asStreamAssemblyIssue,
+  buildToolRepairPrompt,
+  issueFailureMessage,
+  normalizeRawToolCall,
+  normalizeToolArguments,
+  prepareToolCall,
+  type ToolCallIssue
+} from './tool-call-recovery'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
 const MAX_REACT_FORMAT_RETRIES = 2
 const MAX_REPEATED_ACTION_RETRIES = 2
+const MAX_TOOL_ARGUMENT_REPAIRS = 2
+const MAX_INCOMPLETE_ACTION_REPAIRS = 2
 const MODEL_INACTIVITY_TIMEOUT_MS = 60_000
 // The model output is limited by max_tokens already. Keep this guard above the
 // normal response budget so a long but valid reasoning field is not cut off
@@ -35,14 +47,15 @@ const PARTIAL_THOUGHT_TAGS = ['<think>', '<thought>', '</think>', '</thought>']
 
 type ReactModelReply = {
   thought?: string
-  action?: ToolCall
-  tool_calls?: ToolCall[]
+  action?: unknown
+  tool_calls?: unknown[]
   choice?: UserChoiceDetails
   final?: string
   unparsed?: string
+  toolIssue?: ToolCallIssue
 }
 type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
-type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean }
+type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean; streamToolCallAssemblyError?: boolean }
 type ConversationMessage = { role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[] }
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
@@ -124,6 +137,10 @@ export class ReactAgent {
     let previousActionSignature = ''
     let unresolvedCommandFailure = false
     let incompleteToolCallRetries = 0
+    let toolArgumentRepairRetries = 0
+    let previousToolArgumentIssueSignature = ''
+    let repeatedToolArgumentIssueCount = 0
+    let focusedModelMessages: ModelMessage[] | undefined
     let reactFormatRetries = 0
     let repeatedActionRetries = 0
     let finalizationOnly = false
@@ -145,7 +162,9 @@ export class ReactAgent {
       let content: string
       let modelResponse: ModelResponse
       try {
-        modelResponse = await this.callModel(messages, (delta) => stream.push(delta), signal, task, model, onStep)
+        const requestMessages = focusedModelMessages ?? messages
+        focusedModelMessages = undefined
+        modelResponse = await this.callModel(requestMessages, (delta) => stream.push(delta), signal, task, model, onStep)
         content = modelResponse.content
       } catch (error) {
         const modelError = error instanceof Error ? error : new Error(String(error))
@@ -166,15 +185,17 @@ export class ReactAgent {
 
       const reply = this.parseReply(content)
       let toolCalls = this.getToolCalls(reply)
-      if (!toolCalls.length && looksLikeIncompleteToolCall(content)) {
+      let toolIssue = reply.toolIssue
+      if (toolIssue && modelResponse.streamToolCallAssemblyError) toolIssue = asStreamAssemblyIssue(toolIssue)
+      if (!toolCalls.length && !toolIssue && looksLikeIncompleteToolCall(content)) {
         incompleteToolCallRetries++
-        if (incompleteToolCallRetries > 3 || turn > this.maxReactTurns) throw new Error('模型工具调用连续被截断，无法生成可执行的完整 Action。')
+        if (incompleteToolCallRetries > MAX_INCOMPLETE_ACTION_REPAIRS || turn > this.maxReactTurns) throw new Error('模型工具调用连续被截断，无法生成可执行的完整 Action。')
         messages[messages.length - 1] = { role: 'assistant', content: '[上一条工具调用在 Action JSON 闭合前被截断，未执行。]' }
         this.addStep(task, step('reason', '工具调用响应不完整', 'Action JSON 在传输完成前被截断，正在请求模型缩小内容后重新生成。'), onStep)
-        messages.push({
-          role: 'user',
-          content: '上一条 Action JSON 在结束前被截断，不能执行，也不能把它作为 Final。请立即重新输出一个完整 Action JSON。若 write_file 的 content 较长，必须精简实现，或把 HTML、CSS、JavaScript 拆成多个文件并逐个调用 write_file；单次 content 不得超过 6000 个字符。不要重复发送同样的超长内容。'
-        })
+        const repairPrompt = 'ACTION_TRUNCATED：上一条 Action JSON 在结束前被截断，不能执行，也不能把它作为 Final。请立即重新输出一个完整 Action JSON。若 write_file 的 content 较长，必须精简实现，或把 HTML、CSS、JavaScript 拆成多个文件并逐个调用 write_file；单次 content 不得超过 6000 个字符。不要重复发送同样的超长内容。'
+        messages.push({ role: 'user', content: repairPrompt })
+        focusedModelMessages = buildFocusedRepairContext(messages[0], toolIntentPrompt, latestObservationText(messages), repairPrompt)
+        turn--
         continue
       }
       if (toolCalls.length) incompleteToolCallRetries = 0
@@ -197,6 +218,76 @@ export class ReactAgent {
           return this.fallbackFinalAfterRepeatedAction(task, observationsForFallback)
         }
         throw new Error('ReAct 已达到最大工具轮数，收尾轮不能继续调用工具。')
+      }
+      toolCalls = toolCalls.slice(0, MAX_ACTIONS_PER_TURN)
+      let argumentAdjustments: string[] = []
+      if (!toolIssue && toolCalls.length) {
+        const preparedCall = prepareToolCall(toolCalls[0], {
+          currentRequest: toolIntentPrompt,
+          latestObservation: latestObservationText(messages)
+        })
+        toolIssue = preparedCall.issue
+        argumentAdjustments = preparedCall.adjustments
+        toolCalls = preparedCall.call ? [preparedCall.call] : []
+      }
+      if (toolIssue) {
+        if (toolIssue.signature === previousToolArgumentIssueSignature) repeatedToolArgumentIssueCount++
+        else {
+          previousToolArgumentIssueSignature = toolIssue.signature
+          repeatedToolArgumentIssueCount = 1
+        }
+        const shouldStopRepairing = !toolIssue.recoverable ||
+          toolArgumentRepairRetries >= MAX_TOOL_ARGUMENT_REPAIRS ||
+          repeatedToolArgumentIssueCount >= 2
+        if (shouldStopRepairing) {
+          const canChoosePath = Boolean(requestUserChoice && toolIssue.partialCall && toolIssue.candidates.length)
+          if (!canChoosePath) throw new Error(issueFailureMessage(toolIssue))
+          const candidateOptions = toolIssue.candidates.map((path, index) => ({
+            id: 'tool_path_' + index,
+            label: path,
+            description: '将此路径用于 ' + (toolIssue?.toolName ?? '工具') + ' 的 path 参数。'
+          }))
+          const cancelOption = { id: 'cancel_tool_argument', label: '暂不执行', description: '停止本次工具调用，稍后提供更明确的参数。' }
+          const selection = await requestUserChoice?.({
+            title: '确认工具路径',
+            description: (toolIssue.toolName ?? '工具调用') + ' 缺少唯一明确的 path，请选择本次任务要使用的路径。',
+            options: [...candidateOptions, cancelOption]
+          })
+          throwIfAborted(signal)
+          const selectedId = typeof selection === 'string' ? selection : selection?.optionId
+          if (!selectedId || selectedId === cancelOption.id) throw new Error('用户未确认工具路径，本次工具调用已停止。')
+          const selectedIndex = Number(selectedId.replace('tool_path_', ''))
+          const selectedPath = toolIssue.candidates[selectedIndex]
+          const clarifiedCall = selectedPath ? applyPathCandidate(toolIssue, selectedPath) : undefined
+          if (!clarifiedCall) throw new Error(issueFailureMessage(toolIssue))
+          const clarified = prepareToolCall(clarifiedCall, { currentRequest: toolIntentPrompt, latestObservation: latestObservationText(messages) })
+          if (!clarified.call) throw new Error(issueFailureMessage(clarified.issue ?? toolIssue))
+          toolCalls = [clarified.call]
+          toolIssue = undefined
+          argumentAdjustments = [...clarified.adjustments, 'path 已由用户确认为 ' + selectedPath]
+          messages[assistantMessageIndex] = { role: 'assistant', content: JSON.stringify({ action: clarified.call }) }
+          this.addStep(task, step('reason', '用户已补充工具参数', selectedPath), onStep)
+        } else {
+          toolArgumentRepairRetries++
+          const issueContext = { currentRequest: toolIntentPrompt, latestObservation: latestObservationText(messages) }
+          const repairPrompt = buildToolRepairPrompt(toolIssue, issueContext, currentPolicy.enabledTools)
+          messages[assistantMessageIndex] = {
+            role: 'assistant',
+            content: '[上一条 ' + (toolIssue.toolName ?? '工具') + ' Action 参数无效，未执行。]'
+          }
+          messages.push({ role: 'user', content: repairPrompt })
+          focusedModelMessages = buildFocusedRepairContext(messages[0], toolIntentPrompt, issueContext.latestObservation, repairPrompt)
+          this.addStep(task, step(
+            'reason',
+            '修复工具调用参数',
+            formatToolIssueDetail(toolIssue, toolArgumentRepairRetries, MAX_TOOL_ARGUMENT_REPAIRS)
+          ), onStep)
+          turn--
+          continue
+        }
+      }
+      if (argumentAdjustments.length) {
+        this.addStep(task, step('reason', '已补全工具参数', argumentAdjustments.join('；')), onStep)
       }
       const choiceRequest = !toolCalls.length ? normalizeChoiceRequest(reply.choice) ?? inferChoiceRequest(reply.final) : undefined
       const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
@@ -359,6 +450,9 @@ export class ReactAgent {
       const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n')
       messages.push({ role: 'user', content: observationText })
       observationsForFallback.push(observationText)
+      toolArgumentRepairRetries = 0
+      previousToolArgumentIssueSignature = ''
+      repeatedToolArgumentIssueCount = 0
       if (turn === this.maxReactTurns) {
         messages.push({
           role: 'user',
@@ -442,6 +536,9 @@ export class ReactAgent {
   private async executeTool(call: ToolCall, tools: WorkspaceTools, policy: AgentPolicy, requestMcpApproval?: McpApprovalCallback, requestCommandApproval?: CommandApprovalCallback, signal?: AbortSignal): Promise<string> {
     throwIfAborted(signal)
     if (!policy.enabledTools.includes(call.name)) throw new Error('工具未启用：' + call.name)
+    const validated = prepareToolCall(call, { currentRequest: '' })
+    if (!validated.call) throw new Error(issueFailureMessage(validated.issue!))
+    call = validated.call
     if (call.name === 'read_file' && call.arguments.path) return tools.readFile(call.arguments.path)
     if (call.name === 'write_file' && call.arguments.path && typeof call.arguments.content === 'string') return tools.writeFile(call.arguments.path, call.arguments.content)
     if (call.name === 'create_directory' && call.arguments.path) return tools.createDirectory(call.arguments.path)
@@ -483,7 +580,7 @@ export class ReactAgent {
         : tools.runCommand(call.arguments.command, args, undefined, approved)
     }
     if (call.name === 'start_service' && call.arguments.command) return tools.startService(call.arguments.command, call.arguments.args ?? [], signal)
-    throw new Error('工具参数不完整：' + call.name)
+    throw new Error('工具调用无法执行：' + call.name)
   }
 
   private buildUserContent(prompt: string, attachments: ChatAttachment[] = []): ModelContent {
@@ -723,6 +820,7 @@ export class ReactAgent {
     let streamDone = false
     let protocolDrift = false
     let lastActivityAt = Date.now()
+    const streamedToolCalls = new Map<number, { name: string; arguments: string }>()
     const processLine = (line: string): boolean => {
       const trimmed = line.trim()
       if (!trimmed.startsWith('data:')) return false
@@ -735,6 +833,12 @@ export class ReactAgent {
 
       const payload = this.parseStreamPayload(data)
       if (payload.usage) usage = payload.usage
+      for (const toolCall of payload.toolCallDeltas ?? []) {
+        const current = streamedToolCalls.get(toolCall.index) ?? { name: '', arguments: '' }
+        current.name += toolCall.name ?? ''
+        current.arguments += toolCall.arguments ?? ''
+        streamedToolCalls.set(toolCall.index, current)
+      }
       if (payload.reasoningDelta) {
         if (!reasoningOpen) {
           reasoningOpen = true
@@ -753,7 +857,7 @@ export class ReactAgent {
         content += payload.delta
         onDelta?.(payload.delta)
       }
-      return Boolean(payload.delta || payload.reasoningDelta || payload.usage)
+      return Boolean(payload.delta || payload.reasoningDelta || payload.usage || payload.toolCallDeltas?.length)
     }
 
     const readWithTimeout = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
@@ -799,17 +903,65 @@ export class ReactAgent {
       content += '</think>'
       onDelta?.('</think>')
     }
+    if (streamedToolCalls.size) {
+      const toolCalls = [...streamedToolCalls.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, call]) => ({ name: call.name, arguments: call.arguments || {} }))
+      const streamToolCallAssemblyError = toolCalls.some((call) => {
+        if (!call.name) return true
+        if (typeof call.arguments !== 'string') return false
+        try {
+          const value = JSON.parse(call.arguments) as unknown
+          return !value || typeof value !== 'object' || Array.isArray(value)
+        } catch {
+          return true
+        }
+      })
+      content = JSON.stringify({
+        thought: extractThoughtTags(content).trim() || '准备执行模型返回的工具调用。',
+        tool_calls: toolCalls
+      })
+      return { content, usage, protocolDrift, streamToolCallAssemblyError }
+    }
     return { content, usage, protocolDrift }
   }
 
-  private parseStreamPayload(data: string): { delta: string; reasoningDelta?: string; usage?: RawModelUsage } {
+  private parseStreamPayload(data: string): { delta: string; reasoningDelta?: string; usage?: RawModelUsage; toolCallDeltas?: Array<{ index: number; name?: string; arguments?: string }> } {
     try {
-      const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown; thinking?: unknown }, message?: { content?: unknown } }>; usage?: RawModelUsage }
+      const payload = JSON.parse(data) as {
+        choices?: Array<{
+          delta?: {
+            content?: unknown
+            reasoning_content?: unknown
+            reasoning?: unknown
+            thinking?: unknown
+            tool_calls?: Array<{ index?: number; function?: { name?: unknown; arguments?: unknown }; name?: unknown; arguments?: unknown }>
+          }
+          message?: {
+            content?: unknown
+            tool_calls?: Array<{ index?: number; function?: { name?: unknown; arguments?: unknown }; name?: unknown; arguments?: unknown }>
+          }
+        }>
+        usage?: RawModelUsage
+      }
       const delta = payload.choices?.[0]?.delta
+      const rawToolCalls = delta?.tool_calls ?? payload.choices?.[0]?.message?.tool_calls ?? []
       return {
         delta: normalizeModelContent(delta?.content ?? payload.choices?.[0]?.message?.content),
         reasoningDelta: normalizeModelContent(delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking) || undefined,
-        usage: payload.usage
+        usage: payload.usage,
+        toolCallDeltas: rawToolCalls.flatMap((item, index) => {
+          const source = item.function ?? item
+          const name = typeof source.name === 'string' ? source.name : undefined
+          const argumentsValue = typeof source.arguments === 'string'
+            ? source.arguments
+            : source.arguments && typeof source.arguments === 'object'
+              ? JSON.stringify(source.arguments)
+              : undefined
+          return name !== undefined || argumentsValue !== undefined
+            ? [{ index: typeof item.index === 'number' ? item.index : index, name, arguments: argumentsValue }]
+            : []
+        })
       }
     } catch {
       return { delta: '' }
@@ -869,6 +1021,8 @@ export class ReactAgent {
       const normalized = candidate.action ? { ...candidate, action: calls[0], tool_calls: undefined } : { ...candidate, tool_calls: calls }
       return this.attachThought(normalized, thought)
     }
+    const toolIssue = this.getToolCallIssue(candidate)
+    if (toolIssue) return this.attachThought({ toolIssue }, thought)
     if (typeof candidate.final === 'string') return this.attachThought({ ...candidate, final: candidate.final }, thought)
     if (candidate.choice && typeof candidate.choice === 'object') return this.attachThought(candidate, thought)
     return undefined
@@ -887,6 +1041,8 @@ export class ReactAgent {
         .trim()
       const action = this.parseLooseAction(actionLine, input)
       if (action) return { thought: thought || undefined, action }
+      const toolIssue = this.parseLooseActionIssue(actionLine, input)
+      if (toolIssue) return { thought: thought || undefined, toolIssue }
     }
     if (finalMatch) return { thought: thought || undefined, final: finalMatch[1].trim() }
     return undefined
@@ -901,8 +1057,7 @@ export class ReactAgent {
         const calls = parsedCalls.length ? parsedCalls : this.getToolCalls({ action: parsed as unknown as ToolCall })
         if (calls.length) return calls[0]
         if (typeof (parsed as unknown as { name?: unknown }).name === 'string') {
-          const name = normalizeToolName(String((parsed as unknown as { name: string }).name))
-          if (isToolName(name)) return { name, arguments: normalizeToolArguments((parsed as unknown as { arguments?: unknown }).arguments) ?? {} }
+          return normalizeRawToolCall(parsed).call
         }
       } catch {
         return undefined
@@ -917,6 +1072,23 @@ export class ReactAgent {
     const args = object ? parseLooseArguments(this.normalizeJsonControlCharacters(object)) : normalizeLooseArguments(rawInput, name)
     if (args) return { name, arguments: args }
     return undefined
+  }
+
+  private parseLooseActionIssue(actionLine: string, input?: string): ToolCallIssue | undefined {
+    if (actionLine.startsWith('{')) {
+      const actionObject = this.extractBalancedObject(actionLine, 0)
+      if (!actionObject) return undefined
+      try {
+        return normalizeRawToolCall(JSON.parse(this.normalizeJsonControlCharacters(actionObject))).issue
+      } catch {
+        return undefined
+      }
+    }
+    const rawName = actionLine.match(/^[a-zA-Z_][\w-]*/)?.[0]
+    if (!rawName) return undefined
+    const inlineObjectStart = actionLine.indexOf('{')
+    const rawInput = inlineObjectStart >= 0 ? actionLine.slice(inlineObjectStart) : input
+    return normalizeRawToolCall({ name: rawName, arguments: rawInput ?? {} }).issue
   }
 
   private attachThought(reply: ReactModelReply, thought: string): ReactModelReply {
@@ -976,11 +1148,7 @@ export class ReactAgent {
     if (!actionObject) return undefined
     try {
       const candidate = JSON.parse(this.normalizeJsonControlCharacters(actionObject)) as Partial<ToolCall>
-      if (typeof candidate.name !== 'string') return undefined
-      const name = normalizeToolName(candidate.name)
-      if (!isToolName(name)) return undefined
-      if (!candidate.arguments || typeof candidate.arguments !== 'object') return undefined
-      return { ...candidate, name } as ToolCall
+      return normalizeRawToolCall(candidate).call
     } catch {
       return undefined
     }
@@ -1052,16 +1220,12 @@ export class ReactAgent {
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {
     const calls: unknown[] = reply.action ? [reply.action] : reply.tool_calls ?? []
-    return calls.flatMap((item) => {
-      if (!item || typeof item !== 'object') return []
-      const raw = item as { name?: unknown; arguments?: unknown; function?: { name?: unknown; arguments?: unknown } }
-      const source = raw.function ?? raw
-      const name = typeof source.name === 'string' ? normalizeToolName(source.name) : ''
-      if (!isToolName(name)) return []
-      const argumentsValue = normalizeToolArguments(source.arguments)
-      if (!argumentsValue) return []
-      return [{ name, arguments: argumentsValue }]
-    })
+    return calls.flatMap((item) => normalizeRawToolCall(item).call ?? [])
+  }
+
+  private getToolCallIssue(reply: ReactModelReply): ToolCallIssue | undefined {
+    const calls: unknown[] = reply.action ? [reply.action] : reply.tool_calls ?? []
+    return calls.map((item) => normalizeRawToolCall(item).issue).find((issue): issue is ToolCallIssue => Boolean(issue))
   }
 
   private addStep(task: AgentTask, taskStep: TaskStep, onStep?: StepCallback): void {
@@ -1090,6 +1254,36 @@ export class ReactAgent {
       '你的任务是：' + prompt
     ].join(' / ')
   }
+}
+
+function latestObservationText(messages: ModelMessage[]): string | undefined {
+  const message = [...messages].reverse().find((candidate) =>
+    candidate.role === 'user' && typeof candidate.content === 'string' &&
+    (/^Observation #/i.test(candidate.content) || /^UserChoice Observation:/i.test(candidate.content))
+  )
+  return typeof message?.content === 'string' ? message.content : undefined
+}
+
+function buildFocusedRepairContext(systemMessage: ModelMessage, currentRequest: string, latestObservation: string | undefined, repairPrompt: string): ModelMessage[] {
+  return [
+    systemMessage,
+    { role: 'user', content: '当前用户请求：\n' + currentRequest },
+    ...(latestObservation ? [{ role: 'user' as const, content: latestObservation }] : []),
+    { role: 'assistant', content: '[上一条工具调用无效，未执行。]' },
+    { role: 'user', content: repairPrompt }
+  ]
+}
+
+function formatToolIssueDetail(issue: ToolCallIssue, attempt: number, maximum: number): string {
+  const fields = [
+    issue.type,
+    issue.toolName ? '工具：' + issue.toolName : '',
+    issue.missing.length ? '缺少：' + issue.missing.join('、') : '',
+    issue.invalid.length ? '类型错误：' + issue.invalid.join('、') : '',
+    issue.candidates.length ? '候选路径：' + issue.candidates.join('、') : '',
+    '修复尝试 ' + attempt + '/' + maximum
+  ]
+  return fields.filter(Boolean).join(' · ')
 }
 
 function extractThoughtTags(content: string): string {
@@ -1136,23 +1330,6 @@ function extractReactSection(content: string, startPattern: RegExp, stopPattern:
   const remainder = content.slice(start.index + start[0].length)
   const stop = stopPattern.exec(remainder)
   return (stop ? remainder.slice(0, stop.index) : remainder).trim()
-}
-
-function normalizeToolArguments(value: unknown): ToolCall['arguments'] | undefined {
-  if (value === undefined || value === null || value === '') return {}
-  if (typeof value === 'string') return parseLooseArguments(value)
-  if (typeof value !== 'object' || Array.isArray(value)) return undefined
-  const source = value as Record<string, unknown>
-  const args: ToolCall['arguments'] = {}
-  if (typeof source.path === 'string') args.path = source.path
-  if (typeof source.content === 'string') args.content = source.content
-  if (typeof source.command === 'string') args.command = source.command
-  if (Array.isArray(source.args) && source.args.every((item) => typeof item === 'string')) args.args = source.args as string[]
-  if (typeof source.recursive === 'boolean') args.recursive = source.recursive
-  if (typeof source.output_path === 'string') args.output_path = source.output_path
-  if (typeof source.max_characters === 'number') args.max_characters = source.max_characters
-  if (typeof source.include_notes === 'boolean') args.include_notes = source.include_notes
-  return args
 }
 
 function parseLooseArguments(value: string): ToolCall['arguments'] | undefined {
@@ -1438,7 +1615,7 @@ function estimateTokenCount(value: unknown): number {
 
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {
   const message = error instanceof Error ? error.message : String(error)
-  if (/工具未启用|工具参数不完整/.test(message)) return false
+  if (/工具未启用|工具调用参数修复失败|工具调用无法执行/.test(message)) return false
   if (toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)

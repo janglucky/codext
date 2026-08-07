@@ -7,6 +7,7 @@
 - Electron 安全窗口与 context-isolated IPC
 - 标准 ReAct：Reason → Skill → Act → Validate
 - ReAct 输出协议校验与自动纠正，兼容 JSON、Thought/Action/Action Input 文本及 OpenAI `tool_calls`
+- 工具参数分级恢复：字段别名与类型标准化、安全默认值、当前任务唯一值补全、精简上下文定向修复、歧义路径用户确认及重复修复熔断
 - 模型首包和 SSE 流停顿检测，自动降级非流式请求；重试共享总超时预算并显示状态
 - 保留当前工具 Observation、附件和写入内容供后续轮次使用，超出预算时优先压缩较早的历史与重复结果
 - Token 感知的分级上下文压缩：达到可用输入预算 80% 后压缩至约 62%，保留当前请求和最新 Observation，并在 UI 标记完成状态

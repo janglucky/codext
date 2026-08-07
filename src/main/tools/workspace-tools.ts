@@ -248,9 +248,19 @@ export class WorkspaceTools {
       signal?.addEventListener('abort', onAbort, { once: true })
       child.once('error', (error) => settle(error))
       child.once('exit', (code) => {
-        runningWorkspaceServices.delete(serviceKey)
-        void rm(logPath, { force: true })
-        if (!settled) settle(new Error('服务进程提前退出' + (code === null ? '' : '（退出码 ' + code + '）') + '。' + (output ? '\n' + output.trim() : '')))
+        void (async () => {
+          runningWorkspaceServices.delete(serviceKey)
+          if (settled) {
+            await rm(logPath, { force: true })
+            return
+          }
+          try {
+            output = this.decodeCommandOutput(await readFile(logPath)).slice(-16_000)
+          } catch {
+            /* 日志文件可能未创建，保留已有输出。 */
+          }
+          settle(new Error('服务进程提前退出' + (code === null ? '' : '（退出码 ' + code + '）') + '。' + (output ? '\n' + output.trim() : '')))
+        })()
       })
       void pollOutput()
     })

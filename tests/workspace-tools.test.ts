@@ -65,6 +65,13 @@ describe('WorkspaceTools.startService', () => {
     expect(result.pid).toBeGreaterThan(0)
     await expect(fetch(result.url).then((response) => response.text())).resolves.toBe('ready')
   })
+
+  it('includes the final service log when the process exits early', async () => {
+    const script = "process.stderr.write('startup diagnostic\\n');process.exit(3)"
+
+    await expect(workspaceTools.startService(process.execPath, ['-e', script]))
+      .rejects.toThrow('startup diagnostic')
+  })
 })
 
 describe('WorkspaceTools.runCommand', () => {

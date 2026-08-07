@@ -18,6 +18,20 @@ describe('tool call recovery', () => {
     expect(normalized.normalizedFields).toEqual(expect.arrayContaining(['cmd → command', 'argv → args']))
   })
 
+  it('converts executable-style tool names into run_command calls', () => {
+    expect(normalizeRawToolCall({ name: 'npx', arguments: { args: ['vite', '--version'] } })).toMatchObject({
+      call: { name: 'run_command', arguments: { command: 'npx', args: ['vite', '--version'] } },
+      normalizedFields: ['工具 npx → run_command']
+    })
+    expect(normalizeRawToolCall({ name: 'npm', arguments: { command: 'run', args: ['build'] } }).call)
+      .toEqual({ name: 'run_command', arguments: { command: 'npm', args: ['run', 'build'] } })
+  })
+
+  it('keeps unrelated unknown tool names as repairable issues', () => {
+    expect(normalizeRawToolCall({ name: 'search_the_web', arguments: { args: ['query'] } }).issue)
+      .toMatchObject({ type: 'UNKNOWN_TOOL', toolName: 'search_the_web' })
+  })
+
   it('classifies malformed argument JSON without discarding the tool name', () => {
     const normalized = normalizeRawToolCall({ name: 'read_file', arguments: '{"path":' })
 

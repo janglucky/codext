@@ -56,6 +56,10 @@ const GENERIC_FILE_EXTENSIONS = new Set([
   'pdf', 'php', 'ppt', 'pptx', 'properties', 'py', 'rb', 'rs', 'scss', 'sh', 'sql', 'svelte', 'toml', 'ts',
   'tsx', 'txt', 'vue', 'xml', 'xls', 'xlsx', 'yaml', 'yml'
 ])
+const EXECUTABLE_TOOL_ALIASES = new Set([
+  'bash', 'cat', 'cmd', 'curl', 'dir', 'eslint', 'find', 'git', 'grep', 'jq', 'ls', 'node', 'npm', 'npx',
+  'pnpm', 'pytest', 'rg', 'sh', 'ssh', 'tsc', 'uvicorn', 'vite', 'yarn', 'zsh'
+])
 const PATH_PATTERN = /(?:^|[\s`"'（(])((?:(?:[\p{L}\p{N}_@+.-]+)[\\/])*[\p{L}\p{N}_@+-]+\.[A-Za-z0-9]{1,12})(?=$|[\s`"'）),，。:：;；\]}>])/gimu
 
 export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
@@ -70,6 +74,8 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
   const rawName = typeof source.name === 'string' ? source.name : ''
   const normalizedName = normalizeToolName(rawName)
   if (!isToolName(normalizedName)) {
+    const executableCall = normalizeExecutableToolAlias(rawName, normalizedName, source.arguments ?? source.parameters ?? source.input ?? source.action_input)
+    if (executableCall) return executableCall
     return { issue: createIssue('UNKNOWN_TOOL', rawName || undefined, value), normalizedFields: [] }
   }
 
@@ -86,6 +92,25 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
     }
   }
   return { call: partialCall, normalizedFields: normalized.normalizedFields }
+}
+
+function normalizeExecutableToolAlias(rawName: string, normalizedName: string, rawArguments: unknown): ToolCallNormalization | undefined {
+  if (!EXECUTABLE_TOOL_ALIASES.has(normalizedName)) return undefined
+  const normalized = normalizeArgumentsDetailed(rawArguments)
+  if (normalized.issueType) {
+    const partialCall: ToolCall = { name: 'run_command', arguments: { command: rawName.trim(), args: [] } }
+    return {
+      issue: createIssue(normalized.issueType, 'run_command', rawArguments, { invalid: normalized.invalid, partialCall }),
+      normalizedFields: ['工具 ' + rawName + ' → run_command', ...normalized.normalizedFields]
+    }
+  }
+  const executableArguments = normalized.arguments ?? {}
+  const args = [...(executableArguments.args ?? [])]
+  if (executableArguments.command) args.unshift(executableArguments.command)
+  return {
+    call: { name: 'run_command', arguments: { command: rawName.trim(), args } },
+    normalizedFields: ['工具 ' + rawName + ' → run_command', ...normalized.normalizedFields]
+  }
 }
 
 export function normalizeToolArguments(value: unknown): ToolArguments | undefined {

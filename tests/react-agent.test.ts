@@ -704,6 +704,28 @@ describe('ReactAgent.execute', () => {
       expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, true)
     })
 
+    it('recovers an executable-style npx action and requests command approval', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'npx', arguments: { args: ['vite', '--version'] } } })
+          : JSON.stringify({ final: 'vite version checked' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const runCommand = vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockResolvedValue('vite/6.3.5')
+      const approval = vi.fn(async () => true)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '检查 Vite 版本', approval)
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('vite version checked')
+      expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'npx', args: ['vite', '--version'], displayCommand: 'npx vite --version' }))
+      expect(runCommand).toHaveBeenCalledWith('npx', ['vite', '--version'], undefined, true)
+      expect(task.steps.some((item) => item.title === '修复工具调用参数')).toBe(false)
+    })
+
     it('does not start a service when the user rejects its command', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {

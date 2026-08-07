@@ -528,9 +528,8 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
 
 function MessageView({ conversationId, message, onPreview }: { conversationId: string; message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
-  const contextCompressed = message.role === 'assistant' && message.steps?.some((taskStep) => taskStep.title === '已完成上下文压缩')
   return <article className={'message-item ' + message.role}>
-    <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}{contextCompressed ? <span className="context-compressed"><Database />已完成上下文压缩</span> : null}</div>
+    <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
     {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
     <div className="message-content-group">
       {message.content ? message.role === 'assistant'

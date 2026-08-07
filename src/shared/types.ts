@@ -1,6 +1,6 @@
 export type TaskStatus = 'pending' | 'reasoning' | 'acting' | 'validating' | 'succeeded' | 'failed' | 'paused'
 export type AgentArtifact = { type: 'file'; path: string } | { type: 'service'; url: string }
-export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number }
+export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number; contextWindowTokens?: number; maxOutputTokens?: number }
 export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
 export interface TaskStep { id: string; phase: 'reason' | 'skill' | 'act' | 'validate'; title: string; detail: string; timestamp: string }

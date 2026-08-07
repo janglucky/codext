@@ -1,6 +1,8 @@
 import type { AppSettings, ModelConfig, ModelProfile } from './types'
 
 export const LEGACY_MODEL_ID = 'default-model'
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
+export const DEFAULT_MAX_OUTPUT_TOKENS = 16_384
 
 export function getModelProfiles(settings: AppSettings): ModelProfile[] {
   if (settings.models?.length) return settings.models
@@ -18,5 +20,13 @@ export function resolveModelProfile(settings: AppSettings, modelId?: string): Mo
 }
 
 export function modelConfig(profile: ModelProfile): ModelConfig {
-  return { baseUrl: profile.baseUrl, apiKey: profile.apiKey, model: profile.model, timeoutMs: profile.timeoutMs, maxRetries: profile.maxRetries }
+  return {
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    timeoutMs: profile.timeoutMs,
+    maxRetries: profile.maxRetries,
+    contextWindowTokens: profile.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+    maxOutputTokens: profile.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+  }
 }

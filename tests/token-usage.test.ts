@@ -121,4 +121,32 @@ describe('agent token usage', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).model).toBe('override-model')
     expect(settings.model.model).toBe('test-model')
   })
+
+  it('compresses context before the request and reports completion through a task step', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: () => Promise.resolve({ choices: [{ message: { content: JSON.stringify({ final: 'done' }) } }] })
+    })
+    globalThis.fetch = fetchMock
+    const compactSettings: AppSettings = {
+      ...settings,
+      model: { ...settings.model, contextWindowTokens: 16_000, maxOutputTokens: 2_000 }
+    }
+    const history = Array.from({ length: 18 }, (_, index) => ({
+      role: index % 2 ? 'assistant' as const : 'user' as const,
+      content: '无关历史 ' + index + ' ' + 'x'.repeat(5_000)
+    }))
+    const steps: string[] = []
+    const agent = new ReactAgent(() => compactSettings, () => policy)
+
+    const task = await agent.run('当前问题', history, (taskStep) => steps.push(taskStep.title))
+    const request = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { max_tokens: number; messages: Array<{ content: unknown }> }
+
+    expect(task.status).toBe('succeeded')
+    expect(steps).toContain('已完成上下文压缩')
+    expect(request.max_tokens).toBe(2_000)
+    expect(request.messages.at(-1)?.content).toBe('当前问题')
+    expect(JSON.stringify(request.messages)).toContain('上下文')
+  })
 })

@@ -6,13 +6,14 @@ import { parseOfficeDocument, type OfficeDocumentKind } from '../tools/office-pa
 import { PptMcpClient } from '../ppt/ppt-mcp-client'
 import { classifyCommandRisk } from '../tools/command-risk'
 import { modelFetch } from '../model-fetch'
+import { prepareContext, estimateContextTokens, type ContextContent as ModelContent, type ContextContentPart as ModelContentPart, type ContextMessage as ModelMessage } from './context-manager'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from '../../shared/models'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
 const MAX_REACT_FORMAT_RETRIES = 2
 const MAX_REPEATED_ACTION_RETRIES = 2
 const MODEL_INACTIVITY_TIMEOUT_MS = 60_000
-const MAX_HISTORY_MESSAGES = 24
 // The model output is limited by max_tokens already. Keep this guard above the
 // normal response budget so a long but valid reasoning field is not cut off
 // before its Action JSON arrives.
@@ -40,11 +41,6 @@ type ReactModelReply = {
   final?: string
   unparsed?: string
 }
-type ModelContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string; detail: 'auto' } }
-type ModelContent = string | ModelContentPart[]
-type ModelMessage = { role: 'system' | 'user' | 'assistant'; content: ModelContent }
 type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
 type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean }
 type ConversationMessage = { role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[] }
@@ -119,7 +115,6 @@ export class ReactAgent {
       { role: 'system', content: this.buildSystemPrompt(currentPolicy) },
       ...history
         .filter((message) => message.content.trim() || message.attachments?.length)
-        .slice(-MAX_HISTORY_MESSAGES)
         .map((message): ModelMessage => ({
           role: message.role,
           content: message.role === 'user' ? this.buildUserContent(message.content, message.attachments) : message.content
@@ -157,8 +152,7 @@ export class ReactAgent {
         const hasToolProgress = task.steps.some((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
         if (!modelConnectionRecoveryUsed && hasToolProgress && this.isRetryableModelError(modelError)) {
           modelConnectionRecoveryUsed = true
-          this.compactToolContext(messages)
-          this.addStep(task, step('reason', '模型连接中断，正在恢复', '已保留工具执行结果并压缩上下文，准备继续未完成的任务。'), onStep)
+          this.addStep(task, step('reason', '模型连接中断，正在恢复', '已保留当前上下文和工具结果，准备继续未完成的任务。'), onStep)
           await abortableDelay(1000, signal)
           turn--
           continue
@@ -575,6 +569,18 @@ export class ReactAgent {
   }
 
   private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback): Promise<ModelResponse> {
+    const prepared = prepareContext(messages, {
+      contextWindowTokens: model.contextWindowTokens,
+      maxOutputTokens: model.maxOutputTokens
+    })
+    if (prepared.compressed) {
+      messages.splice(0, messages.length, ...prepared.messages)
+      this.addStep(task, step(
+        'reason',
+        '已完成上下文压缩',
+        '第 ' + prepared.level + ' 级 · ' + prepared.beforeTokens.toLocaleString('zh-CN') + ' → ' + prepared.afterTokens.toLocaleString('zh-CN') + ' tokens'
+      ), onStep)
+    }
     const maxAttempts = Math.max(1, model.maxRetries + 1)
     const totalTimeoutMs = Math.max(1000, model.timeoutMs)
     const deadline = Date.now() + totalTimeoutMs
@@ -624,7 +630,9 @@ export class ReactAgent {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: useStreaming ? 'text/event-stream' : 'application/json' }
       if (model.apiKey.trim()) headers.Authorization = 'Bearer ' + model.apiKey
-      const requestBody: Record<string, unknown> = { model: model.model, messages, temperature: 0, max_tokens: 16384, stream: useStreaming }
+      const contextWindowTokens = Math.max(4096, Math.floor(model.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS))
+      const maxOutputTokens = Math.min(Math.max(256, Math.floor(model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS)), Math.floor(contextWindowTokens * 0.5))
+      const requestBody: Record<string, unknown> = { model: model.model, messages, temperature: 0, max_tokens: maxOutputTokens, stream: useStreaming }
       if (useStreaming) requestBody.stream_options = { include_usage: true }
       const response = await modelFetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
@@ -672,19 +680,6 @@ export class ReactAgent {
     return status === 408 || status === 429 || status === 502 || status === 503 || status === 504 || status === 524 ||
       error.name === 'TypeError' || /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|UND_ERR|超时|中断|无数据|没有新数据|timeout|timed out/i.test(error.message) ||
       (typeof causeCode === 'string' && /ECONNRESET|ETIMEDOUT|UND_ERR|EAI_AGAIN|ENETUNREACH/i.test(causeCode))
-  }
-
-  private compactToolContext(messages: ModelMessage[]): void {
-    const observationIndexes = messages.flatMap((message, index) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith('Observation #') ? [index] : [])
-    const latestObservationIndex = observationIndexes.at(-1)
-    for (let index = 0; index < messages.length; index++) {
-      const message = messages[index]
-      if (index === latestObservationIndex || message.role !== 'user' || typeof message.content !== 'string' || !message.content.startsWith('Observation #') || message.content.length <= 64_000) continue
-      messages[index] = {
-        ...message,
-        content: message.content.slice(0, 48_000) + '\n\n[较长的工具输出已压缩]\n\n' + message.content.slice(-16_000)
-      }
-    }
   }
 
   private async readJsonResponse(response: Response): Promise<ModelResponse> {
@@ -825,7 +820,7 @@ export class ReactAgent {
     const inputTokens = normalizedTokenCount(response.usage?.prompt_tokens ?? response.usage?.input_tokens)
     const outputTokens = normalizedTokenCount(response.usage?.completion_tokens ?? response.usage?.output_tokens)
     const current: TokenUsage = {
-      inputTokens: inputTokens ?? estimateMessageTokenCount(messages),
+      inputTokens: inputTokens ?? estimateContextTokens(messages),
       outputTokens: outputTokens ?? estimateTokenCount(response.content),
       durationMs,
       estimated: inputTokens === undefined || outputTokens === undefined
@@ -1439,15 +1434,6 @@ function estimateTokenCount(value: unknown): number {
   if (!text) return 0
   const cjkCount = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu)?.length ?? 0
   return Math.max(1, Math.ceil(cjkCount + (text.length - cjkCount) / 4))
-}
-
-function estimateMessageTokenCount(messages: ModelMessage[]): number {
-  return messages.reduce((total, message) => {
-    const contentTokens = typeof message.content === 'string'
-      ? estimateTokenCount(message.content)
-      : message.content.reduce((sum, part) => sum + (part.type === 'text' ? estimateTokenCount(part.text) : 85), 0)
-    return total + contentTokens + 4
-  }, 2)
 }
 
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {

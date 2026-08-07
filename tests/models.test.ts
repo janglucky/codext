@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { getDefaultModelProfile, getModelProfiles, resolveModelProfile } from '../src/shared/models'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../src/shared/models'
 import type { AppSettings } from '../src/shared/types'
 
 const baseSettings: AppSettings = {
@@ -14,6 +14,7 @@ describe('model profiles', () => {
     expect(profiles).toHaveLength(1)
     expect(profiles[0]).toMatchObject({ id: 'default-model', name: 'legacy-model', provider: 'OpenAI 兼容', model: 'legacy-model' })
     expect(getDefaultModelProfile(baseSettings).model).toBe('legacy-model')
+    expect(modelConfig(profiles[0])).toMatchObject({ contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS })
   })
 
   it('resolves a conversation model and falls back to default', () => {

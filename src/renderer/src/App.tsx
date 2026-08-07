@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
 import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
-import { getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../../shared/models'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../../shared/models'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -43,7 +43,7 @@ const paths: Record<IconName, ReactElement> = {
 }
 
 const initialSettings: AppSettings = {
-  model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3 },
+  model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS },
   models: [],
   skillsEnabled: true,
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
@@ -541,8 +541,9 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
 
 function MessageView({ conversationId, message, onPreview }: { conversationId: string; message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
+  const contextCompressed = message.role === 'assistant' && message.steps?.some((taskStep) => taskStep.title === '已完成上下文压缩')
   return <article className={'message-item ' + message.role}>
-    <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
+    <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}{contextCompressed ? <span className="context-compressed"><Database />已完成上下文压缩</span> : null}</div>
     {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
     <div className="message-content-group">
       {message.content ? message.role === 'assistant'
@@ -922,7 +923,7 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
   }
   function addModel(): void {
     const source = selectedProfile ?? defaultProfile
-    const profile: ModelProfile = { ...(source ?? { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, provider: 'OpenAI 兼容' }), id: crypto.randomUUID(), name: '新模型' }
+    const profile: ModelProfile = { ...(source ?? { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS, provider: 'OpenAI 兼容' }), id: crypto.randomUUID(), name: '新模型' }
     commitProfiles([...profiles, profile], settings.defaultModelId ?? profiles[0]?.id)
     setSelectedModelId(profile.id)
     setNotice({ type: 'success', text: '已添加模型配置，请填写连接信息。' })
@@ -975,6 +976,10 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
         <datalist id="model-provider-options"><option value="OpenAI" /><option value="Azure OpenAI" /><option value="DeepSeek" /><option value="通义千问" /><option value="OpenRouter" /><option value="OpenAI 兼容" /></datalist>
         <label>接口地址<input value={selectedProfile.baseUrl} onChange={(event) => updateSelectedProfile({ baseUrl: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
         <label>模型名称<input value={selectedProfile.model} onChange={(event) => updateSelectedProfile({ model: event.target.value })} placeholder="gpt-4.1-mini" /></label>
+        <div className="model-context-grid">
+          <label>上下文窗口（tokens）<input type="number" min="4096" max="4000000" step="1024" value={selectedProfile.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS} onChange={(event) => updateSelectedProfile({ contextWindowTokens: Number(event.target.value) || DEFAULT_CONTEXT_WINDOW_TOKENS })} /></label>
+          <label>最大输出（tokens）<input type="number" min="256" max="1000000" step="256" value={selectedProfile.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS} onChange={(event) => updateSelectedProfile({ maxOutputTokens: Number(event.target.value) || DEFAULT_MAX_OUTPUT_TOKENS })} /></label>
+        </div>
       <div className="api-key-field">
         <label htmlFor="model-api-key">API Key <small className="optional-field">（可选）</small></label>
         <div className="api-key-input">

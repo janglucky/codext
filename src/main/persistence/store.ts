@@ -2,7 +2,7 @@ import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, ModelConfig, ModelProfile } from '../../shared/types'
-import { LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
 type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation'> & {
@@ -15,7 +15,7 @@ type PersistedStateDraft = Partial<PersistedState> & {
   tasks?: AgentTask[]
 }
 
-const defaultModelConfig: ModelConfig = { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3 }
+const defaultModelConfig: ModelConfig = { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS }
 const defaultModelProfile: ModelProfile = { id: LEGACY_MODEL_ID, name: 'OpenAI', provider: 'OpenAI', ...defaultModelConfig }
 
 export const defaults: AppSettings = {
@@ -38,12 +38,19 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
     let suffix = 2
     while (usedIds.has(id)) id = requestedId + '-' + suffix++
     usedIds.add(id)
+    const contextWindowTokens = normalizeTokenLimit(profile.contextWindowTokens, DEFAULT_CONTEXT_WINDOW_TOKENS, 4096, 4_000_000)
+    const maxOutputTokens = Math.min(
+      normalizeTokenLimit(profile.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256, 1_000_000),
+      Math.floor(contextWindowTokens * 0.5)
+    )
     const model = {
       baseUrl: typeof profile.baseUrl === 'string' ? profile.baseUrl : defaultModelConfig.baseUrl,
       apiKey: typeof profile.apiKey === 'string' ? profile.apiKey : '',
       model: typeof profile.model === 'string' ? profile.model : '',
       timeoutMs: Math.max(Number.isFinite(profile.timeoutMs) ? profile.timeoutMs : defaultModelConfig.timeoutMs, defaultModelConfig.timeoutMs),
-      maxRetries: Math.max(Number.isFinite(profile.maxRetries) ? profile.maxRetries : defaultModelConfig.maxRetries, 0)
+      maxRetries: Math.max(Number.isFinite(profile.maxRetries) ? profile.maxRetries : defaultModelConfig.maxRetries, 0),
+      contextWindowTokens,
+      maxOutputTokens
     }
     return { ...model, id, name: typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : model.model || '模型 ' + (index + 1), provider: typeof profile.provider === 'string' && profile.provider.trim() ? profile.provider.trim() : 'OpenAI 兼容' }
   })
@@ -65,7 +72,19 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
 }
 
 function modelConfigFromProfile(profile: ModelProfile): ModelConfig {
-  return { baseUrl: profile.baseUrl, apiKey: profile.apiKey, model: profile.model, timeoutMs: profile.timeoutMs, maxRetries: profile.maxRetries }
+  return {
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    timeoutMs: profile.timeoutMs,
+    maxRetries: profile.maxRetries,
+    contextWindowTokens: profile.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+    maxOutputTokens: profile.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
+  }
+}
+
+function normalizeTokenLimit(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback, minimum), maximum)
 }
 const legacySystemPrompt = '你是 Codext Agent。你在 Windows 桌面工作区中协助用户完成任务。优先使用可用工具读取、写入和检查文件；执行命令前说明目的；绝不访问工作区外的文件；遇到危险或破坏性命令必须拒绝。输出简洁、可验证的结果。'
 const previousOfficeMcpSystemPrompt = [

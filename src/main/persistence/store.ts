@@ -230,16 +230,6 @@ export class LocalStore {
     return conversation
   }
 
-  async setConversationAttachments(conversationId: string, attachments: ChatMessage['attachments']): Promise<Conversation> {
-    const conversation = this.ensureConversation(conversationId)
-    if (attachments?.length) conversation.activeAttachments = attachments
-    else delete conversation.activeAttachments
-    conversation.updatedAt = now()
-    this.bumpConversation(conversation.id)
-    await this.save()
-    return conversation
-  }
-
   async setConversationModel(conversationId: string, modelId?: string): Promise<Conversation> {
     const conversation = this.ensureConversation(conversationId)
     if (modelId && !getModelProfiles(this.state.settings).some((profile) => profile.id === modelId)) throw new Error('找不到指定的模型配置。')
@@ -281,13 +271,9 @@ export class LocalStore {
   private normalizeConversations(draft: PersistedStateDraft): Conversation[] {
     if (draft.conversations?.length) return draft.conversations.map((conversation) => {
       const messages = conversation.messages.map(normalizePersistedMessage)
-      return {
-        ...conversation,
-        messages,
-        activeAttachments: conversation.activeAttachments?.length
-          ? conversation.activeAttachments
-          : [...messages].reverse().find((message) => message.role === 'user' && message.attachments?.length)?.attachments
-      }
+      const normalized = { ...conversation, messages } as Conversation & { activeAttachments?: ChatMessage['attachments'] }
+      delete normalized.activeAttachments
+      return normalized
     })
     if (draft.tasks?.length) return [this.conversationFromTasks(draft.tasks)]
     return [newConversation()]

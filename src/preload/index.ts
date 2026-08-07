@@ -9,7 +9,6 @@ const api: DesktopApi = {
   deleteConversation: (conversationId) => ipcRenderer.invoke('conversations:delete', conversationId),
   selectConversationWorkspace: (conversationId) => ipcRenderer.invoke('conversations:select-workspace', conversationId),
   resetConversationWorkspace: (conversationId) => ipcRenderer.invoke('conversations:reset-workspace', conversationId),
-  removeConversationAttachment: (conversationId, attachmentId) => ipcRenderer.invoke('conversations:remove-attachment', conversationId, attachmentId),
   setConversationModel: (conversationId, modelId) => ipcRenderer.invoke('conversations:set-model', conversationId, modelId),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (settings: AppSettings) => ipcRenderer.invoke('settings:save', settings),

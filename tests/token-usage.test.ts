@@ -135,7 +135,11 @@ describe('agent token usage', () => {
     }
     const history = Array.from({ length: 18 }, (_, index) => ({
       role: index % 2 ? 'assistant' as const : 'user' as const,
-      content: '无关历史 ' + index + ' ' + 'x'.repeat(5_000)
+      content: index === 0
+        ? '当前问题的相关历史 ' + 'x'.repeat(5_000)
+        : index % 2
+          ? '当前任务的旧执行结果 ' + index + ' ' + 'x'.repeat(5_000)
+          : '继续'
     }))
     const steps: string[] = []
     const agent = new ReactAgent(() => compactSettings, () => policy)

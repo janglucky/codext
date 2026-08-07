@@ -78,9 +78,7 @@ app.whenReady().then(async () => {
     const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : ''
     const validatedAttachments = validateAttachments(attachments)
     const normalizedNewAttachments = await materializeOfficeAttachments(validatedAttachments, workspacePath)
-    const normalizedAttachments = mergeConversationAttachments(conversationAtStart.activeAttachments ?? [], normalizedNewAttachments)
-    if (!normalizedPrompt && !normalizedAttachments.length) throw new Error('请输入任务或添加附件')
-    if (normalizedNewAttachments.length) await store.setConversationAttachments(conversationId, normalizedAttachments)
+    if (!normalizedPrompt && !normalizedNewAttachments.length) throw new Error('请输入任务或添加附件')
     const agentPrompt = normalizedPrompt || '请查看附件并根据附件内容提供帮助。'
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
@@ -96,21 +94,20 @@ app.whenReady().then(async () => {
     const historyMessages = conversationBeforeRun.messages
       .filter((message) => message.id !== assistantMessage.id)
       .slice(0, -1)
-    for (const message of historyMessages) {
-      if (!message.attachments?.length) continue
-      const materialized = await materializeOfficeAttachments(message.attachments, workspacePath)
-      if (materialized === message.attachments) continue
-      message.attachments = materialized
-      await store.updateMessage(conversationId, message)
-    }
-    const history = historyMessages.map((message) => ({ role: message.role, content: historyContent(message), attachments: message.attachments }))
+    const history = historyMessages.map((message) => ({
+      role: message.role,
+      content: message.content,
+      attachments: message.attachments,
+      status: message.status,
+      steps: message.steps
+    }))
     const task = await agent.run(agentPrompt, history, (taskStep) => {
       assistantMessage.steps = upsertStep(assistantMessage.steps ?? [], taskStep)
       event.sender.send('agent:step', { conversationId, messageId: assistantMessage.id, step: taskStep })
     }, (delta) => {
       assistantMessage.content += delta
       event.sender.send('agent:delta', { conversationId, messageId: assistantMessage.id, delta })
-    }, normalizedAttachments, (request) => mcpApprovalManager.request(event.sender, { ...request, conversationId }), controller.signal, workspacePath, async (request) => {
+    }, normalizedNewAttachments, (request) => mcpApprovalManager.request(event.sender, { ...request, conversationId }), controller.signal, workspacePath, async (request) => {
       const optionId = await userChoiceManager.request(event.sender, { ...request, conversationId })
       const selectedOption = request.options.find((option) => option.id === optionId)
       if (!selectedOption?.workspacePath?.trim()) return optionId
@@ -163,10 +160,6 @@ app.whenReady().then(async () => {
     const conversation = store.getConversation(conversationId)
     await copyConversationAttachments(conversation, effectiveWorkspacePath(conversation), resolve(store.getPolicy().workspacePath))
     return store.setConversationWorkspace(conversationId)
-  })
-  ipcMain.handle('conversations:remove-attachment', async (_event, conversationId: string, attachmentId: string) => {
-    const conversation = store.getConversation(conversationId)
-    return store.setConversationAttachments(conversationId, (conversation.activeAttachments ?? []).filter((attachment) => attachment.id !== attachmentId))
   })
   ipcMain.handle('conversations:set-model', (_event, conversationId: unknown, modelId: unknown) => {
     if (typeof conversationId !== 'string' || (modelId !== undefined && typeof modelId !== 'string')) throw new Error('会话模型参数无效。')
@@ -275,31 +268,10 @@ function workspaceKey(workspacePath: string): string {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
-function mergeConversationAttachments(current: ChatAttachment[], added: ChatAttachment[]): ChatAttachment[] {
-  if (!added.length) return current
-  const merged = [...current]
-  for (const attachment of added) {
-    const duplicateIndex = merged.findIndex((item) => item.id === attachment.id || (item.name === attachment.name && item.size === attachment.size && item.mimeType === attachment.mimeType))
-    if (duplicateIndex >= 0) merged[duplicateIndex] = attachment
-    else merged.push(attachment)
-  }
-  if (merged.reduce((total, attachment) => total + attachment.size, 0) > MAX_TOTAL_ATTACHMENT_SIZE) throw new Error('当前会话附件总大小不能超过限制，请先移除不需要的附件。')
-  return merged
-}
-
 function upsertStep<T extends { id: string }>(steps: T[], nextStep: T): T[] {
   const index = steps.findIndex((item) => item.id === nextStep.id)
   if (index < 0) return [...steps, nextStep]
   return steps.map((item) => item.id === nextStep.id ? nextStep : item)
-}
-
-function historyContent(message: ChatMessage): string {
-  if (message.role !== 'assistant' || !message.steps?.length) return message.content
-  const trace = message.steps
-    .filter((item) => item.phase === 'act')
-    .map((item) => item.title + ': ' + item.detail)
-    .join('\n')
-  return [message.content, trace ? 'Previous execution trace:\n' + trace : ''].filter(Boolean).join('\n\n')
 }
 
 function validateAttachments(value: unknown): ChatAttachment[] {

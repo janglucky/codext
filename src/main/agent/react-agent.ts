@@ -18,6 +18,7 @@ import {
   prepareToolCall,
   type ToolCallIssue
 } from './tool-call-recovery'
+import { selectTaskHistory } from './history-selector'
 
 const MAX_REACT_TURNS = 100
 const MAX_ACTIONS_PER_TURN = 1
@@ -56,7 +57,13 @@ type ReactModelReply = {
 }
 type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
 type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean; streamToolCallAssemblyError?: boolean }
-type ConversationMessage = { role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[] }
+type ConversationMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  attachments?: ChatAttachment[]
+  status?: string
+  steps?: TaskStep[]
+}
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
 type McpApprovalCallback = (request: McpApprovalDetails) => Promise<boolean>
@@ -115,7 +122,8 @@ export class ReactAgent {
 
     let currentPolicy = policy
     let tools = new WorkspaceTools(currentPolicy.workspacePath)
-    const allAttachments = [...attachments, ...history.flatMap((message) => message.attachments ?? [])]
+    const selectedHistory = selectTaskHistory(history, prompt, { hasCurrentAttachments: Boolean(attachments.length) })
+    const allAttachments = [...attachments, ...selectedHistory.flatMap((message) => message.attachments ?? [])]
     const pendingDecryptPaths = new Set(allAttachments
       .filter((attachment) => attachment.workspacePath && isDecryptableAttachmentName(attachment.name) && looksLikeEncryptedTextAttachment(attachment))
       .map((attachment) => attachment.workspacePath as string))
@@ -126,7 +134,7 @@ export class ReactAgent {
     }
     const messages: ModelMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(currentPolicy) },
-      ...history
+      ...selectedHistory
         .filter((message) => message.content.trim() || message.attachments?.length)
         .map((message): ModelMessage => ({
           role: message.role,
@@ -148,7 +156,7 @@ export class ReactAgent {
     const observationsForFallback: string[] = []
     const deniedMcpPaths = new Set<string>()
     const deniedCommandSignatures = new Set<string>()
-    const toolIntentPrompt = resolveToolIntentPrompt(prompt, history)
+    const toolIntentPrompt = resolveToolIntentPrompt(prompt, selectedHistory)
 
     for (let turn = 1; turn <= this.maxReactTurns + 1; turn++) {
       throwIfAborted(signal)

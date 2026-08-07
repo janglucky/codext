@@ -417,6 +417,33 @@ describe('ReactAgent.execute', () => {
       expect(userContent.some((part) => part.type === 'text' && part.text?.includes('notes.txt') && part.text.includes('hello'))).toBe(true)
     })
 
+    it('does not send unrelated historical screenshots or task text to the model', async () => {
+      const { agent } = makeAgent(makeSettings())
+      const oldImage: ChatAttachment = {
+        id: 'old-image',
+        name: 'old-ui.png',
+        mimeType: 'image/png',
+        size: 8,
+        dataUrl: 'data:image/png;base64,b2xkLWltYWdl'
+      }
+      const history = [
+        { role: 'user' as const, content: '重新设计旧页面', attachments: [oldImage] },
+        { role: 'assistant' as const, content: '旧页面已经处理完成', status: 'succeeded' },
+        { role: 'user' as const, content: "测试连接时报错 NoneType strip" },
+        { role: 'assistant' as const, content: '连接问题尚未修复', status: 'paused' }
+      ]
+
+      await agent.run('修复测试连接的 NoneType strip 问题', history)
+
+      const request = vi.mocked(globalThis.fetch).mock.calls[0]?.[1]
+      const body = String(request?.body)
+      expect(body).toContain('测试连接时报错')
+      expect(body).not.toContain('old-ui.png')
+      expect(body).not.toContain(oldImage.dataUrl)
+      expect(body).not.toContain('重新设计旧页面')
+      expect(body).not.toContain('旧页面已经处理完成')
+    })
+
     it('sends an image attachment even when the visible message has no text', async () => {
       const { agent } = makeAgent(makeSettings())
       const image: ChatAttachment = { id: 'image-only', name: 'clipboard.png', mimeType: 'image/png', size: 8, dataUrl: 'data:image/png;base64,iVBORw0KGgo=' }

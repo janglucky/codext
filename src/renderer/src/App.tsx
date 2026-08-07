@@ -82,7 +82,6 @@ export function App(): ReactElement {
   const messageListRef = useRef<HTMLElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const attachmentsRef = useRef<ChatAttachment[]>([])
-  const activeAttachmentsRef = useRef<ChatAttachment[]>([])
   const pendingAttachmentReadsRef = useRef<Promise<void> | null>(null)
   const runningConversationIdRef = useRef('')
   const modelControlRef = useRef<HTMLDivElement | null>(null)
@@ -90,7 +89,6 @@ export function App(): ReactElement {
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
   const activeWorkspacePath = activeConversation?.workspacePath || policy?.workspacePath || ''
-  const activeAttachments = activeConversation?.activeAttachments ?? []
   const modelProfiles = useMemo(() => getModelProfiles(settings), [settings])
   const defaultModel = useMemo(() => getDefaultModelProfile(settings), [settings])
   const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
@@ -229,10 +227,6 @@ export function App(): ReactElement {
     setModelMenuOpen(false)
   }, [activeId])
 
-  useEffect(() => {
-    activeAttachmentsRef.current = activeAttachments
-  }, [activeAttachments])
-
   function queueFiles(files: File[]): void {
     if (!files.length) return
     setAttachmentsLoading(true)
@@ -254,7 +248,7 @@ export function App(): ReactElement {
     if (!files.length) return
     const errors: string[] = []
 
-    let totalSize = [...activeAttachmentsRef.current, ...attachmentsRef.current].reduce((sum, attachment) => sum + attachment.size, 0)
+    let totalSize = attachmentsRef.current.reduce((sum, attachment) => sum + attachment.size, 0)
     const readableFiles = files.filter((file) => {
       const mimeType = inferAttachmentMimeType(file.type, file.name)
       if (!isSupportedAttachmentType(mimeType, file.name)) {
@@ -304,9 +298,7 @@ export function App(): ReactElement {
     if (running || !activeConversation) return
     if (pendingAttachmentReadsRef.current) await pendingAttachmentReadsRef.current
     const currentAttachments = attachmentsRef.current
-    const retainedAttachments = activeAttachmentsRef.current
-    const effectiveAttachments = [...retainedAttachments, ...currentAttachments.filter((attachment) => !retainedAttachments.some((active) => active.id === attachment.id))]
-    if (!prompt.trim() && !effectiveAttachments.length) return
+    if (!prompt.trim() && !currentAttachments.length) return
     const submittedPrompt = prompt.trim()
     const submittedAttachments = currentAttachments
     const conversationId = activeConversation.id
@@ -335,9 +327,8 @@ export function App(): ReactElement {
       if (conversation.id !== conversationId) return conversation
       return {
         ...conversation,
-        title: conversation.title === '新对话' ? submittedPrompt.slice(0, 28) || effectiveAttachments[0]?.name.slice(0, 28) || '新对话' : conversation.title,
+        title: conversation.title === '新对话' ? submittedPrompt.slice(0, 28) || currentAttachments[0]?.name.slice(0, 28) || '新对话' : conversation.title,
         updatedAt: createdAt,
-        activeAttachments: effectiveAttachments.length ? effectiveAttachments : undefined,
         messages: [...conversation.messages, optimisticMessage, pendingAssistant]
       }
     }))

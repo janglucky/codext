@@ -27,7 +27,7 @@ export async function copyConversationAttachments(conversation: Conversation, so
   const sourceTools = new WorkspaceTools(sourceWorkspacePath)
   const targetTools = new WorkspaceTools(targetWorkspacePath)
   const copiedPaths = new Set<string>()
-  const attachments = [...(conversation.activeAttachments ?? []), ...conversation.messages.flatMap((message) => message.attachments ?? [])]
+  const attachments = conversation.messages.flatMap((message) => message.attachments ?? [])
   for (const attachment of attachments) {
     if (!attachment.workspacePath || copiedPaths.has(attachment.workspacePath)) continue
     const content = await sourceTools.readBinaryFile(attachment.workspacePath)

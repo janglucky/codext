@@ -8,7 +8,7 @@ export interface TokenUsage { inputTokens: number; outputTokens: number; duratio
 export interface AgentTask { id: string; prompt: string; status: TaskStatus; result?: string; error?: string; createdAt: string; steps: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
 export interface ChatAttachment { id: string; name: string; mimeType: string; size: number; dataUrl: string; workspacePath?: string }
 export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
-export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; activeAttachments?: ChatAttachment[]; modelId?: string }
+export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; modelId?: string }
 export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings }
 export interface AgentPolicy { systemPrompt: string; workspacePath: string; enabledTools: string[] }
 export interface ConnectionTestResult { ok: boolean; message: string }
@@ -32,7 +32,6 @@ export interface DesktopApi {
   deleteConversation(conversationId: string): Promise<Conversation[]>
   selectConversationWorkspace(conversationId: string): Promise<Conversation>
   resetConversationWorkspace(conversationId: string): Promise<Conversation>
-  removeConversationAttachment(conversationId: string, attachmentId: string): Promise<Conversation>
   getSettings(): Promise<AppSettings>
   saveSettings(settings: AppSettings): Promise<AppSettings>
   testConnection(settings: AppSettings, modelId?: string): Promise<ConnectionTestResult>

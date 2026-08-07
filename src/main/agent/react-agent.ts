@@ -8,6 +8,7 @@ import { classifyCommandRisk } from '../tools/command-risk'
 import { modelFetch } from '../model-fetch'
 import { prepareContext, estimateContextTokens, type ContextContent as ModelContent, type ContextContentPart as ModelContentPart, type ContextMessage as ModelMessage } from './context-manager'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from '../../shared/models'
+import { normalizeTechnicalPunctuation } from '../../shared/text'
 import {
   applyPathCandidate,
   asStreamAssemblyIssue,
@@ -1403,7 +1404,7 @@ function sanitizeAssistantText(text: string): string {
 }
 
 function formatThoughtDetail(thought: string): string {
-  const normalized = thought.replace(/\s+/g, ' ').trim()
+  const normalized = normalizeTechnicalPunctuation(thought).replace(/\s+/g, ' ').trim()
   return normalized.length <= MAX_DISPLAYED_THOUGHT_CHARACTERS
     ? normalized
     : normalized.slice(0, MAX_DISPLAYED_THOUGHT_CHARACTERS - 1).trimEnd() + '…'

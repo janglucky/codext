@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
 import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, resolveModelProfile } from '../../shared/models'
+import { normalizeTechnicalPunctuation } from '../../shared/text'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -774,7 +775,7 @@ function AgentStepView({ step: taskStep, steps, index }: { step: TaskStep; steps
 }
 
 function conciseThought(detail: string): string {
-  const withoutReasoning = detail
+  const withoutReasoning = normalizeTechnicalPunctuation(detail)
     .replace(/<\s*(?:think|thought)\s*>[\s\S]*?<\s*\/\s*(?:think|thought)\s*>/gi, '')
     .replace(/<\s*(?:think|thought)\s*>[\s\S]*$/gi, '')
     .replace(/<\s*\/?\s*(?:think|thought)\s*>/gi, '')

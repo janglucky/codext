@@ -611,7 +611,7 @@ describe('ReactAgent.execute', () => {
             start(controller) {
               controller.enqueue(ssePayload({ choices: [{ delta: { reasoning: '这是厂商独立返回的原始长思考，不应进入 UI 或上下文。' } }] }))
               controller.enqueue(ssePayload({ choices: [{ delta: { content: '<think>正文里兼容的长思考也不应保留。</think>' } }] }))
-              controller.enqueue(ssePayload({ choices: [{ delta: { content: '{"thought":"准备读取项目配置。","action":{"name":"read_file","arguments":{"path":"package.json"}}}' } }] }))
+              controller.enqueue(ssePayload({ choices: [{ delta: { content: '{"thought":"准备读取 package。json。","action":{"name":"read_file","arguments":{"path":"package.json"}}}' } }] }))
               controller.enqueue(encoder.encode('data: [DONE]\n\n'))
               controller.close()
             }
@@ -630,13 +630,13 @@ describe('ReactAgent.execute', () => {
 
       const followUpContext = JSON.stringify(requestBodies[1]?.messages ?? [])
       expect(result).toBe('done')
-      expect(stepSnapshots).toContain('准备读取项目配置。')
+      expect(stepSnapshots).toContain('准备读取 package.json。')
       expect(stepSnapshots).toContain('已完成文件检查。')
       expect(stepSnapshots.some((item) => item.includes('原始长思考') || item.includes('正文里兼容'))).toBe(false)
       expect(followUpContext).not.toContain('原始长思考')
       expect(followUpContext).not.toContain('正文里兼容')
       expect(followUpContext).not.toContain('<think>')
-      expect(followUpContext).toContain('准备读取项目配置。')
+      expect(followUpContext).toContain('准备读取 package.json。')
     })
   })
 

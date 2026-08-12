@@ -54,6 +54,36 @@ describe('context manager', () => {
     expect(estimateContextTokens(prepared.messages)).toBe(prepared.afterTokens)
   })
 
+  it('keeps a native assistant tool call and all matching tool results together', () => {
+    const oldMessages = Array.from({ length: 14 }, (_, index): ContextMessage => ({
+      role: index % 2 ? 'assistant' : 'user',
+      content: '旧信息 ' + index + ' ' + 'n'.repeat(5_000)
+    }))
+    const assistantCall: ContextMessage = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { id: 'call_a', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.ts"}' } },
+        { id: 'call_b', type: 'function', function: { name: 'read_file', arguments: '{"path":"b.ts"}' } }
+      ]
+    }
+    const messages: ContextMessage[] = [
+      system,
+      ...oldMessages,
+      { role: 'user', content: '读取两个文件' },
+      assistantCall,
+      { role: 'tool', tool_call_id: 'call_a', content: 'a content' },
+      { role: 'tool', tool_call_id: 'call_b', content: 'b content' }
+    ]
+
+    const prepared = prepareContext(messages, { contextWindowTokens: 18_000, maxOutputTokens: 2_000 })
+
+    expect(prepared.compressed).toBe(true)
+    const callIndex = prepared.messages.findIndex((message) => message.tool_calls?.[0]?.id === 'call_a')
+    expect(callIndex).toBeGreaterThan(0)
+    expect(prepared.messages.slice(callIndex + 1).filter((message) => message.role === 'tool').map((message) => message.tool_call_id)).toEqual(['call_a', 'call_b'])
+  })
+
   it('removes duplicate protocol noise before semantic compression', () => {
     const duplicate = { role: 'assistant' as const, content: '重复的旧结果 ' + 'q'.repeat(8_000) }
     const noise = { role: 'user' as const, content: 'REPEATED_ACTION：不要重复工具' }

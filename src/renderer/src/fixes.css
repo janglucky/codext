@@ -404,3 +404,220 @@ html, body, #root { width: 100%; height: 100%; overflow: hidden; }.chat-app { he
 .message-markdown { overflow-x: hidden; }
 .message-markdown :not(pre) > code { overflow-wrap: anywhere; word-break: break-word; }
 .message-markdown pre code { overflow-wrap: normal; word-break: normal; }
+
+/* Keep one Action and its Observation in a single compact execution card. */
+.agent-flow-tool-call > summary .agent-flow-status span {
+  display: block;
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.agent-flow-tool-call,
+.agent-flow-tool-call[open],
+.agent-flow-tool-call > .agent-flow-tool-result,
+.agent-flow-tool-call > .agent-flow-tool-result.has-edit-diff {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  box-sizing: border-box;
+  justify-self: stretch;
+}
+
+.agent-flow-tool-call[open] > summary .agent-flow-status span {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.agent-flow-tool-result {
+  display: grid;
+  gap: 5px;
+  margin: 1px 0 0 21px;
+}
+
+.agent-flow-tool-result.has-edit-diff {
+  width: 100%;
+  min-width: 0;
+  margin-right: 0;
+  margin-left: 0;
+}
+
+.agent-flow-tool-result > span {
+  color: #8d97a5;
+  font-size: 11px;
+}
+
+.agent-flow-tool-result pre {
+  max-height: 260px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid #e7ece8;
+  border-radius: 8px;
+  color: #4e6655;
+  background: #f8fbf8;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.edit-diff-view {
+  width: 100%;
+  min-width: 0;
+  overflow: visible;
+  box-sizing: border-box;
+  border: 1px solid #d8dde3;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Override the generic .agent-process section padding. Diff row backgrounds
+   must start directly at the component border. */
+.agent-process section.edit-diff-view,
+.agent-process section.edit-diff-view:first-of-type {
+  padding: 0;
+}
+
+.edit-diff-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border-bottom: 1px solid rgba(42, 56, 69, .08);
+  border-radius: 7px 7px 0 0;
+  background: #f3f5f7;
+}
+
+.edit-diff-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #405261;
+  font: 600 12px/1.4 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.edit-diff-file svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.edit-diff-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.edit-diff-stats {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.edit-diff-stats span { padding: 2px 6px; border-radius: 99px; }
+.edit-diff-stats .added { color: #176b3a; background: #dff7e8; }
+.edit-diff-stats .deleted { color: #9b303a; background: #fde5e7; }
+.edit-diff-stats .modified { color: #285f9d; background: #e2efff; }
+
+.edit-diff-code {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  max-height: 440px;
+  overflow: auto;
+  color: #2e3a43;
+  background: #fafbfc;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  scrollbar-color: rgba(112, 124, 134, .48) transparent;
+  scrollbar-width: thin;
+  tab-size: 2;
+}
+
+.edit-diff-code::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.edit-diff-code::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.edit-diff-code::-webkit-scrollbar-thumb {
+  border: 0;
+  border-radius: 3px;
+  background: rgba(112, 124, 134, .48);
+}
+
+.edit-diff-code::-webkit-scrollbar-thumb:hover {
+  background: rgba(88, 101, 112, .62);
+}
+
+.edit-diff-code::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.edit-diff-code::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.edit-diff-lines {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+}
+
+.edit-diff-line {
+  display: grid;
+  grid-template-columns: 42px 42px 22px minmax(max-content, 1fr);
+  width: 100%;
+  min-width: 100%;
+}
+
+.edit-diff-line > span,
+.edit-diff-line > code { min-height: 20px; box-sizing: border-box; }
+
+.diff-line-number {
+  padding: 0 7px;
+  border-right: 1px solid rgba(116, 133, 147, .14);
+  color: #98a4ae;
+  background: rgba(244, 247, 249, .82);
+  text-align: right;
+  user-select: none;
+}
+
+.diff-marker { padding: 0 5px; text-align: center; user-select: none; }
+.edit-diff-line code { padding: 0 10px 0 4px; color: inherit; white-space: pre; }
+
+.edit-diff-line.add { color: #17683a; background: #eaf9f0; }
+.edit-diff-line.add .diff-line-number { color: #39865a; background: rgba(203, 239, 217, .72); }
+.edit-diff-line.delete { color: #962f38; background: #fff0f1; }
+.edit-diff-line.delete .diff-line-number { color: #ad5660; background: rgba(248, 207, 212, .72); }
+.edit-diff-line.modify-old,
+.edit-diff-line.modify-new { color: #245e9c; background: #edf5ff; }
+.edit-diff-line.modify-old .diff-line-number,
+.edit-diff-line.modify-new .diff-line-number { color: #497daf; background: rgba(207, 228, 252, .76); }
+
+.edit-diff-line.hunk,
+.edit-diff-line.note {
+  grid-template-columns: minmax(100%, max-content);
+  color: #62798f;
+  background: #eef4f9;
+}
+
+.edit-diff-line.note { color: #7a6b45; background: #fff9e9; }
+.diff-meta { padding: 2px 10px; white-space: pre; }
+
+@media (max-width: 700px) {
+  .edit-diff-header { align-items: flex-start; flex-direction: column; }
+  .edit-diff-line { grid-template-columns: 34px 34px 18px minmax(max-content, 1fr); }
+}

@@ -101,19 +101,27 @@ const previousLocalOfficeSystemPrompt = [
   '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
   '最终答复要简洁、可验证，并说明实际完成了什么。'
 ].join('\n')
+const previousServiceSystemPrompt = [
+  '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
+  '你必须遵循 ReAct 模式：先判断是否需要工具，再执行一个明确动作，读取 Observation 后继续下一轮，直到可以给出 Final。',
+  '你可以读取文件、写入文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过需用户单次授权的 PPT MCP 解析 PowerPoint，以及执行命令行；所有文件操作必须限制在工作区内。',
+  '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
+  '最终答复要简洁、可验证，并说明实际完成了什么。'
+].join('\n')
 const legacyEnabledTools = ['read_file', 'write_file', 'run_command']
 const previousDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'run_command']
 const previousOfficeDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command']
+const previousServiceDefaultEnabledTools = [...previousOfficeDefaultEnabledTools, 'start_service']
 export const defaultPolicy: AgentPolicy = {
   systemPrompt: [
     '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
     '你必须遵循 ReAct 模式：先判断是否需要工具，再执行一个明确动作，读取 Observation 后继续下一轮，直到可以给出 Final。',
-    '你可以读取文件、写入文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过需用户单次授权的 PPT MCP 解析 PowerPoint，以及执行命令行；所有文件操作必须限制在工作区内。',
+    '你可以读取、写入或局部编辑文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过需用户单次授权的 PPT MCP 解析 PowerPoint，以及执行命令行；所有文件操作必须限制在工作区内。',
     '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
     '最终答复要简洁、可验证，并说明实际完成了什么。'
   ].join('\n'),
   workspacePath: 'D:/work/codext',
-  enabledTools: ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command', 'start_service']
+  enabledTools: ['read_file', 'write_file', 'edit_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command', 'start_service']
 }
 
 /** 返回当前时间的 ISO 8601 字符串，用于时间戳字段的统一格式。 */
@@ -125,6 +133,15 @@ function normalizePersistedMessage(message: ChatMessage): ChatMessage {
   const normalized = filteredSteps?.length !== message.steps?.length ? { ...message, steps: filteredSteps } : message
   if (normalized.role !== 'assistant') return normalized
   const protocolError = '模型未按 ReAct 协议返回最终结果，原始思考内容已隐藏。'
+  try {
+    const payload = JSON.parse(normalized.content.trim()) as { thought?: unknown; action?: unknown; tool_calls?: unknown; choice?: unknown; final?: unknown }
+    const thoughtOnly = typeof payload.thought === 'string' && payload.action === undefined && payload.tool_calls === undefined && payload.choice === undefined && payload.final === undefined
+    if (thoughtOnly) {
+      return { ...normalized, content: '模型仅返回了思考摘要，未继续执行所需动作。请重试本次任务。', status: 'failed', completedAt: normalized.completedAt ?? now() }
+    }
+  } catch {
+    /* 普通助手文本不是 JSON，继续原有的历史兼容处理。 */
+  }
   if (normalized.content.trim() === '[REACT_PROTOCOL_DRIFT]') {
     return { ...normalized, content: protocolError, status: 'failed', completedAt: normalized.completedAt ?? now() }
   }
@@ -178,7 +195,7 @@ export class LocalStore {
         policy: {
           ...defaultPolicy,
           ...draft.policy,
-          systemPrompt: draft.policy?.systemPrompt === legacySystemPrompt || draft.policy?.systemPrompt === previousOfficeMcpSystemPrompt || draft.policy?.systemPrompt === previousLocalOfficeSystemPrompt
+          systemPrompt: draft.policy?.systemPrompt === legacySystemPrompt || draft.policy?.systemPrompt === previousOfficeMcpSystemPrompt || draft.policy?.systemPrompt === previousLocalOfficeSystemPrompt || draft.policy?.systemPrompt === previousServiceSystemPrompt
             ? defaultPolicy.systemPrompt
             : draft.policy?.systemPrompt ?? defaultPolicy.systemPrompt,
           enabledTools: normalizeEnabledTools(draft.policy?.enabledTools)
@@ -312,5 +329,6 @@ function normalizeEnabledTools(enabledTools?: string[]): string[] {
   const isLegacyDefault = enabledTools.length === legacyEnabledTools.length && legacyEnabledTools.every((tool) => enabledTools.includes(tool))
   const isPreviousDefault = enabledTools.length === previousDefaultEnabledTools.length && previousDefaultEnabledTools.every((tool) => enabledTools.includes(tool))
   const isPreviousOfficeDefault = enabledTools.length === previousOfficeDefaultEnabledTools.length && previousOfficeDefaultEnabledTools.every((tool) => enabledTools.includes(tool))
-  return isLegacyDefault || isPreviousDefault || isPreviousOfficeDefault ? defaultPolicy.enabledTools : enabledTools
+  const isPreviousServiceDefault = enabledTools.length === previousServiceDefaultEnabledTools.length && previousServiceDefaultEnabledTools.every((tool) => enabledTools.includes(tool))
+  return isLegacyDefault || isPreviousDefault || isPreviousOfficeDefault || isPreviousServiceDefault ? defaultPolicy.enabledTools : enabledTools
 }

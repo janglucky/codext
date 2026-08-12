@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeTechnicalPunctuation } from '../src/shared/text'
+import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../src/shared/text'
 
 describe('normalizeTechnicalPunctuation', () => {
   it('repairs full-width punctuation inside technical identifiers', () => {
@@ -12,5 +12,14 @@ describe('normalizeTechnicalPunctuation', () => {
   it('keeps Chinese prose punctuation unchanged', () => {
     expect(normalizeTechnicalPunctuation('先读取配置，然后检查页面。'))
       .toBe('先读取配置，然后检查页面。')
+  })
+})
+
+describe('hideReactObservationReferences', () => {
+  it('removes internal ReAct turn numbers from user-facing thoughts', () => {
+    expect(hideReactObservationReferences('之前的 CSS 编辑已成功（Observation #5），但 JS 仍需修改。'))
+      .toBe('之前的 CSS 编辑已成功，但 JS 仍需修改。')
+    expect(hideReactObservationReferences('根据 Observation #12 继续检查。'))
+      .toBe('根据工具结果继续检查。')
   })
 })

@@ -4,7 +4,8 @@ import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
 import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
-import { normalizeTechnicalPunctuation } from '../../shared/text'
+import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
+import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -514,7 +515,7 @@ function CommandApprovalMessage({ request, onRespond }: { request: CommandApprov
     <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">{highRisk ? '等待高风险确认' : '等待确认'}</b></div>
     <section className={'mcp-approval-inline command-approval-inline ' + (highRisk ? 'high-risk' : '')}>
       <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">执行命令确认</h2><p>{request.reason}</p></div></div>
-      <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
+      <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.background ? <div><dt>模式</dt><dd>后台启动，成功创建进程后返回</dd></div> : null}{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
       <div className="mcp-approval-footer"><span>{highRisk ? '高风险操作，仅确认本次' : '仅确认本次命令'}</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className={'mcp-allow ' + (highRisk ? 'danger' : '')} autoFocus={!highRisk} onClick={() => onRespond(true)}>{highRisk ? '仍然执行' : '执行一次'}</button></div></div>
     </section>
   </article>
@@ -782,37 +783,151 @@ function workspaceLabel(workspacePath: string): string {
 
 function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
   const steps = message.steps ?? []
-  const observations = steps.filter((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
+  const flowItems = buildAgentFlowItems(steps)
   const isRunning = message.status === 'acting'
   const actionCount = steps.filter((item) => item.phase === 'act' && item.title.startsWith('正在执行工具')).length
   const now = useNow(isRunning)
   const elapsed = formatElapsed(getElapsedMs(message, now))
 
   return <details className="agent-process agent-process-flow" open={isRunning}>
-    <summary><span>{isRunning ? '正在处理 ' + elapsed : '已处理 ' + elapsed}</span><small>{steps.length || 1} 个步骤 · {observations.length} 次观察 · {actionCount} 条命令</small></summary>
+    <summary><span>{isRunning ? '正在处理 ' + elapsed : '已处理 ' + elapsed}</span><small>{flowItems.length || 1} 个步骤 · {actionCount} 个工具</small></summary>
     <div className="agent-flow">
-      {steps.length ? steps.map((item, index) => <AgentStepView key={item.id} step={item} steps={steps} index={index} />) : <AgentStatusLine status="thinking" text={isRunning ? THINKING_PLACEHOLDER : '本次没有返回执行过程。'} />}
+      {flowItems.length ? flowItems.map((item) => item.kind === 'tool'
+        ? <AgentToolCallView key={item.action.id} action={item.action} observation={item.observation} />
+        : <AgentStepView key={item.step.id} step={item.step} />
+      ) : <AgentStatusLine status="thinking" text={isRunning ? THINKING_PLACEHOLDER : '本次没有返回执行过程。'} />}
     </div>
   </details>
 }
 
-function AgentStepView({ step: taskStep, steps, index }: { step: TaskStep; steps: TaskStep[]; index: number }): ReactElement {
+type AgentFlowItem =
+  | { kind: 'step'; step: TaskStep }
+  | { kind: 'tool'; action: TaskStep; observation?: TaskStep }
+
+function buildAgentFlowItems(steps: TaskStep[]): AgentFlowItem[] {
+  const items: AgentFlowItem[] = []
+  const pendingTools: Array<Extract<AgentFlowItem, { kind: 'tool' }>> = []
+
+  for (const taskStep of steps) {
+    if (taskStep.phase === 'reason' && (taskStep.title === '已规划工具执行顺序' || taskStep.title === '已补全工具参数')) continue
+    if (taskStep.phase === 'act' && taskStep.title.startsWith('正在执行工具')) {
+      const item: Extract<AgentFlowItem, { kind: 'tool' }> = { kind: 'tool', action: taskStep }
+      items.push(item)
+      pendingTools.push(item)
+      continue
+    }
+    if (taskStep.phase === 'act' && isObservationStepTitle(taskStep.title)) {
+      const observationTool = observationToolName(taskStep.title)
+      const pendingIndex = pendingTools.findIndex((item) => !item.observation && (!observationTool || normalizeToolLabel(getToolName(item.action)) === normalizeToolLabel(observationTool)))
+      const item = pendingIndex >= 0 ? pendingTools.splice(pendingIndex, 1)[0] : undefined
+      if (item) {
+        item.observation = taskStep
+        continue
+      }
+      // Deferred/skipped calls can produce internal observations without a
+      // corresponding execution row. They are model context, not useful UI.
+      continue
+    }
+    items.push({ kind: 'step', step: taskStep })
+  }
+  return items
+}
+
+function isObservationStepTitle(title: string): boolean {
+  return title.startsWith('Observation #') || title.startsWith('工具结果')
+}
+
+function observationToolName(title: string): string {
+  return title.replace(/^Observation\s+#\d+[：:]\s*/i, '').replace(/^工具结果[：:]\s*/, '').trim()
+}
+
+function normalizeToolLabel(value: string): string {
+  return value.trim().toLowerCase().replaceAll('-', '_')
+}
+
+function AgentToolCallView({ action, observation }: { action: TaskStep; observation?: TaskStep }): ReactElement {
+  const completed = Boolean(observation)
+  const toolName = normalizeToolLabel(getToolName(action))
+  const summary = (completed ? '已执行：' : '正在执行：') + toolDisplayName(getToolName(action)) + (action.detail ? ' ' + action.detail : ' 无参数')
+  const fileResult = observation && (toolName === 'edit_file' || toolName === 'write_file')
+    ? parseFileChangeResult(observation.detail, toolName)
+    : undefined
+  return <CollapsibleFlowBlock className={'agent-flow-action agent-flow-tool-call ' + (completed ? 'done' : 'running')}>
+    <summary><AgentStatusLine status={completed ? 'done' : 'running'} text={summary} /></summary>
+    {observation ? <div className={'agent-flow-tool-result' + (fileResult?.diff ? ' has-edit-diff' : '')}>
+      <span>执行结果</span>
+      <pre>{fileResult?.summary ?? observation.detail}</pre>
+      {fileResult?.diff ? <EditFileDiff path={fileResult.path} diff={fileResult.diff} /> : null}
+    </div> : null}
+  </CollapsibleFlowBlock>
+}
+
+function EditFileDiff({ path, diff }: { path: string; diff: string }): ReactElement {
+  const parsed = useMemo(() => parseUnifiedDiff(diff), [diff])
+  return <section className="edit-diff-view" aria-label={'文件修改：' + path}>
+    <header className="edit-diff-header">
+      <div className="edit-diff-file"><FileCode2 /><span>{path}</span></div>
+      <div className="edit-diff-stats" aria-label="修改统计">
+        <span className="added">新增 {parsed.added}</span>
+        <span className="deleted">删除 {parsed.deleted}</span>
+        <span className="modified">修改 {parsed.modified}</span>
+      </div>
+    </header>
+    <div className="edit-diff-code" role="table" aria-label="代码差异">
+      <div className="edit-diff-lines">
+        {parsed.lines.map((line, index) => <EditDiffLine key={index} line={line} />)}
+      </div>
+    </div>
+  </section>
+}
+
+function EditDiffLine({ line }: { line: UnifiedDiffLine }): ReactElement {
+  if (line.kind === 'hunk' || line.kind === 'note') {
+    return <div className={'edit-diff-line ' + line.kind} role="row"><span className="diff-meta">{line.content}</span></div>
+  }
+  const marker = line.kind === 'add' || line.kind === 'modify-new' ? '+' : line.kind === 'delete' || line.kind === 'modify-old' ? '−' : ' '
+  return <div className={'edit-diff-line ' + line.kind} role="row">
+    <span className="diff-line-number old" aria-label={line.oldLine ? '原第 ' + line.oldLine + ' 行' : undefined}>{line.oldLine ?? ''}</span>
+    <span className="diff-line-number new" aria-label={line.newLine ? '新第 ' + line.newLine + ' 行' : undefined}>{line.newLine ?? ''}</span>
+    <span className="diff-marker" aria-hidden="true">{marker}</span>
+    <code>{line.content || ' '}</code>
+  </div>
+}
+
+interface FileChangeResult {
+  path: string
+  summary: string
+  diff?: string
+}
+
+function parseFileChangeResult(detail: string, toolName: string): FileChangeResult | undefined {
+  try {
+    const value = JSON.parse(detail) as { ok?: unknown; path?: unknown; replacements?: unknown; created?: unknown; diff?: unknown }
+    if (value.ok !== true || typeof value.path !== 'string') return undefined
+    if (toolName === 'edit_file' && typeof value.replacements !== 'number') return undefined
+    if (toolName === 'write_file' && typeof value.created !== 'boolean') return undefined
+    const summary = toolName === 'edit_file'
+      ? '已编辑 ' + value.path + '，替换 ' + value.replacements + ' 处。'
+      : (value.created ? '已创建并写入 ' : '已写入 ') + value.path + '。'
+    return {
+      path: value.path,
+      summary,
+      diff: typeof value.diff === 'string' && value.diff.trim() ? value.diff : undefined
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function AgentStepView({ step: taskStep }: { step: TaskStep }): ReactElement {
   if (taskStep.phase === 'reason' && taskStep.title === THINKING_TITLE) {
     if (taskStep.detail === THINKING_PLACEHOLDER) return <AgentStatusLine status="thinking" text={THINKING_PLACEHOLDER} />
     return <p className="agent-flow-text">{conciseThought(taskStep.detail)}</p>
   }
 
-  if (taskStep.phase === 'act' && taskStep.title.startsWith('正在执行工具')) {
-    const hasObservation = steps.slice(index + 1).some((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
-    return <CollapsibleFlowBlock className={'agent-flow-action ' + (hasObservation ? 'done' : 'running')} initialOpen={!hasObservation}>
-      <summary><AgentStatusLine status={hasObservation ? 'done' : 'running'} text={(hasObservation ? '已运行 Action：' : '正在运行 Action：') + getToolName(taskStep)} /></summary>
-      <pre>{taskStep.detail || '无参数'}</pre>
-    </CollapsibleFlowBlock>
-  }
-
-  if (taskStep.phase === 'act' && (taskStep.title.startsWith('Observation #') || taskStep.title.startsWith('工具结果'))) {
+  if (taskStep.phase === 'act' && isObservationStepTitle(taskStep.title)) {
     return <CollapsibleFlowBlock className="agent-flow-observation">
-      <summary><AgentStatusLine status="observe" text={taskStep.title} /></summary>
+      <summary><AgentStatusLine status="observe" text="执行结果" /></summary>
       <pre>{taskStep.detail}</pre>
     </CollapsibleFlowBlock>
   }
@@ -821,7 +936,7 @@ function AgentStepView({ step: taskStep, steps, index }: { step: TaskStep; steps
 }
 
 function conciseThought(detail: string): string {
-  const withoutReasoning = normalizeTechnicalPunctuation(detail)
+  const withoutReasoning = hideReactObservationReferences(normalizeTechnicalPunctuation(detail))
     .replace(/<\s*(?:think|thought)\s*>[\s\S]*?<\s*\/\s*(?:think|thought)\s*>/gi, '')
     .replace(/<\s*(?:think|thought)\s*>[\s\S]*$/gi, '')
     .replace(/<\s*\/?\s*(?:think|thought)\s*>/gi, '')
@@ -997,6 +1112,7 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
   const toolLabels: Record<string, string> = {
     read_file: '读取文件',
     write_file: '写入文件',
+    edit_file: '编辑文件',
     create_directory: '创建目录',
     list_files: '列举文件',
     decrypt_file: '文件解密',

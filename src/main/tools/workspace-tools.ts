@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { lstat, mkdir, open, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
@@ -19,6 +19,9 @@ const DECRYPT_EXTENSIONS = new Set(['.txt', '.csv', '.pdf', '.docx', '.xlsx', '.
 const WINDOWS_BATCH_EXTENSIONS = new Set(['.cmd', '.bat'])
 const WINDOWS_BATCH_META_CHARACTERS = /[\0\r\n"&|<>^%!()]/
 const SERVICE_START_TIMEOUT_MS = 30_000
+const BACKGROUND_START_GRACE_MS = 2000
+const EDIT_DIFF_TIMEOUT_MS = 10_000
+const MAX_EDIT_DIFF_CHARACTERS = 20_000
 
 interface RunningWorkspaceService { child: ChildProcess; url?: string; logPath: string }
 const runningWorkspaceServices = new Map<string, RunningWorkspaceService>()
@@ -58,8 +61,34 @@ export class WorkspaceTools {
   async writeFile(filePath: string, content: string): Promise<string> {
     const target = this.resolvePath(filePath)
     await this.ensureSafeOutputPath(target)
+    let previousContent = ''
+    let created = false
+    try {
+      previousContent = await readFile(target, 'utf8')
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') created = true
+      else throw error
+    }
     await writeFile(target, content, 'utf8')
-    return '已写入 ' + this.displayPath(target)
+    const path = this.displayPath(target)
+    const diff = await this.createEditDiff(path, previousContent, content)
+    return JSON.stringify({ ok: true, path, created, ...(diff ? { diff } : {}) })
+  }
+
+  async editFile(filePath: string, oldText: string, newText: string, replaceAll = false): Promise<string> {
+    if (!oldText.length) throw new Error('old_text 不能为空。')
+    const target = await this.resolveExistingPath(filePath)
+    if (!(await stat(target)).isFile()) throw new Error('编辑路径必须是文件。')
+    const content = await readFile(target, 'utf8')
+    const matches = this.countOccurrences(content, oldText)
+    if (!matches) throw new Error('未在文件中找到与 old_text 完全一致的内容。')
+    if (matches > 1 && !replaceAll) throw new Error('old_text 在文件中匹配 ' + matches + ' 处；请提供更唯一的上下文，或明确设置 replace_all 为 true。')
+    const replacements = replaceAll ? matches : 1
+    const updated = replaceAll ? content.replaceAll(oldText, newText) : content.replace(oldText, newText)
+    await writeFile(target, updated, 'utf8')
+    const path = this.displayPath(target)
+    const diff = await this.createEditDiff(path, content, updated)
+    return JSON.stringify({ ok: true, path, replacements, ...(diff ? { diff } : {}) })
   }
 
   async saveBinaryFile(filePath: string, content: Uint8Array): Promise<string> {
@@ -157,12 +186,13 @@ export class WorkspaceTools {
     }
   }
 
-  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false, dangerousApproved = false): Promise<string> {
+  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false, dangerousApproved = false, background = false): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('命令不能为空。')
     const risk = classifyCommandRisk(executable, args)
     if ((risk.level === 'blocked' || blockedCommands.test([executable, ...args].join(' '))) && !dangerousApproved) throw new Error('高风险命令需要用户明确确认：' + risk.reason)
     if (risk.level === 'write' && !writeApproved) throw new Error('该命令可能修改状态，需要用户授权后执行。')
+    if (background) return this.runBackgroundCommand(executable, args, signal)
     const timeoutMs = this.commandTimeout(executable, args)
 
     if (process.platform === 'win32' && this.isWindowsBatchCommand(executable)) {
@@ -193,6 +223,8 @@ export class WorkspaceTools {
     const logPath = join(tmpdir(), 'codext-service-' + crypto.randomUUID() + '.log')
     const logFile = await open(logPath, 'a')
     let child: ChildProcess
+    let earlySpawnError: Error | undefined
+    const captureEarlySpawnError = (error: Error): void => { earlySpawnError = error }
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd: this.workspacePath,
@@ -201,6 +233,9 @@ export class WorkspaceTools {
         env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
         stdio: ['ignore', logFile.fd, logFile.fd]
       })
+      // Attach before the first await. ENOENT can otherwise emit while the
+      // log file is closing and surface as an uncaught main-process error.
+      child.once('error', captureEarlySpawnError)
     } finally {
       await logFile.close()
     }
@@ -246,6 +281,7 @@ export class WorkspaceTools {
       }
 
       signal?.addEventListener('abort', onAbort, { once: true })
+      child.removeListener('error', captureEarlySpawnError)
       child.once('error', (error) => settle(error))
       child.once('exit', (code) => {
         void (async () => {
@@ -262,7 +298,8 @@ export class WorkspaceTools {
           settle(new Error('服务进程提前退出' + (code === null ? '' : '（退出码 ' + code + '）') + '。' + (output ? '\n' + output.trim() : '')))
         })()
       })
-      void pollOutput()
+      if (earlySpawnError) settle(earlySpawnError)
+      else void pollOutput()
     })
   }
 
@@ -279,6 +316,77 @@ export class WorkspaceTools {
       const exitCode = this.commandExitCode(error)
       throw new Error('命令执行失败' + (exitCode ? '（退出码 ' + exitCode + '）' : '') + '。' + (details ? '\n' + details : ''))
     }
+  }
+
+  private async runBackgroundCommand(command: string, args: string[], signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) throw new DOMException('后台命令已暂停', 'AbortError')
+    const invocation = await this.resolveServiceInvocation(command, args, signal)
+    const logPath = join(tmpdir(), 'codext-background-' + crypto.randomUUID() + '.log')
+    const logFile = await open(logPath, 'a')
+    let child: ChildProcess
+    let earlySpawnError: Error | undefined
+    let spawnedEarly = false
+    const captureEarlySpawnError = (error: Error): void => { earlySpawnError = error }
+    const captureEarlySpawn = (): void => { spawnedEarly = true }
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        cwd: this.workspacePath,
+        windowsHide: false,
+        detached: true,
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        stdio: ['ignore', logFile.fd, logFile.fd]
+      })
+      child.once('error', captureEarlySpawnError)
+      child.once('spawn', captureEarlySpawn)
+    } finally {
+      await logFile.close()
+    }
+    return new Promise((resolveBackground, rejectBackground) => {
+      let settled = false
+      let graceTimer: ReturnType<typeof setTimeout> | undefined
+      const cleanup = (): void => {
+        if (graceTimer) clearTimeout(graceTimer)
+        signal?.removeEventListener('abort', onAbort)
+        child.removeListener('error', onError)
+        child.removeListener('exit', onExit)
+      }
+      const settle = (error?: Error): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (error) {
+          void readFile(logPath).then((output) => {
+            const details = this.decodeCommandOutput(output).trim()
+            return rm(logPath, { force: true }).then(() => rejectBackground(new Error(error.message + (details ? '\n' + details : ''))))
+          }).catch(() => rejectBackground(error))
+          return
+        }
+        child.once('error', () => undefined)
+        child.unref()
+        child.once('exit', () => { void rm(logPath, { force: true }) })
+        resolveBackground(JSON.stringify({ ok: true, background: true, verified: true, pid: child.pid }))
+      }
+      const onAbort = (): void => {
+        child.kill()
+        settle(new DOMException('后台命令已暂停', 'AbortError'))
+      }
+      const onError = (error: Error): void => settle(error)
+      const onExit = (code: number | null, exitSignal: NodeJS.Signals | null): void => {
+        const detail = code === null ? '信号 ' + (exitSignal ?? '未知') : '退出码 ' + code
+        settle(new Error('后台进程在启动确认前退出（' + detail + '）。'))
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
+      child.removeListener('error', captureEarlySpawnError)
+      child.removeListener('spawn', captureEarlySpawn)
+      child.once('error', onError)
+      child.once('exit', onExit)
+      child.once('spawn', () => {
+        graceTimer = setTimeout(() => settle(), BACKGROUND_START_GRACE_MS)
+      })
+      if (earlySpawnError) settle(earlySpawnError)
+      else if (spawnedEarly) graceTimer = setTimeout(() => settle(), BACKGROUND_START_GRACE_MS)
+    })
   }
 
   private async runWindowsBatchCommand(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
@@ -305,6 +413,16 @@ export class WorkspaceTools {
   }
 
   private async resolveServiceInvocation(command: string, args: string[], signal?: AbortSignal): Promise<{ command: string; args: string[] }> {
+    const executableName = basename(command).toLowerCase().replace(/\.(?:cmd|bat|exe)$/, '')
+    if (process.platform !== 'win32' && /^(?:npx|pnpx)$/.test(executableName) && args[0]?.toLowerCase() === 'electron') {
+      const localElectron = join(this.workspacePath, 'node_modules', 'electron', 'dist', process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : 'electron')
+      try {
+        const localStat = await stat(localElectron)
+        if (localStat.isFile()) return { command: localElectron, args: args.slice(1) }
+      } catch {
+        /* Fall back to the package runner so its error can be reported. */
+      }
+    }
     if (process.platform !== 'win32') return { command, args }
     const batchCommand = this.isWindowsBatchCommand(command) ? command : await this.findWindowsBatchCommand(command, signal)
     if (!batchCommand) return { command, args }
@@ -356,16 +474,26 @@ export class WorkspaceTools {
 
   private findServiceUrl(output: string): string | undefined {
     const ansiEscapePattern = new RegExp(String.fromCharCode(27) + '\\[[0-?]*[ -/]*[@-~]', 'g')
-    const match = output.replace(ansiEscapePattern, '').match(/https?:\/\/[^\s<>"'`]+/i)?.[0]
-    if (!match) return undefined
-    try {
-      const url = new URL(match.replace(/[),.;\]，。；]+$/, ''))
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-      if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
-      return url.toString()
-    } catch {
-      return undefined
+    const matches = output.replace(ansiEscapePattern, '').match(/https?:\/\/[^\s<>"'`]+/gi) ?? []
+    for (const match of matches) {
+      try {
+        const url = new URL(match.replace(/[),.;\]，。；]+$/, ''))
+        if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !this.isLocalServiceHost(url.hostname)) continue
+        if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
+        return url.toString()
+      } catch {
+        /* 继续检查日志中的其他 URL。 */
+      }
     }
+    return undefined
+  }
+
+  private isLocalServiceHost(hostname: string): boolean {
+    const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    if (host === 'localhost' || host === '::1' || host === '::' || host === '0.0.0.0' || host.endsWith('.local')) return true
+    if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return true
+    const private172 = /^172\.(\d{1,2})\./.exec(host)
+    return private172 ? Number(private172[1]) >= 16 && Number(private172[1]) <= 31 : false
   }
 
   private isMissingExecutableError(error: unknown): boolean {
@@ -389,6 +517,63 @@ export class WorkspaceTools {
     const actualPath = await realpath(target)
     this.assertWorkspacePath(actualPath)
     return actualPath
+  }
+
+  private countOccurrences(content: string, search: string): number {
+    let count = 0
+    let offset = 0
+    while ((offset = content.indexOf(search, offset)) >= 0) {
+      count++
+      offset += search.length
+    }
+    return count
+  }
+
+  private async createEditDiff(filePath: string, before: string, after: string): Promise<string | undefined> {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'codext-edit-diff-'))
+    const normalizedPath = filePath.replaceAll('\\', '/')
+    const beforePath = join(tempRoot, 'before', normalizedPath)
+    const afterPath = join(tempRoot, 'after', normalizedPath)
+    try {
+      await Promise.all([
+        mkdir(dirname(beforePath), { recursive: true }),
+        mkdir(dirname(afterPath), { recursive: true })
+      ])
+      await Promise.all([
+        writeFile(beforePath, before, 'utf8'),
+        writeFile(afterPath, after, 'utf8')
+      ])
+
+      let output = ''
+      try {
+        const result = await execFileAsync('git', [
+          'diff', '--no-index', '--no-color', '--no-ext-diff', '--text', '--unified=3', '--',
+          relative(tempRoot, beforePath), relative(tempRoot, afterPath)
+        ], {
+          cwd: tempRoot,
+          timeout: EDIT_DIFF_TIMEOUT_MS,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          encoding: 'buffer'
+        }) as unknown as { stdout: Buffer }
+        output = this.decodeCommandOutput(result.stdout)
+      } catch (error) {
+        // git diff --no-index returns 1 when it successfully finds changes.
+        if (this.commandExitCode(error) !== '1') return undefined
+        const stdout = typeof error === 'object' && error !== null && 'stdout' in error ? error.stdout : undefined
+        output = Buffer.isBuffer(stdout) ? this.decodeCommandOutput(stdout) : typeof stdout === 'string' ? stdout : ''
+      }
+
+      const normalized = output
+        .replaceAll('a/before/', 'a/')
+        .replaceAll('b/after/', 'b/')
+        .trim()
+      if (!normalized) return undefined
+      if (normalized.length <= MAX_EDIT_DIFF_CHARACTERS) return normalized
+      return normalized.slice(0, 16_000) + '\n...差异内容过长，已截断...\n' + normalized.slice(-4_000)
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
+    }
   }
 
   private assertWorkspacePath(target: string): void {
@@ -422,7 +607,10 @@ export class WorkspaceTools {
         if (!currentStat.isDirectory()) throw new Error('目录路径中包含同名文件：' + this.displayPath(currentPath))
       } catch (error) {
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-          await mkdir(currentPath)
+          // Multiple independent write_file calls may create the same parent
+          // directory concurrently. Recursive mkdir is idempotent for an
+          // already-created directory and avoids a false EEXIST failure.
+          await mkdir(currentPath, { recursive: true })
           continue
         }
         throw error

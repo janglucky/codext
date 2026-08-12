@@ -44,7 +44,7 @@ type ArgumentNormalization = {
   normalizedFields: string[]
 }
 
-const PATH_INFERENCE_TOOLS = new Set<ToolName>(['read_file', 'parse_word', 'parse_excel', 'parse_powerpoint'])
+const PATH_INFERENCE_TOOLS = new Set<ToolName>(['read_file', 'edit_file', 'parse_word', 'parse_excel', 'parse_powerpoint'])
 const PATH_EXTENSIONS: Partial<Record<ToolName, Set<string>>> = {
   parse_word: new Set(['docx']),
   parse_excel: new Set(['xlsx']),
@@ -72,16 +72,19 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
     ? functionValue as Record<string, unknown>
     : raw
   const rawName = typeof source.name === 'string' ? source.name : ''
+  const rawId = raw.id ?? source.id
+  const id = typeof rawId === 'string' && rawId.trim() ? rawId.trim() : undefined
+  const rawArguments = source.arguments ?? source.parameters ?? source.input ?? source.action_input
+  const dependsOn = normalizeDependencies(raw.depends_on ?? raw.dependsOn ?? raw.after ?? source.depends_on ?? source.dependsOn ?? source.after ?? dependencyValue(rawArguments))
   const normalizedName = normalizeToolName(rawName)
   if (!isToolName(normalizedName)) {
-    const executableCall = normalizeExecutableToolAlias(rawName, normalizedName, source.arguments ?? source.parameters ?? source.input ?? source.action_input)
+    const executableCall = normalizeExecutableToolAlias(rawName, normalizedName, rawArguments, id, dependsOn)
     if (executableCall) return executableCall
     return { issue: createIssue('UNKNOWN_TOOL', rawName || undefined, value), normalizedFields: [] }
   }
 
-  const rawArguments = source.arguments ?? source.parameters ?? source.input ?? source.action_input
   const normalized = normalizeArgumentsDetailed(rawArguments)
-  const partialCall: ToolCall = { name: normalizedName, arguments: normalized.arguments ?? {} }
+  const partialCall: ToolCall = { id, dependsOn, name: normalizedName, arguments: normalized.arguments ?? {} }
   if (normalized.issueType) {
     return {
       issue: createIssue(normalized.issueType, normalizedName, rawArguments, {
@@ -94,11 +97,11 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
   return { call: partialCall, normalizedFields: normalized.normalizedFields }
 }
 
-function normalizeExecutableToolAlias(rawName: string, normalizedName: string, rawArguments: unknown): ToolCallNormalization | undefined {
+function normalizeExecutableToolAlias(rawName: string, normalizedName: string, rawArguments: unknown, id?: string, dependsOn?: string[]): ToolCallNormalization | undefined {
   if (!EXECUTABLE_TOOL_ALIASES.has(normalizedName)) return undefined
   const normalized = normalizeArgumentsDetailed(rawArguments)
   if (normalized.issueType) {
-    const partialCall: ToolCall = { name: 'run_command', arguments: { command: rawName.trim(), args: [] } }
+    const partialCall: ToolCall = { id, dependsOn, name: 'run_command', arguments: { command: rawName.trim(), args: [] } }
     return {
       issue: createIssue(normalized.issueType, 'run_command', rawArguments, { invalid: normalized.invalid, partialCall }),
       normalizedFields: ['工具 ' + rawName + ' → run_command', ...normalized.normalizedFields]
@@ -108,7 +111,7 @@ function normalizeExecutableToolAlias(rawName: string, normalizedName: string, r
   const args = [...(executableArguments.args ?? [])]
   if (executableArguments.command) args.unshift(executableArguments.command)
   return {
-    call: { name: 'run_command', arguments: { command: rawName.trim(), args } },
+    call: { id, dependsOn, name: 'run_command', arguments: { command: rawName.trim(), args } },
     normalizedFields: ['工具 ' + rawName + ' → run_command', ...normalized.normalizedFields]
   }
 }
@@ -119,6 +122,7 @@ export function normalizeToolArguments(value: unknown): ToolArguments | undefine
 }
 
 export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolCallPreparation {
+  let toolName = call.name
   const args: ToolArguments = { ...call.arguments }
   const adjustments: string[] = []
 
@@ -136,19 +140,43 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
     args.args = []
     adjustments.push('args 使用默认空数组')
   }
+  if ((toolName === 'run_command' || toolName === 'start_service') && nonEmptyString(args.command)) {
+    const normalizedLaunch = normalizeInlineElectronLaunch(args.command, args.args ?? [])
+    if (normalizedLaunch) {
+      args.command = normalizedLaunch.command
+      args.args = normalizedLaunch.args
+      adjustments.push('已规范化 Electron 启动命令')
+    }
+  }
+  if ((toolName === 'run_command' || toolName === 'start_service') && nonEmptyString(args.command) && shouldRunDesktopAppInBackground(args.command, args.args ?? [], context.currentRequest)) {
+    if (toolName === 'start_service') {
+      toolName = 'run_command'
+      adjustments.push('桌面应用改用后台命令启动')
+    }
+    if (args.background !== true) {
+      args.background = true
+      adjustments.push('检测到桌面应用启动，使用后台模式')
+    }
+    if (process.platform === 'linux' && isElectronLaunch(args.command, args.args ?? []) && !(args.args ?? []).includes('--no-sandbox')) {
+      const electronArgumentIndex = /^(?:npx|pnpx)$/i.test(args.command) ? 1 : 0
+      args.args = [...(args.args ?? [])]
+      args.args.splice(electronArgumentIndex, 0, '--no-sandbox')
+      adjustments.push('Linux Electron 启动使用 --no-sandbox')
+    }
+  }
 
-  const required = requiredArguments(call.name)
+  const required = requiredArguments(toolName)
   let missing = required.filter((field) => !hasRequiredValue(args, field))
   if (missing.includes('path')) {
-    const candidates = collectPathCandidates(context, call.name)
-    if (PATH_INFERENCE_TOOLS.has(call.name) && candidates.length === 1) {
+    const candidates = collectPathCandidates(context, toolName)
+    if (PATH_INFERENCE_TOOLS.has(toolName) && candidates.length === 1) {
       args.path = candidates[0]
       missing = missing.filter((field) => field !== 'path')
       adjustments.push('path 从当前任务唯一候选补全为 ' + candidates[0])
     } else if (candidates.length > 1) {
-      const partialCall = { name: call.name, arguments: args }
+      const partialCall = { name: toolName, arguments: args }
       return {
-        issue: createIssue('ARGUMENT_AMBIGUOUS', call.name, call.arguments, {
+        issue: createIssue('ARGUMENT_AMBIGUOUS', toolName, call.arguments, {
           missing,
           candidates,
           partialCall
@@ -159,10 +187,10 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
   }
 
   if (missing.length) {
-    const candidates = missing.includes('path') ? collectPathCandidates(context, call.name) : []
-    const partialCall = { name: call.name, arguments: args }
+    const candidates = missing.includes('path') ? collectPathCandidates(context, toolName) : []
+    const partialCall = { name: toolName, arguments: args }
     return {
-      issue: createIssue('ARGUMENT_MISSING', call.name, call.arguments, {
+      issue: createIssue('ARGUMENT_MISSING', toolName, call.arguments, {
         missing,
         candidates,
         partialCall
@@ -171,7 +199,62 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
     }
   }
 
-  return { call: { name: call.name, arguments: args }, adjustments }
+  return { call: { id: call.id, dependsOn: call.dependsOn, name: toolName, arguments: args }, adjustments }
+}
+
+function normalizeInlineElectronLaunch(command: string, args: string[]): { command: string; args: string[] } | undefined {
+  if (args.length || !/\s/.test(command.trim())) return undefined
+  let value = command.trim()
+  let disableSandbox = false
+  const environmentPrefix = /^(?:env\s+)?ELECTRON_DISABLE_SANDBOX=(?:1|true)\s+/i
+  if (environmentPrefix.test(value)) {
+    disableSandbox = true
+    value = value.replace(environmentPrefix, '')
+  }
+  if (/[;&|`$<>\r\n]/.test(value)) return undefined
+  const tokens = splitSafeCommandLine(value)
+  if (!tokens.length) return undefined
+  const executable = tokens[0].replaceAll('\\', '/').split('/').at(-1)?.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '') ?? ''
+  const executableIsElectron = executable === 'electron'
+  const packageRunner = /^(?:npx|pnpx)$/.test(executable) && tokens[1]?.toLowerCase() === 'electron'
+  if (!executableIsElectron && !packageRunner) return undefined
+
+  const normalizedArgs = tokens.slice(1)
+  if (disableSandbox && !normalizedArgs.includes('--no-sandbox')) {
+    normalizedArgs.splice(packageRunner ? 1 : 0, 0, '--no-sandbox')
+  }
+  return { command: tokens[0], args: normalizedArgs }
+}
+
+function splitSafeCommandLine(value: string): string[] {
+  return value.match(/"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|\S+/g)
+    ?.map((item) => item.replace(/^['"]|['"]$/g, '')) ?? []
+}
+
+function shouldRunDesktopAppInBackground(command: string, args: string[], currentRequest: string): boolean {
+  const executable = command.trim().replaceAll('\\', '/').split('/').at(-1)?.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '') ?? ''
+  const commandLine = [command, ...args].join(' ').replaceAll('\\', '/').toLowerCase()
+  const finiteElectronOperation = /(?:^|\s)(?:electron-builder|electron-packager)(?:\s|$)|(?:^|\s)(?:--version|-v|install|add|build|pack|package|test|lint|check)(?:\s|$)/i.test(commandLine)
+  if (finiteElectronOperation) return false
+
+  const directElectronLaunch = executable === 'electron' || /(?:^|[\s"'])[^\s"']*electron\/dist\/electron(?:\s|["']|$)/i.test(commandLine)
+  const packageElectronLaunch = /^(?:npx|pnpx)$/.test(executable) && /^electron(?:\s|$)/i.test(args.join(' ')) ||
+    /^(?:npm|pnpm|yarn|yarnpkg)$/.test(executable) && args.some((arg) => /^(?:electron(?::|-)?(?:dev|start)?|dev:electron)$/i.test(arg))
+  if (directElectronLaunch || packageElectronLaunch || /(?:^|[\s"'])electron(?:\s+\.|\s+--no-sandbox|["']|$)/i.test(commandLine)) return true
+
+  const desktopIntent = /electron|桌面(?:应用|客户端|app)|客户端窗口|desktop\s+(?:app|client)/i.test(currentRequest)
+  if (!desktopIntent) return false
+  if (/^(?:npm|pnpm|yarn|yarnpkg)$/.test(executable)) {
+    const operation = args[0]?.toLowerCase()
+    return operation === 'start' || operation === 'dev' || operation === 'run' && /^(?:dev|start|electron(?::|-)?dev)$/i.test(args[1] ?? '')
+  }
+  return false
+}
+
+function isElectronLaunch(command: string, args: string[]): boolean {
+  const executable = command.trim().replaceAll('\\', '/').split('/').at(-1)?.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '') ?? ''
+  if (executable === 'electron' || /electron\/dist\/electron$/.test(command.replaceAll('\\', '/').toLowerCase())) return true
+  return /^(?:npx|pnpx)$/.test(executable) && args[0]?.toLowerCase() === 'electron'
 }
 
 export function asStreamAssemblyIssue(issue: ToolCallIssue): ToolCallIssue {
@@ -247,8 +330,12 @@ function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
   const normalizedFields: string[] = []
   const path = readAlias(source, 'path', ['file_path', 'filePath', 'filepath', 'file', 'directory', 'dir', 'target_path', 'targetPath'])
   const content = readAlias(source, 'content', ['text', 'data', 'file_content', 'fileContent'])
+  const oldText = readAlias(source, 'old_text', ['oldText', 'search', 'find', 'target'])
+  const newText = readAlias(source, 'new_text', ['newText', 'replacement', 'replace'])
+  const replaceAll = readAlias(source, 'replace_all', ['replaceAll'])
   const command = readAlias(source, 'command', ['cmd', 'executable', 'program'])
   const commandArgs = readAlias(source, 'args', ['argv', 'parameters', 'command_args', 'commandArgs'])
+  const background = readAlias(source, 'background', ['detached', 'run_in_background', 'runInBackground'])
   const recursive = readAlias(source, 'recursive', ['recurse'])
   const outputPath = readAlias(source, 'output_path', ['outputPath'])
   const maxCharacters = readAlias(source, 'max_characters', ['maxCharacters'])
@@ -256,6 +343,8 @@ function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
 
   assignString(args, 'path', path, invalid, normalizedFields)
   assignString(args, 'content', content, invalid, normalizedFields, false)
+  assignString(args, 'old_text', oldText, invalid, normalizedFields, false)
+  assignString(args, 'new_text', newText, invalid, normalizedFields, false)
   assignString(args, 'command', command, invalid, normalizedFields)
   assignString(args, 'output_path', outputPath, invalid, normalizedFields)
 
@@ -270,6 +359,18 @@ function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
     if (normalized === undefined) invalid.push('recursive')
     else args.recursive = normalized
     if (recursive.alias) normalizedFields.push(recursive.alias + ' → recursive')
+  }
+  if (background.found) {
+    const normalized = normalizeBoolean(background.value)
+    if (normalized === undefined) invalid.push('background')
+    else args.background = normalized
+    if (background.alias) normalizedFields.push(background.alias + ' → background')
+  }
+  if (replaceAll.found) {
+    const normalized = normalizeBoolean(replaceAll.value)
+    if (normalized === undefined) invalid.push('replace_all')
+    else args.replace_all = normalized
+    if (replaceAll.alias) normalizedFields.push(replaceAll.alias + ' → replace_all')
   }
   if (includeNotes.found) {
     const normalized = normalizeBoolean(includeNotes.value)
@@ -298,7 +399,7 @@ function readAlias(source: Record<string, unknown>, canonical: string, aliases: 
   return alias ? { found: true, value: source[alias], alias } : { found: false }
 }
 
-function assignString(args: ToolArguments, key: 'path' | 'content' | 'command' | 'output_path', source: { found: boolean; value?: unknown; alias?: string }, invalid: string[], normalizedFields: string[], trim = true): void {
+function assignString(args: ToolArguments, key: 'path' | 'content' | 'old_text' | 'new_text' | 'command' | 'output_path', source: { found: boolean; value?: unknown; alias?: string }, invalid: string[], normalizedFields: string[], trim = true): void {
   if (!source.found) return
   if (typeof source.value !== 'string') {
     invalid.push(key)
@@ -317,6 +418,18 @@ function normalizeStringArray(value: unknown): string[] | undefined {
   } catch {
     return undefined
   }
+}
+
+function dependencyValue(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const source = value as Record<string, unknown>
+  return source.depends_on ?? source.dependsOn ?? source.after
+}
+
+function normalizeDependencies(value: unknown): string[] | undefined {
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
+  const normalized = [...new Set(values.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean))]
+  return normalized.length ? normalized : undefined
 }
 
 function normalizeBoolean(value: unknown): boolean | undefined {
@@ -338,7 +451,8 @@ function requiredArguments(name: ToolName): string[] {
 
 function hasRequiredValue(args: ToolArguments, field: string): boolean {
   const value = (args as Record<string, unknown>)[field]
-  if (field === 'content') return typeof value === 'string'
+  if (field === 'content' || field === 'new_text') return typeof value === 'string'
+  if (field === 'old_text') return typeof value === 'string' && value.length > 0
   return typeof value === 'string' ? Boolean(value.trim()) : value !== undefined && value !== null
 }
 

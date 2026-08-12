@@ -27,11 +27,12 @@ describe('CommandApprovalManager', () => {
       args: ['install'],
       displayCommand: 'npm install',
       reason: '可能安装依赖。',
+      background: true,
       workspacePath: 'D:/work/codext'
     })
     const request = target.sent[0]
 
-    expect(request).toMatchObject({ command: 'npm', args: ['install'] })
+    expect(request).toMatchObject({ command: 'npm', args: ['install'], background: true })
     expect(manager.respond(99, request.id, true)).toBe(false)
     expect(manager.respond(target.id, request.id, true)).toBe(true)
     await expect(approval).resolves.toBe(true)

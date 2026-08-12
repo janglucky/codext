@@ -27,6 +27,20 @@ describe('tool call recovery', () => {
       .toEqual({ name: 'run_command', arguments: { command: 'npm', args: ['run', 'build'] } })
   })
 
+  it('normalizes aliases for background command execution', () => {
+    const normalized = normalizeRawToolCall({
+      name: 'run-command',
+      arguments: { cmd: 'npm', argv: ['run', 'electron:dev'], runInBackground: 'true' }
+    })
+
+    expect(normalized.issue).toBeUndefined()
+    expect(normalized.call).toEqual({
+      name: 'run_command',
+      arguments: { command: 'npm', args: ['run', 'electron:dev'], background: true }
+    })
+    expect(normalized.normalizedFields).toEqual(expect.arrayContaining(['runInBackground → background']))
+  })
+
   it('keeps unrelated unknown tool names as repairable issues', () => {
     expect(normalizeRawToolCall({ name: 'search_the_web', arguments: { args: ['query'] } }).issue)
       .toMatchObject({ type: 'UNKNOWN_TOOL', toolName: 'search_the_web' })
@@ -51,6 +65,69 @@ describe('tool call recovery', () => {
 
     expect(listing.call).toEqual({ name: 'list_files', arguments: { path: '.', recursive: false } })
     expect(command.call).toEqual({ name: 'run_command', arguments: { command: 'git', args: [] } })
+  })
+
+  it('forces Electron desktop launches into background mode', () => {
+    const direct = prepareToolCall({
+      name: 'run_command',
+      arguments: { command: 'npx', args: ['electron', '.'] }
+    }, { currentRequest: '启动这个桌面客户端' })
+    const wrapped = prepareToolCall({
+      name: 'run_command',
+      arguments: { command: 'bash', args: ['-c', 'ELECTRON_DISABLE_SANDBOX=1 node_modules/electron/dist/electron .'] }
+    }, { currentRequest: '启动 APP' })
+
+    expect(direct.call?.arguments.background).toBe(true)
+    if (process.platform === 'linux') expect(direct.call?.arguments.args).toEqual(['electron', '--no-sandbox', '.'])
+    expect(wrapped.call?.arguments.background).toBe(true)
+    expect(wrapped.adjustments).toContain('检测到桌面应用启动，使用后台模式')
+  })
+
+  it('repairs an inline Electron command and converts start_service to a background run_command', () => {
+    const prepared = prepareToolCall({
+      name: 'start_service',
+      arguments: { command: 'ELECTRON_DISABLE_SANDBOX=1 npx electron .', args: [] }
+    }, { currentRequest: '启动 Electron APP' })
+
+    expect(prepared.call).toEqual({
+      id: undefined,
+      dependsOn: undefined,
+      name: 'run_command',
+      arguments: { command: 'npx', args: ['electron', '--no-sandbox', '.'], background: true }
+    })
+    expect(prepared.adjustments).toEqual(expect.arrayContaining([
+      '已规范化 Electron 启动命令',
+      '桌面应用改用后台命令启动',
+      '检测到桌面应用启动，使用后台模式'
+    ]))
+  })
+
+  it('does not background Electron installation, builds or version checks', () => {
+    const calls = [
+      { command: 'npm', args: ['install', 'electron'] },
+      { command: 'npx', args: ['electron-builder', '--linux'] },
+      { command: 'npx', args: ['electron', '--version'] }
+    ]
+
+    for (const argumentsValue of calls) {
+      const prepared = prepareToolCall({ name: 'run_command', arguments: argumentsValue }, { currentRequest: '检查 Electron 项目' })
+      expect(prepared.call?.arguments.background).not.toBe(true)
+    }
+  })
+
+  it('preserves explicit multi-tool dependencies from Qwen aliases', () => {
+    const normalized = normalizeRawToolCall({
+      id: 'read_after_write',
+      depends_on: ['write_config'],
+      function: { name: 'read_file', arguments: '{"path":"config.json"}' }
+    })
+
+    expect(normalized.call).toEqual({
+      id: 'read_after_write',
+      dependsOn: ['write_config'],
+      name: 'read_file',
+      arguments: { path: 'config.json' }
+    })
   })
 
   it('infers a read-only path only when the current task has one candidate', () => {
@@ -88,6 +165,40 @@ describe('tool call recovery', () => {
 
     expect(prepared.call).toBeUndefined()
     expect(prepared.issue).toMatchObject({ type: 'ARGUMENT_MISSING', missing: ['content'] })
+  })
+
+  it('normalizes edit aliases while preserving exact replacement text', () => {
+    const normalized = normalizeRawToolCall({
+      name: 'edit-file',
+      arguments: { filePath: 'src/app.ts', oldText: '  old value\n', replacement: '  new value\n', replaceAll: 'true' }
+    })
+
+    expect(normalized.issue).toBeUndefined()
+    expect(normalized.call).toEqual({
+      name: 'edit_file',
+      arguments: { path: 'src/app.ts', old_text: '  old value\n', new_text: '  new value\n', replace_all: true }
+    })
+    expect(normalized.normalizedFields).toEqual(expect.arrayContaining([
+      'filePath → path', 'oldText → old_text', 'replacement → new_text', 'replaceAll → replace_all'
+    ]))
+  })
+
+  it('requires non-empty old_text but permits an empty edit replacement', () => {
+    const missingOldText = prepareToolCall(
+      { name: 'edit_file', arguments: { path: 'notes.txt', new_text: '' } },
+      { currentRequest: '删除 notes.txt 中的指定内容' }
+    )
+    const emptyOldText = prepareToolCall(
+      { name: 'edit_file', arguments: { path: 'notes.txt', old_text: '', new_text: '' } },
+      { currentRequest: '删除 notes.txt 中的指定内容' }
+    )
+
+    expect(missingOldText.issue).toMatchObject({ type: 'ARGUMENT_MISSING', missing: ['old_text'] })
+    expect(emptyOldText.issue).toMatchObject({ type: 'ARGUMENT_MISSING', missing: ['old_text'] })
+    expect(prepareToolCall(
+      { name: 'edit_file', arguments: { path: 'notes.txt', old_text: 'remove me', new_text: '' } },
+      { currentRequest: '删除 notes.txt 中的指定内容' }
+    ).call).toEqual({ name: 'edit_file', arguments: { path: 'notes.txt', old_text: 'remove me', new_text: '' } })
   })
 
   it('distinguishes type errors and stream assembly errors', () => {

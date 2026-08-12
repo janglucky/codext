@@ -1,6 +1,6 @@
-export type ToolName = 'read_file' | 'write_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command' | 'start_service'
-export type ToolArguments = { path?: string; content?: string; command?: string; args?: string[]; recursive?: boolean; output_path?: string; max_characters?: number; include_notes?: boolean }
-export type ToolCall = { name: ToolName; arguments: ToolArguments }
+export type ToolName = 'read_file' | 'write_file' | 'edit_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command' | 'start_service'
+export type ToolArguments = { path?: string; content?: string; old_text?: string; new_text?: string; replace_all?: boolean; command?: string; args?: string[]; background?: boolean; recursive?: boolean; output_path?: string; max_characters?: number; include_notes?: boolean }
+export type ToolCall = { id?: string; dependsOn?: string[]; name: ToolName; arguments: ToolArguments }
 
 export interface ToolDefinition {
   name: ToolName
@@ -35,6 +35,22 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
       }
     },
     example: { name: 'write_file', arguments: { path: 'notes/todo.txt', content: 'hello' } }
+  },
+  edit_file: {
+    name: 'edit_file',
+    description: '精确替换工作区内现有文本文件的一段内容，不会创建新文件或覆盖整个文件。',
+    whenToUse: '已读取目标文件且只需局部修改时调用。old_text 必须与文件内容完全一致；默认要求它只出现一次，多处匹配时必须明确设置 replace_all 为 true。',
+    inputSchema: {
+      type: 'object',
+      required: ['path', 'old_text', 'new_text'],
+      properties: {
+        path: { type: 'string', description: '现有文本文件的工作区相对路径。' },
+        old_text: { type: 'string', minLength: 1, description: '要替换的原始文本，必须与文件内容完全一致且不能为空。' },
+        new_text: { type: 'string', description: '替换后的文本；传空字符串表示删除 old_text。' },
+        replace_all: { type: 'boolean', default: false, description: '是否替换所有匹配；默认 false，多处匹配时拒绝执行。' }
+      }
+    },
+    example: { name: 'edit_file', arguments: { path: 'src/app.ts', old_text: 'const port = 3000', new_text: 'const port = 5173', replace_all: false } }
   },
   create_directory: {
     name: 'create_directory',
@@ -119,14 +135,15 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
   },
   run_command: {
     name: 'run_command',
-    description: '执行命令行程序并返回 stdout/stderr。每次执行都必须由用户在交互界面单次确认；高风险命令会显示强化警告并由用户决定。',
-    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。包括只读查询和重启、终止进程等高风险操作在内的所有命令都必须等待用户确认；用户明确要求命令时应输出 Action，由宿主交互决定是否执行。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。',
+    description: '执行命令行程序并返回 stdout/stderr；设置 background=true 时在进程成功创建后立即返回 PID。每次执行都必须由用户在交互界面单次确认；高风险命令会显示强化警告并由用户决定。',
+    whenToUse: '需要查看本地或 SSH 远程信息、运行测试、构建或执行工程命令时调用。启动 Electron 或其他桌面程序时设置 background=true；只有需要识别 HTTP 地址的 Web 服务才使用 start_service。包括只读查询和重启、终止进程等高风险操作在内的所有命令都必须等待用户确认；用户明确要求命令时应输出 Action，由宿主交互决定是否执行。创建 Node 项目前先检查 node --version，并选择与当前 Node 引擎兼容的依赖版本；EBADENGINE 后应修正 package.json，不能原样重复安装。禁止用它调用 Python、PowerShell、tar、unzip 或临时脚本解析 Office 文件；Office 必须使用专用解析工具。',
     inputSchema: {
       type: 'object',
       required: ['command'],
       properties: {
         command: { type: 'string', description: '可执行文件名，例如 npm、node、git。调用 Node 包管理器时固定传 npm 或 npx，不要传 npm.cmd、npm。cmd 等 Windows 启动名，宿主会自动解析。不要传整段 shell 字符串。' },
-        args: { type: 'array', items: { type: 'string' }, description: '命令参数数组，例如 ["run", "build"]。' }
+        args: { type: 'array', items: { type: 'string' }, description: '命令参数数组，例如 ["run", "build"]。' },
+        background: { type: 'boolean', default: false, description: '是否在后台启动并在创建进程后立即返回。启动桌面程序时设为 true；测试和构建保持 false。' }
       }
     },
     example: { name: 'run_command', arguments: { command: 'npm', args: ['run', 'build'] } }

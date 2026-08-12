@@ -49,13 +49,79 @@ describe('WorkspaceTools directories and listing', () => {
 
 describe('tool registry', () => {
   it('registers workspace and service tools', () => {
-    const names = ['create_directory', 'list_files', 'decrypt_file', 'start_service']
+    const names = ['edit_file', 'create_directory', 'list_files', 'decrypt_file', 'start_service']
     expect(names.every(isToolName)).toBe(true)
     expect(getEnabledToolDefinitions(names).map((tool) => tool.name)).toEqual(names)
   })
 })
 
+describe('WorkspaceTools.writeFile', () => {
+  it('returns a full added-lines diff for a new file', async () => {
+    const result = JSON.parse(await workspaceTools.writeFile('new.ts', 'const first = 1\nconst second = 2\n')) as { path: string; created: boolean; diff?: string }
+
+    expect(normalizePath(result.path)).toBe('new.ts')
+    expect(result.created).toBe(true)
+    expect(result.diff).toContain('diff --git a/new.ts b/new.ts')
+    expect(result.diff).toContain('+const first = 1')
+    expect(result.diff).toContain('+const second = 2')
+  })
+
+  it('returns the actual diff when overwriting an existing file', async () => {
+    await writeFile(join(workspacePath, 'existing.ts'), 'const port = 3000\n', 'utf8')
+
+    const result = JSON.parse(await workspaceTools.writeFile('existing.ts', 'const port = 5173\n')) as { created: boolean; diff?: string }
+
+    expect(result.created).toBe(false)
+    expect(result.diff).toContain('-const port = 3000')
+    expect(result.diff).toContain('+const port = 5173')
+  })
+})
+
+describe('WorkspaceTools.editFile', () => {
+  it('replaces one exact occurrence in an existing file', async () => {
+    await writeFile(join(workspacePath, 'app.ts'), 'const port = 3000\nstart(port)\n', 'utf8')
+
+    const result = JSON.parse(await workspaceTools.editFile('app.ts', 'const port = 3000', 'const port = 5173')) as { path: string; replacements: number; diff?: string }
+
+    expect(normalizePath(result.path)).toBe('app.ts')
+    expect(result.replacements).toBe(1)
+    expect(result.diff).toContain('diff --git a/app.ts b/app.ts')
+    expect(result.diff).toContain('-const port = 3000')
+    expect(result.diff).toContain('+const port = 5173')
+    expect(await readFile(join(workspacePath, 'app.ts'), 'utf8')).toBe('const port = 5173\nstart(port)\n')
+  })
+
+  it('rejects ambiguous matches unless replace_all is explicitly enabled', async () => {
+    const target = join(workspacePath, 'repeated.txt')
+    await writeFile(target, 'before before before', 'utf8')
+
+    await expect(workspaceTools.editFile('repeated.txt', 'before', 'after')).rejects.toThrow('匹配 3 处')
+    expect(await readFile(target, 'utf8')).toBe('before before before')
+
+    const result = JSON.parse(await workspaceTools.editFile('repeated.txt', 'before', 'after', true)) as { replacements: number }
+    expect(result.replacements).toBe(3)
+    expect(await readFile(target, 'utf8')).toBe('after after after')
+  })
+
+  it('supports deletion and rejects missing text, files and unsafe paths', async () => {
+    await writeFile(join(workspacePath, 'notes.txt'), 'keep\nremove me\n', 'utf8')
+
+    await expect(workspaceTools.editFile('notes.txt', '', 'value')).rejects.toThrow('不能为空')
+    await expect(workspaceTools.editFile('notes.txt', 'not present', 'value')).rejects.toThrow('未在文件中找到')
+    await expect(workspaceTools.editFile('missing.txt', 'old', 'new')).rejects.toThrow()
+    await expect(workspaceTools.editFile('../outside.txt', 'old', 'new')).rejects.toThrow('工作区')
+
+    await workspaceTools.editFile('notes.txt', 'remove me\n', '')
+    expect(await readFile(join(workspacePath, 'notes.txt'), 'utf8')).toBe('keep\n')
+  })
+})
+
 describe('WorkspaceTools.startService', () => {
+  it('reports a missing executable without an uncaught child-process error', async () => {
+    await expect(workspaceTools.startService('codext-command-that-does-not-exist-' + Date.now()))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('returns the service URL while leaving the server available', async () => {
     const script = "const http=require('node:http');const server=http.createServer((_request,response)=>response.end('ready'));server.listen(0,'127.0.0.1',()=>console.log('http://127.0.0.1:'+server.address().port))"
 
@@ -72,6 +138,14 @@ describe('WorkspaceTools.startService', () => {
     await expect(workspaceTools.startService(process.execPath, ['-e', script]))
       .rejects.toThrow('startup diagnostic')
   })
+
+  it('ignores documentation links and waits for a local service URL', async () => {
+    const script = "const http=require('node:http');console.log('See https://rollupjs.org/configuration-options/#output-manualchunks');setTimeout(()=>{const server=http.createServer((_request,response)=>response.end('ready'));server.listen(0,'127.0.0.1',()=>console.log('http://127.0.0.1:'+server.address().port))},100)"
+
+    const result = JSON.parse(await workspaceTools.startService(process.execPath, ['-e', script])) as { url: string }
+
+    expect(result.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/)
+  })
 })
 
 describe('WorkspaceTools.runCommand', () => {
@@ -85,6 +159,48 @@ describe('WorkspaceTools.runCommand', () => {
   it('includes stderr when a command exits unsuccessfully', async () => {
     await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stderr.write('diagnostic stderr'); process.exit(2)"], undefined, true))
       .rejects.toThrow('diagnostic stderr')
+  })
+
+  it('returns a PID without waiting for a background process to exit', async () => {
+    const startedAt = Date.now()
+    const result = JSON.parse(await workspaceTools.runCommand(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      undefined,
+      true,
+      false,
+      true
+    )) as { ok: boolean; background: boolean; pid: number }
+
+    try {
+      expect(result).toMatchObject({ ok: true, background: true, verified: true, pid: expect.any(Number) })
+      expect(Date.now() - startedAt).toBeLessThan(5000)
+      expect(() => process.kill(result.pid, 0)).not.toThrow()
+    } finally {
+      try { process.kill(result.pid) } catch { /* 进程可能已自行退出。 */ }
+    }
+  })
+
+  it('reports a background process that exits during startup', async () => {
+    await expect(workspaceTools.runCommand(
+      process.execPath,
+      ['-e', 'process.exit(3)'],
+      undefined,
+      true,
+      false,
+      true
+    )).rejects.toThrow('启动确认前退出')
+  })
+
+  it('includes background startup logs when the process exits early', async () => {
+    await expect(workspaceTools.runCommand(
+      process.execPath,
+      ['-e', "process.stderr.write('desktop startup failed\\n'); process.exit(4)"],
+      undefined,
+      true,
+      false,
+      true
+    )).rejects.toThrow('desktop startup failed')
   })
 
   it.runIf(process.platform === 'win32')('resolves npm to its Windows command wrapper', async () => {

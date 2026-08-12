@@ -4,7 +4,16 @@ export type ContextContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string; detail: 'auto' } }
 export type ContextContent = string | ContextContentPart[]
-export type ContextMessage = { role: 'system' | 'user' | 'assistant'; content: ContextContent }
+export type ContextMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: ContextContent
+  tool_call_id?: string
+  tool_calls?: Array<{
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+  }>
+}
 
 export interface ContextCompressionResult {
   messages: ContextMessage[]
@@ -71,12 +80,18 @@ function estimateTextTokens(text: string): number {
 }
 
 function removeNoiseAndDuplicates(messages: ContextMessage[]): ContextMessage[] {
-  const protectedStart = Math.max(1, messages.length - RECENT_MESSAGES_TO_KEEP)
+  const protectedStart = recentMessageStart(messages)
   const seen = new Set<string>()
   const retained: ContextMessage[] = []
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
     const text = contentText(message.content).trim()
+    // Native function-calling messages form a protocol pair. Keep both sides
+    // intact at level 1; later summary levels may replace the entire old pair.
+    if (message.role === 'tool' || message.tool_calls?.length) {
+      retained.push(message)
+      continue
+    }
     if (index === 0 || index >= protectedStart) {
       retained.push(message)
       if (text) seen.add(message.role + '\n' + text)
@@ -93,7 +108,7 @@ function removeNoiseAndDuplicates(messages: ContextMessage[]): ContextMessage[] 
 
 function summarizeHistoricalMessages(messages: ContextMessage[], targetTokens: number): ContextMessage[] {
   if (messages.length <= RECENT_MESSAGES_TO_KEEP + 1) return messages
-  const recentStart = Math.max(1, messages.length - RECENT_MESSAGES_TO_KEEP)
+  const recentStart = recentMessageStart(messages)
   const historical = messages.slice(1, recentStart)
   if (!historical.length) return messages
 
@@ -113,13 +128,13 @@ function buildStructuredSummary(messages: ContextMessage[], tokenBudget: number)
   for (const message of messages) {
     const text = cleanHistoricalText(contentText(message.content))
     if (!text) continue
-    if (message.role === 'user' && !isToolMessage(text)) {
+    if (message.role === 'user' && !isToolMessage(message, text)) {
       const requirementLines = selectRelevantLines(text, REQUIREMENT_PATTERN, 4)
       requirements.push(...(requirementLines.length ? requirementLines : [compactText(text, 500)]))
-    } else if (message.role === 'assistant' && !isToolMessage(text)) {
+    } else if (message.role === 'assistant' && !isToolMessage(message, text)) {
       outcomes.push(compactText(text, 500))
     }
-    if (isToolMessage(text)) {
+    if (isToolMessage(message, text)) {
       const paths = [...new Set(text.match(PATH_PATTERN) ?? [])].slice(0, 8)
       const status = selectRelevantLines(text, ERROR_PATTERN, 4)
       toolsAndFiles.push(compactText([paths.length ? '路径：' + paths.join('、') : '', ...status].filter(Boolean).join('\n') || text, 700))
@@ -142,10 +157,10 @@ function buildStructuredSummary(messages: ContextMessage[], tokenBudget: number)
 }
 
 function compactOlderToolResults(messages: ContextMessage[]): ContextMessage[] {
-  const latestObservationIndex = messages.findLastIndex((message) => isObservation(contentText(message.content)))
+  const latestObservationIndex = messages.findLastIndex((message) => message.role === 'tool' || isObservation(contentText(message.content)))
   return messages.map((message, index) => {
     const text = contentText(message.content)
-    if (index === latestObservationIndex || !isObservation(text) || estimateTextTokens(text) <= 2200) return message
+    if (index === latestObservationIndex || (message.role !== 'tool' && !isObservation(text)) || estimateTextTokens(text) <= 2200) return message
     const errors = selectRelevantLines(text, ERROR_PATTERN, 8)
     const paths = [...new Set(text.match(PATH_PATTERN) ?? [])].slice(0, 12)
     const compacted = [
@@ -174,10 +189,18 @@ function findEssentialMessageIndexes(messages: ContextMessage[]): Set<number> {
   const lastIndex = messages.length - 1
   if (lastIndex > 0) indexes.add(lastIndex)
 
-  const latestObservationIndex = messages.findLastIndex((message) => isObservation(contentText(message.content)))
+  const latestObservationIndex = messages.findLastIndex((message) => message.role === 'tool' || isObservation(contentText(message.content)))
   if (latestObservationIndex > 0) {
     indexes.add(latestObservationIndex)
     if (latestObservationIndex > 1 && messages[latestObservationIndex - 1].role === 'assistant') indexes.add(latestObservationIndex - 1)
+  }
+
+
+  const latestToolResultIndex = messages.findLastIndex((message) => message.role === 'tool')
+  if (latestToolResultIndex > 0) {
+    for (let index = latestToolResultIndex; index > 0 && messages[index].role === 'tool'; index--) indexes.add(index)
+    const assistantIndex = [...indexes].filter((index) => messages[index]?.role === 'tool').sort((left, right) => left - right)[0] - 1
+    if (assistantIndex > 0 && messages[assistantIndex].role === 'assistant' && messages[assistantIndex].tool_calls?.length) indexes.add(assistantIndex)
   }
 
   for (let index = lastIndex; index > 0; index--) {
@@ -202,12 +225,20 @@ function cleanHistoricalText(text: string): string {
     .trim()
 }
 
-function isToolMessage(text: string): boolean {
-  return isObservation(text) || /"(?:action|tool_calls)"\s*:|正在执行工具|工具执行/i.test(text)
+function isToolMessage(message: ContextMessage, text: string): boolean {
+  return message.role === 'tool' || Boolean(message.tool_calls?.length) || isObservation(text) || /"(?:action|tool_calls)"\s*:|正在执行工具|工具执行/i.test(text)
 }
 
 function isObservation(text: string): boolean {
   return /^Observation #|^UserChoice Observation:/i.test(text.trim())
+}
+
+function recentMessageStart(messages: ContextMessage[]): number {
+  let start = Math.max(1, messages.length - RECENT_MESSAGES_TO_KEEP)
+  if (messages[start]?.role !== 'tool') return start
+  while (start > 1 && messages[start - 1].role === 'tool') start--
+  if (start > 1 && messages[start - 1].role === 'assistant' && messages[start - 1].tool_calls?.length) start--
+  return start
 }
 
 function selectRelevantLines(text: string, pattern: RegExp, limit: number): string[] {

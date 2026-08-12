@@ -19,7 +19,7 @@ export interface AgentDoneEvent { conversationId: string; messageId: string; sta
 export interface AgentRunResult { conversation: Conversation; task: AgentTask }
 export interface McpApprovalDetails { toolName: string; serverUrl: string; path?: string; workspacePath?: string; conversationId?: string }
 export interface McpApprovalRequest extends McpApprovalDetails { id: string; expiresAt: string }
-export interface CommandApprovalDetails { command: string; args: string[]; displayCommand: string; reason: string; riskLevel?: 'read' | 'write' | 'blocked'; workspacePath?: string; conversationId?: string }
+export interface CommandApprovalDetails { command: string; args: string[]; displayCommand: string; reason: string; background?: boolean; riskLevel?: 'read' | 'write' | 'blocked'; workspacePath?: string; conversationId?: string }
 export interface CommandApprovalRequest extends CommandApprovalDetails { id: string; expiresAt: string }
 export interface UserChoiceOption { id: string; label: string; description?: string; workspacePath?: string }
 export interface UserChoiceDetails { title: string; description?: string; options: UserChoiceOption[]; conversationId?: string }

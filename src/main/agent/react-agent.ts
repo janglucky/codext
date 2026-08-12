@@ -8,7 +8,7 @@ import { classifyCommandRisk } from '../tools/command-risk'
 import { modelFetch } from '../model-fetch'
 import { prepareContext, estimateContextTokens, type ContextContent as ModelContent, type ContextContentPart as ModelContentPart, type ContextMessage as ModelMessage } from './context-manager'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from '../../shared/models'
-import { normalizeTechnicalPunctuation } from '../../shared/text'
+import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import {
   applyPathCandidate,
   asStreamAssemblyIssue,
@@ -22,7 +22,10 @@ import {
 import { selectTaskHistory } from './history-selector'
 
 const MAX_REACT_TURNS = 100
-const MAX_ACTIONS_PER_TURN = 1
+// A model may return several independent tool calls in one response. Keep a
+// bounded batch size so a malformed or over-eager model cannot enqueue an
+// unbounded number of local operations in a single ReAct turn.
+const MAX_ACTIONS_PER_TURN = 8
 const MAX_REACT_FORMAT_RETRIES = 2
 const MAX_REPEATED_ACTION_RETRIES = 2
 const MAX_TOOL_ARGUMENT_REPAIRS = 2
@@ -50,13 +53,15 @@ type ReactModelReply = {
   thought?: string
   action?: unknown
   tool_calls?: unknown[]
+  function_call?: unknown
+  tools?: unknown[]
   choice?: UserChoiceDetails
   final?: string
   unparsed?: string
   toolIssue?: ToolCallIssue
 }
 type RawModelUsage = { prompt_tokens?: number; completion_tokens?: number; input_tokens?: number; output_tokens?: number }
-type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean; streamToolCallAssemblyError?: boolean }
+type ModelResponse = { content: string; usage?: RawModelUsage; protocolDrift?: boolean; streamToolCallAssemblyError?: boolean; nativeToolCalls?: boolean }
 type ConversationMessage = {
   role: 'user' | 'assistant'
   content: string
@@ -172,7 +177,7 @@ export class ReactAgent {
       try {
         const requestMessages = focusedModelMessages ?? messages
         focusedModelMessages = undefined
-        modelResponse = await this.callModel(requestMessages, (delta) => stream.push(delta), signal, task, model, onStep)
+        modelResponse = await this.callModel(requestMessages, (delta) => stream.push(delta), signal, task, model, onStep, currentPolicy.enabledTools)
         content = modelResponse.content
       } catch (error) {
         const modelError = error instanceof Error ? error : new Error(String(error))
@@ -190,7 +195,9 @@ export class ReactAgent {
       modelConnectionRecoveryUsed = false
       const reply = this.parseReply(content)
       const assistantMessageIndex = messages.length
-      messages.push({ role: 'assistant', content: modelReplyForHistory(reply, content) })
+      messages.push(modelResponse.nativeToolCalls
+        ? nativeAssistantToolMessage(reply)
+        : { role: 'assistant', content: modelReplyForHistory(reply, content) })
       let toolCalls = this.getToolCalls(reply)
       let toolIssue = reply.toolIssue
       if (toolIssue && modelResponse.streamToolCallAssemblyError) toolIssue = asStreamAssemblyIssue(toolIssue)
@@ -199,7 +206,7 @@ export class ReactAgent {
         if (incompleteToolCallRetries > MAX_INCOMPLETE_ACTION_REPAIRS || turn > this.maxReactTurns) throw new Error('模型工具调用连续被截断，无法生成可执行的完整 Action。')
         messages[messages.length - 1] = { role: 'assistant', content: '[上一条工具调用在 Action JSON 闭合前被截断，未执行。]' }
         this.addStep(task, step('reason', '工具调用响应不完整', 'Action JSON 在传输完成前被截断，正在请求模型缩小内容后重新生成。'), onStep)
-        const repairPrompt = 'ACTION_TRUNCATED：上一条 Action JSON 在结束前被截断，不能执行，也不能把它作为 Final。请立即重新输出一个完整 Action JSON。若 write_file 的 content 较长，必须精简实现，或把 HTML、CSS、JavaScript 拆成多个文件并逐个调用 write_file；单次 content 不得超过 6000 个字符。不要重复发送同样的超长内容。'
+        const repairPrompt = 'ACTION_TRUNCATED：上一条 Action JSON 在结束前被截断，不能执行，也不能把它作为 Final。请立即重新输出一个完整 Action JSON。修改现有文件时优先用 edit_file 精确替换局部内容。若 write_file 的 content 较长，必须精简实现，或把 HTML、CSS、JavaScript 拆成多个文件并逐个调用 write_file；单次 content 不得超过 6000 个字符。不要重复发送同样的超长内容。'
         messages.push({ role: 'user', content: repairPrompt })
         focusedModelMessages = buildFocusedRepairContext(messages[0], toolIntentPrompt, latestObservationText(messages), repairPrompt)
         turn--
@@ -210,6 +217,16 @@ export class ReactAgent {
         ? inferOfficeToolCall(prompt, reply, pendingOfficeParses)
         : undefined
       if (implicitOfficeCall) toolCalls = [implicitOfficeCall]
+      const inferredCommandCall = !toolCalls.length
+        ? inferNarrativeCommandCall(toolIntentPrompt, [reply.final, reply.unparsed, content].filter((value): value is string => typeof value === 'string').join('\n'))
+        : undefined
+      if (inferredCommandCall) {
+        toolCalls = [inferredCommandCall]
+        messages[assistantMessageIndex] = {
+          role: 'assistant',
+          content: JSON.stringify({ thought: '准备执行模型给出的命令。', action: inferredCommandCall })
+        }
+      }
       if (finalizationOnly) {
         const forcedFinal = !toolCalls.length && typeof reply.final === 'string' && !isIncompleteFinal(reply.final)
           ? sanitizeThoughtText(reply.final)
@@ -229,13 +246,25 @@ export class ReactAgent {
       toolCalls = toolCalls.slice(0, MAX_ACTIONS_PER_TURN)
       let argumentAdjustments: string[] = []
       if (!toolIssue && toolCalls.length) {
-        const preparedCall = prepareToolCall(toolCalls[0], {
-          currentRequest: toolIntentPrompt,
-          latestObservation: latestObservationText(messages)
-        })
-        toolIssue = preparedCall.issue
-        argumentAdjustments = preparedCall.adjustments
-        toolCalls = preparedCall.call ? [preparedCall.call] : []
+        const preparedCalls: ToolCall[] = []
+        const latestObservation = latestObservationText(messages)
+        for (const call of toolCalls) {
+          const preparedCall = prepareToolCall(call, {
+            currentRequest: toolIntentPrompt,
+            latestObservation
+          })
+          argumentAdjustments.push(...preparedCall.adjustments)
+          if (preparedCall.issue) {
+            // Do not execute a partial batch. A later call may depend on the
+            // failed call's result, and executing only part of the model's
+            // plan would make the Observation misleading.
+            toolIssue = preparedCall.issue
+            preparedCalls.length = 0
+            break
+          }
+          if (preparedCall.call) preparedCalls.push(preparedCall.call)
+        }
+        toolCalls = preparedCalls
       }
       if (toolIssue) {
         if (toolIssue.signature === previousToolArgumentIssueSignature) repeatedToolArgumentIssueCount++
@@ -328,6 +357,9 @@ export class ReactAgent {
       } else if (implicitOfficeCall) {
         thoughtStep.detail = '检测到需要读取 Office 附件，准备立即调用 ' + implicitOfficeCall.name + '。'
         this.upsertStep(task, thoughtStep, onStep)
+      } else if (inferredCommandCall) {
+        thoughtStep.detail = '检测到模型给出的可执行命令，等待用户确认。'
+        this.upsertStep(task, thoughtStep, onStep)
       }
       if (choiceRequest) {
         const selection = requestUserChoice ? await requestUserChoice(choiceRequest) : undefined
@@ -377,17 +409,19 @@ export class ReactAgent {
       }
       const deniedMcpCall = toolCalls.find((call) => call.name === 'parse_powerpoint' && call.arguments.path && deniedMcpPaths.has(call.arguments.path))
       if (deniedMcpCall) {
+        messages[assistantMessageIndex] = { role: 'assistant', content: '[该工具调用对应的授权此前已被拒绝，未再次执行。]' }
         messages.push({ role: 'user', content: '用户已经拒绝对该文件的 PPT MCP 授权，不得再次请求同一路径。请立即改用其他可用工具或给出不依赖 MCP 的解决思路；如果没有可靠替代方案，如实说明限制并输出 Final。' })
         previousActionSignature = ''
         continue
       }
       const deniedCommandCall = toolCalls.find((call) => (call.name === 'run_command' || call.name === 'start_service') && call.arguments.command && deniedCommandSignatures.has(commandSignature(call.arguments.command, call.arguments.args ?? [])))
       if (deniedCommandCall) {
+        messages[assistantMessageIndex] = { role: 'assistant', content: '[该命令此前已被用户或安全策略拒绝，未再次执行。]' }
         messages.push({ role: 'user', content: '用户或安全策略已经拒绝执行相同命令，不得再次申请。请改用其他工具或安全方案，或如实说明限制并输出 Final。' })
         previousActionSignature = ''
         continue
       }
-      const actionSignature = JSON.stringify(toolCalls)
+      const actionSignature = JSON.stringify(toolCalls.map((call) => ({ name: call.name, arguments: call.arguments, dependsOn: call.dependsOn })))
       if (actionSignature === previousActionSignature) {
         repeatedActionRetries++
         if (repeatedActionRetries > MAX_REPEATED_ACTION_RETRIES) {
@@ -418,7 +452,9 @@ export class ReactAgent {
       previousActionSignature = actionSignature
 
       const observations: string[] = []
-      for (const call of toolCalls.slice(0, MAX_ACTIONS_PER_TURN)) {
+      const callsForTurn = toolCalls.slice(0, MAX_ACTIONS_PER_TURN)
+      const executionPlan = planToolExecution(callsForTurn)
+      const executeOne = async (call: ToolCall): Promise<{ output: string; succeeded: boolean }> => {
         this.addStep(task, step('act', '正在执行工具：' + call.name, this.toolDetail(call)), onStep)
         if (call.name === 'decrypt_file' && call.arguments.path) pendingDecryptPaths.delete(call.arguments.path)
         if ((call.name === 'parse_word' || call.name === 'parse_excel' || call.name === 'parse_powerpoint') && call.arguments.path && pendingOfficeParses.get(call.arguments.path) === call.name) {
@@ -449,13 +485,57 @@ export class ReactAgent {
             output += '\n安全策略已拒绝该命令，不得再次尝试。'
           }
         }
-        const observation = call.name + ': ' + output
-        observations.push(observation)
-        this.addStep(task, step('act', 'Observation #' + turn + '：' + call.name, output.slice(0, 800)), onStep)
+        const succeeded = !/^工具执行失败：/.test(output) && !/用户(?:未授权|拒绝)/.test(output)
+        return { output, succeeded }
       }
 
-      const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n')
-      messages.push({ role: 'user', content: observationText })
+      if (callsForTurn.length > 1) {
+        this.addStep(task, step('reason', '已规划工具执行顺序', formatToolExecutionPlan(executionPlan)), onStep)
+      }
+      const indexedResults = new Array<{ output: string; succeeded: boolean } | undefined>(callsForTurn.length)
+      let stopAfterFailure = false
+      for (const batch of executionPlan) {
+        if (stopAfterFailure) {
+          for (const item of batch.items) indexedResults[item.index] = skippedToolResult()
+          continue
+        }
+        if (batch.mode === 'deferred') {
+          for (const item of batch.items) indexedResults[item.index] = deferredToolResult()
+          continue
+        }
+        const results = batch.mode === 'parallel'
+          ? await Promise.all(batch.items.map((item) => executeOne(item.call)))
+          : [await executeOne(batch.items[0].call)]
+        results.forEach((result, resultIndex) => {
+          indexedResults[batch.items[resultIndex].index] = result
+        })
+        if (results.some((result) => !result.succeeded)) stopAfterFailure = true
+      }
+      indexedResults.forEach((result, index) => {
+        const call = callsForTurn[index]
+        const resolved = result ?? skippedToolResult()
+        observations.push(call.name + ': ' + resolved.output)
+        const visibleOutputLimit = call.name === 'edit_file' || call.name === 'write_file' ? 48_000 : 800
+        this.addStep(task, step('act', 'Observation #' + turn + '：' + call.name, resolved.output.slice(0, visibleOutputLimit)), onStep)
+      })
+      const hasDeferredCalls = executionPlan.some((batch) => batch.mode === 'deferred')
+      const observationText = 'Observation #' + turn + ':\n' + observations.join('\n\n') + (hasDeferredCalls
+        ? '\n\n调度说明：部分调用的参数依赖本轮前置工具的真实输出，因此已延后。请根据以上 Observation 重新生成这些调用，不要继续使用占位符。'
+        : '')
+      const nativeAssistantCalls = messages[assistantMessageIndex].tool_calls
+      const nativeToolResults = modelResponse.nativeToolCalls && nativeAssistantCalls?.length === callsForTurn.length && callsForTurn.every((call, index) => {
+        const nativeCall = nativeAssistantCalls[index]
+        return call.id === nativeCall?.id && call.name === nativeCall.function.name && JSON.stringify(call.arguments) === nativeCall.function.arguments
+      })
+      if (nativeToolResults) {
+        callsForTurn.forEach((call, index) => messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: observationOutput(observations[index], call.name)
+        }))
+      } else {
+        messages.push({ role: 'user', content: observationText })
+      }
       observationsForFallback.push(observationText)
       toolArgumentRepairRetries = 0
       previousToolArgumentIssueSignature = ''
@@ -485,7 +565,17 @@ export class ReactAgent {
     const toolSchema = [
       '{',
       '  "thought": "简短说明下一步及原因",',
-      '  "action": { "name": "read_file|write_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command|start_service", "arguments": { ... } }',
+      '  "action": { "name": "read_file|write_file|edit_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command|start_service", "arguments": { ... } }',
+      '}'
+    ].join('\n')
+
+    const multiToolSchema = [
+      '{',
+      '  "thought": "简短说明这一批工具的共同目的",',
+      '  "tool_calls": [',
+      '    { "id": "read_a", "name": "read_file", "arguments": { "path": "src/a.ts" } },',
+      '    { "id": "read_b", "name": "read_file", "arguments": { "path": "src/b.ts" } }',
+      '  ]',
       '}'
     ].join('\n')
 
@@ -514,7 +604,7 @@ export class ReactAgent {
       policy.systemPrompt,
       '',
       '你必须遵循 ReAct 循环：Thought -> Action -> Observation -> Thought -> ... -> Final。',
-      '输出协议是最高优先级约束：每轮只能输出一个合法 JSON 对象，thought 必须作为 JSON 字符串字段；不要输出 Markdown、代码块、XML 标签、JSON 前后说明或第二个 JSON 对象。',
+      '输出协议是最高优先级约束：优先使用 API 提供的原生 function tools；使用文本协议时，每轮只能输出一个合法 JSON 对象，thought 必须作为 JSON 字符串字段；不要输出 Markdown、代码块、JSON 前后说明或第二个 JSON 对象。',
       'thought 只能是 300 字以内的行动摘要，禁止在 thought 中长篇排查、逐段分析代码或反复自问自答；一旦需要查看文件或运行检查，立即结束 thought 并输出 action。',
       '如果本轮需要工具，思考内容只能描述将要执行的计划和原因，必须使用“准备、将要、需要”等未完成措辞；在工具 Observation 返回前，严禁声称文件已经创建、已经写入、已经修改、已经运行、已经完成或已经确认。',
       '只有收到对应工具的 Observation 后，下一轮 Thought 才能描述该工具确实完成的结果；不得在 Action 之前提前编造工具结果。',
@@ -522,8 +612,12 @@ export class ReactAgent {
       '这里的工具通过文本 Action JSON 协议调用；即使模型 API 的原生 tools 列表为空，也不代表这些工具不可用。禁止声称工具未挂载、无法调用或要求用户重新启用。',
       '当问题需要读取 PowerPoint 内容时，立即输出 parse_powerpoint Action JSON，不要先解释限制。宿主收到该 Action 后会在当前会话向用户请求单次 MCP 授权；授权通过后继续调用，授权拒绝后不得重复申请同一路径，必须考虑其他工具或如实给出替代方案。',
       '禁止使用 run_command 调用 python、PowerShell、tar、unzip 或临时脚本来拆解 Word、Excel、PowerPoint 文件。Office 内容只能使用对应 parse_word、parse_excel、parse_powerpoint 工具；解析失败且疑似加密时使用 decrypt_file，否则根据 Observation 如实说明。',
-      '当需要读取、写入、创建目录、列举文件、解密文件、解析 Office 文档、执行命令或启动服务时，输出 Action JSON：',
+      '当需要读取、写入、编辑、创建目录、列举文件、解密文件、解析 Office 文档、执行命令或启动服务时，输出 Action JSON：',
       toolSchema,
+      '同一轮存在多个参数已经完整、且不依赖前一个 Observation 的工具时，可以输出 tool_calls 数组；宿主会并行执行连续的安全只读工具，并将写入、命令、授权和有依赖的操作串行执行：',
+      multiToolSchema,
+      '每个多工具调用建议提供唯一 id；若后一个调用必须等待前一个调用完成，可提供 depends_on 字符串数组引用前一个 id，例如 {"id":"verify","depends_on":["build"],"name":"read_file","arguments":{...}}。宿主会结合显式依赖和文件资源冲突决定串行或并行。',
+      '不得把依赖前一个工具输出才能确定参数的调用放进同一 tool_calls 数组；应先调用前置工具，收到 Observation 后再输出后续调用。',
       '当任务完成或不需要工具时，输出 Final JSON：',
       finalSchema,
       '当存在两个或以上会改变执行路径、工作区、输出位置或实现方案的互斥选项，且无法从上下文安全决定时，输出 Choice JSON：',
@@ -534,9 +628,10 @@ export class ReactAgent {
       '工具注册表（只能调用 enabled=true 的工具；严格按 inputSchema 传 arguments）：',
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
-      '所有文件路径必须是工作区内的相对路径。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。任何 run_command 和 start_service 在执行前都会弹出交互，由用户决定是否允许本次命令；用户拒绝后不得重复申请相同命令。删除、格式化、关机、终止进程、重启和强制清理等高风险命令也必须输出 run_command，宿主会在确认卡中明确警告风险，由用户决定是否仍然执行；禁止在生成 Action 前自行拒绝用户明确要求的命令。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；远程只读命令也必须等待用户确认。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
+      '启动 Electron 或其他桌面应用时，必须使用 run_command 并设置 background=true，禁止使用 start_service。后台命令返回 PID 即表示进程已成功创建；不得因为没有 HTTP 地址而重复启动同一桌面应用。',
+      '所有文件路径必须是工作区内的相对路径。修改已有文件前先用 read_file 读取实际内容，局部修改优先用 edit_file；old_text 必须包含足够上下文以确保唯一匹配，只有明确要替换全部匹配时才设置 replace_all=true。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，调用前需要用户单次确认。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。任何 run_command 和 start_service 在执行前都会弹出交互，由用户决定是否允许本次命令；用户拒绝后不得重复申请相同命令。删除、格式化、关机、终止进程、重启和强制清理等高风险命令也必须输出 run_command，宿主会在确认卡中明确警告风险，由用户决定是否仍然执行；禁止在生成 Action 前自行拒绝用户明确要求的命令。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝；远程只读命令也必须等待用户确认。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。',
-      '再次确认输出契约：只返回一个 JSON 对象，并且只包含 thought + action、thought + choice 或 thought + final 三种结构之一。需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
+      '再次确认输出契约：使用文本协议时只返回一个 JSON 对象，并且只包含 thought + action、thought + tool_calls、thought + choice 或 thought + final 四种结构之一。需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
     ].join('\n')
   }
 
@@ -548,6 +643,9 @@ export class ReactAgent {
     call = validated.call
     if (call.name === 'read_file' && call.arguments.path) return tools.readFile(call.arguments.path)
     if (call.name === 'write_file' && call.arguments.path && typeof call.arguments.content === 'string') return tools.writeFile(call.arguments.path, call.arguments.content)
+    if (call.name === 'edit_file' && call.arguments.path && typeof call.arguments.old_text === 'string' && typeof call.arguments.new_text === 'string') {
+      return tools.editFile(call.arguments.path, call.arguments.old_text, call.arguments.new_text, call.arguments.replace_all ?? false)
+    }
     if (call.name === 'create_directory' && call.arguments.path) return tools.createDirectory(call.arguments.path)
     if (call.name === 'list_files') return tools.listFiles(call.arguments.path ?? '.', call.arguments.recursive ?? false)
     if (call.name === 'decrypt_file' && call.arguments.path) {
@@ -576,11 +674,13 @@ export class ReactAgent {
     }
     if (call.name === 'run_command' && call.arguments.command) {
       const args = call.arguments.args ?? []
+      const background = call.arguments.background ?? false
       const risk = classifyCommandRisk(call.arguments.command, args)
       const approved = requestCommandApproval
-        ? await requestCommandApproval({ command: call.arguments.command, args, displayCommand: risk.displayCommand, reason: risk.reason, riskLevel: risk.level, workspacePath: policy.workspacePath }).catch(() => false)
+        ? await requestCommandApproval({ command: call.arguments.command, args, displayCommand: risk.displayCommand, reason: background ? '准备在后台启动程序。' + risk.reason : risk.reason, background, riskLevel: risk.level, workspacePath: policy.workspacePath }).catch(() => false)
         : false
       if (!approved) return '用户拒绝执行本次命令，命令已取消。'
+      if (background) return tools.runCommand(call.arguments.command, args, signal, approved, risk.level === 'blocked', true)
       return signal
         ? tools.runCommand(call.arguments.command, args, signal, approved, risk.level === 'blocked')
         : tools.runCommand(call.arguments.command, args, undefined, approved, risk.level === 'blocked')
@@ -642,7 +742,7 @@ export class ReactAgent {
   }
 
   private recordToolArtifacts(task: AgentTask, call: ToolCall, output: string): void {
-    if (call.name === 'write_file' && call.arguments.path) {
+    if ((call.name === 'write_file' || call.name === 'edit_file') && call.arguments.path) {
       this.addArtifact(task, { type: 'file', path: call.arguments.path })
     }
     if (call.name === 'decrypt_file') {
@@ -679,7 +779,7 @@ export class ReactAgent {
     }
   }
 
-  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback): Promise<ModelResponse> {
+  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback, enabledTools: string[] = []): Promise<ModelResponse> {
     const prepared = prepareContext(messages, {
       contextWindowTokens: model.contextWindowTokens,
       maxOutputTokens: model.maxOutputTokens
@@ -703,7 +803,7 @@ export class ReactAgent {
       if (remainingMs <= 0) throw new Error('模型请求超时（' + totalTimeoutMs / 1000 + '秒）')
       try {
         const startedAt = performance.now()
-        const response = await this.callModelOnce(messages, model, onDelta, signal, remainingMs, useStreaming)
+        const response = await this.callModelOnce(messages, model, onDelta, signal, remainingMs, useStreaming, enabledTools)
         this.recordTokenUsage(task, messages, response, Math.max(1, performance.now() - startedAt))
         return response
       } catch (error) {
@@ -725,7 +825,7 @@ export class ReactAgent {
     throw lastError ?? new Error('模型请求失败')
   }
 
-  private async callModelOnce(messages: ModelMessage[], model: ModelConfig, onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, remainingMs: number, useStreaming: boolean): Promise<ModelResponse> {
+  private async callModelOnce(messages: ModelMessage[], model: ModelConfig, onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, remainingMs: number, useStreaming: boolean, enabledTools: string[] = []): Promise<ModelResponse> {
     const controller = new AbortController()
     const totalTimeoutMs = Math.max(1000, remainingMs)
     const inactivityTimeoutMs = Math.min(totalTimeoutMs, Math.max(10, this.modelInactivityTimeoutMs))
@@ -745,6 +845,17 @@ export class ReactAgent {
       const maxOutputTokens = Math.min(Math.max(256, Math.floor(model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS)), Math.floor(contextWindowTokens * 0.5))
       const requestBody: Record<string, unknown> = { model: model.model, messages, temperature: 0, max_tokens: maxOutputTokens, stream: useStreaming }
       if (useStreaming) requestBody.stream_options = { include_usage: true }
+      const nativeTools = getEnabledToolDefinitions(enabledTools).map((definition) => ({
+        type: 'function',
+        function: {
+          name: definition.name,
+          description: definition.description + ' ' + definition.whenToUse,
+          parameters: definition.inputSchema
+        }
+      }))
+      if (nativeTools.length && isQwenModel(model.model)) {
+        requestBody.tools = nativeTools
+      }
       const response = await modelFetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
         signal: controller.signal,
@@ -801,7 +912,8 @@ export class ReactAgent {
           reasoning_content?: unknown
           reasoning?: unknown
           thinking?: unknown
-          tool_calls?: Array<{ function?: { name?: string; arguments?: unknown }; name?: string; arguments?: unknown }>
+          tool_calls?: Array<{ id?: unknown; depends_on?: unknown; dependsOn?: unknown; after?: unknown; function?: { name?: string; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown; depends_on?: unknown; dependsOn?: unknown; after?: unknown }; name?: string; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown }>
+          function_call?: { name?: string; arguments?: unknown }
         }
         delta?: { content?: unknown }
       }>
@@ -810,15 +922,19 @@ export class ReactAgent {
     const message = payload.choices?.[0]?.message
     const nativeToolCalls = message?.tool_calls?.flatMap((item) => {
       const source = item.function ?? item
-      return typeof source.name === 'string' ? [{ name: source.name, arguments: source.arguments ?? {} }] : []
+      const id = typeof item.id === 'string' && item.id ? item.id : 'call_' + crypto.randomUUID()
+      const dependsOn = normalizeToolDependencies(item.depends_on ?? item.dependsOn ?? item.after ?? source.depends_on ?? source.dependsOn ?? source.after)
+      return typeof source.name === 'string' ? [{ id, depends_on: dependsOn, name: source.name, arguments: source.arguments ?? source.parameters ?? source.input ?? source.action_input ?? {} }] : []
     }) ?? []
+    if (message?.function_call?.name) nativeToolCalls.push({ id: 'call_' + crypto.randomUUID(), depends_on: undefined, name: message.function_call.name, arguments: message.function_call.arguments ?? {} })
     const messageContent = normalizeModelContent(message?.content ?? payload.choices?.[0]?.delta?.content)
     const content = nativeToolCalls.length
       ? JSON.stringify({ thought: '准备执行模型返回的工具调用。', tool_calls: nativeToolCalls })
       : messageContent
     return {
       content,
-      usage: payload.usage
+      usage: payload.usage,
+      nativeToolCalls: Boolean(message?.tool_calls?.length)
     }
   }
 
@@ -833,7 +949,7 @@ export class ReactAgent {
     let streamDone = false
     let protocolDrift = false
     let lastActivityAt = Date.now()
-    const streamedToolCalls = new Map<number, { name: string; arguments: string }>()
+    const streamedToolCalls = new Map<number, { id?: string; name: string; arguments: string }>()
     const processLine = (line: string): boolean => {
       const trimmed = line.trim()
       if (!trimmed.startsWith('data:')) return false
@@ -848,6 +964,7 @@ export class ReactAgent {
       if (payload.usage) usage = payload.usage
       for (const toolCall of payload.toolCallDeltas ?? []) {
         const current = streamedToolCalls.get(toolCall.index) ?? { name: '', arguments: '' }
+        current.id = current.id ?? toolCall.id
         current.name += toolCall.name ?? ''
         current.arguments += toolCall.arguments ?? ''
         streamedToolCalls.set(toolCall.index, current)
@@ -901,7 +1018,7 @@ export class ReactAgent {
     if (streamedToolCalls.size) {
       const toolCalls = [...streamedToolCalls.entries()]
         .sort(([left], [right]) => left - right)
-        .map(([, call]) => ({ name: call.name, arguments: call.arguments || {} }))
+        .map(([, call]) => ({ id: call.id ?? 'call_' + crypto.randomUUID(), name: call.name, arguments: call.arguments || {} }))
       const streamToolCallAssemblyError = toolCalls.some((call) => {
         if (!call.name) return true
         if (typeof call.arguments !== 'string') return false
@@ -916,12 +1033,12 @@ export class ReactAgent {
         thought: explicitJsonThought(content) || '准备执行模型返回的工具调用。',
         tool_calls: toolCalls
       })
-      return { content, usage, protocolDrift, streamToolCallAssemblyError }
+      return { content, usage, protocolDrift, streamToolCallAssemblyError, nativeToolCalls: true }
     }
     return { content, usage, protocolDrift }
   }
 
-  private parseStreamPayload(data: string): { delta: string; reasoningDelta?: string; usage?: RawModelUsage; toolCallDeltas?: Array<{ index: number; name?: string; arguments?: string }> } {
+  private parseStreamPayload(data: string): { delta: string; reasoningDelta?: string; usage?: RawModelUsage; toolCallDeltas?: Array<{ index: number; id?: string; name?: string; arguments?: string }> } {
     try {
       const payload = JSON.parse(data) as {
         choices?: Array<{
@@ -930,11 +1047,11 @@ export class ReactAgent {
             reasoning_content?: unknown
             reasoning?: unknown
             thinking?: unknown
-            tool_calls?: Array<{ index?: number; function?: { name?: unknown; arguments?: unknown }; name?: unknown; arguments?: unknown }>
+            tool_calls?: Array<{ id?: unknown; index?: number; function?: { name?: unknown; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown }; name?: unknown; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown }>
           }
           message?: {
             content?: unknown
-            tool_calls?: Array<{ index?: number; function?: { name?: unknown; arguments?: unknown }; name?: unknown; arguments?: unknown }>
+            tool_calls?: Array<{ id?: unknown; index?: number; function?: { name?: unknown; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown }; name?: unknown; arguments?: unknown; parameters?: unknown; input?: unknown; action_input?: unknown }>
           }
         }>
         usage?: RawModelUsage
@@ -948,13 +1065,14 @@ export class ReactAgent {
         toolCallDeltas: rawToolCalls.flatMap((item, index) => {
           const source = item.function ?? item
           const name = typeof source.name === 'string' ? source.name : undefined
-          const argumentsValue = typeof source.arguments === 'string'
-            ? source.arguments
-            : source.arguments && typeof source.arguments === 'object'
-              ? JSON.stringify(source.arguments)
+          const rawArguments = source.arguments ?? source.parameters ?? source.input ?? source.action_input
+          const argumentsValue = typeof rawArguments === 'string'
+            ? rawArguments
+            : rawArguments && typeof rawArguments === 'object'
+              ? JSON.stringify(rawArguments)
               : undefined
           return name !== undefined || argumentsValue !== undefined
-            ? [{ index: typeof item.index === 'number' ? item.index : index, name, arguments: argumentsValue }]
+            ? [{ index: typeof item.index === 'number' ? item.index : index, id: typeof item.id === 'string' ? item.id : undefined, name, arguments: argumentsValue }]
             : []
         })
       }
@@ -982,6 +1100,8 @@ export class ReactAgent {
   }
 
   private parseReply(content: string): ReactModelReply {
+    const qwenReply = this.parseQwenToolCallReply(content)
+    if (qwenReply) return qwenReply
     const payload = stripCodeFences(stripThoughtTags(content)).trim()
 
     try {
@@ -1012,7 +1132,10 @@ export class ReactAgent {
     const candidate = value as ReactModelReply
     const calls = this.getToolCalls(candidate)
     if (calls.length) {
-      const normalized = candidate.action ? { ...candidate, action: calls[0], tool_calls: undefined } : { ...candidate, tool_calls: calls }
+      const toolIssue = this.getToolCallIssue(candidate)
+      const normalized = candidate.action
+        ? { ...candidate, action: calls[0], tool_calls: undefined, toolIssue }
+        : { ...candidate, action: undefined, tool_calls: calls, toolIssue }
       return this.attachThought(normalized)
     }
     const toolIssue = this.getToolCallIssue(candidate)
@@ -1020,6 +1143,26 @@ export class ReactAgent {
     if (typeof candidate.final === 'string') return this.attachThought({ ...candidate, final: candidate.final })
     if (candidate.choice && typeof candidate.choice === 'object') return this.attachThought(candidate)
     return undefined
+  }
+
+  private parseQwenToolCallReply(content: string): ReactModelReply | undefined {
+    const calls: unknown[] = []
+    const pattern = /<\s*tool(?:_|-)call\s*>([\s\S]*?)<\s*\/\s*tool(?:_|-)call\s*>/gi
+    for (const match of content.matchAll(pattern)) {
+      const body = stripCodeFences(match[1]).trim()
+      if (!body) continue
+      try {
+        calls.push(JSON.parse(this.normalizeJsonControlCharacters(body)) as unknown)
+      } catch {
+        // Preserve malformed calls so the normal argument-repair path can
+        // report the protocol issue instead of exposing Qwen's raw output.
+        calls.push({ name: extractQwenToolName(body), arguments: extractQwenToolArguments(body) })
+      }
+    }
+    if (!calls.length) return undefined
+    // Qwen's <think> block may contain private/very long reasoning. Keep it
+    // out of task history and UI; attachThought supplies a short action summary.
+    return this.normalizeReplyCandidate({ tool_calls: calls }) ?? this.attachThought({ tool_calls: calls })
   }
 
   private parseTextReactReply(content: string): ReactModelReply | undefined {
@@ -1217,13 +1360,21 @@ export class ReactAgent {
   }
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {
-    const calls: unknown[] = reply.action ? [reply.action] : reply.tool_calls ?? []
+    const calls = this.getRawToolCalls(reply)
     return calls.flatMap((item) => normalizeRawToolCall(item).call ?? [])
   }
 
   private getToolCallIssue(reply: ReactModelReply): ToolCallIssue | undefined {
-    const calls: unknown[] = reply.action ? [reply.action] : reply.tool_calls ?? []
-    return calls.map((item) => normalizeRawToolCall(item).issue).find((issue): issue is ToolCallIssue => Boolean(issue))
+    const calls = this.getRawToolCalls(reply)
+    const issues = calls.map((item) => normalizeRawToolCall(item).issue).filter((issue): issue is ToolCallIssue => Boolean(issue))
+    return issues.find((issue) => issue.type !== 'UNKNOWN_TOOL') ?? (this.getToolCalls(reply).length ? undefined : issues[0])
+  }
+
+  private getRawToolCalls(reply: ReactModelReply): unknown[] {
+    if (reply.action) return [reply.action]
+    if (reply.tool_calls?.length) return reply.tool_calls
+    if (reply.function_call) return [reply.function_call]
+    return reply.tools ?? []
   }
 
   private addStep(task: AgentTask, taskStep: TaskStep, onStep?: StepCallback): void {
@@ -1290,6 +1441,33 @@ function stripThoughtTags(content: string): string {
     .replace(UNCLOSED_THOUGHT_PATTERN, '')
 }
 
+function extractQwenToolName(content: string): string {
+  return /["']?name["']?\s*[:=]\s*["']([^"']+)/i.exec(content)?.[1] ?? ''
+}
+
+function extractQwenToolArguments(content: string): unknown {
+  const match = /["']?(?:arguments|parameters|input|action_input)["']?\s*[:=]\s*/i.exec(content)
+  if (!match) return content
+  const remainder = content.slice(match.index + match[0].length).trim()
+  if (!remainder.startsWith('{')) return remainder.replace(/[,}]\s*$/, '').trim()
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < remainder.length; index++) {
+    const char = remainder[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') inString = true
+    else if (char === '{') depth++
+    else if (char === '}' && --depth === 0) return remainder.slice(0, index + 1)
+  }
+  return remainder
+}
+
 function stripCodeFences(content: string): string {
   return content
     .replace(/^\s*```(?:json|re?act)?\s*/i, '')
@@ -1330,6 +1508,29 @@ function normalizeLooseArguments(value: string | undefined, name: string): ToolC
   return undefined
 }
 
+function inferNarrativeCommandCall(prompt: string, responseText: string): ToolCall | undefined {
+  if (!promptRequestsCommand(prompt)) return undefined
+  const commandMatch = /(?:^|[\n：:]|命令[：:]?\s*)(python(?:\d+(?:\.\d+)?)?|python3|node|npm|npx|pnpm|yarn|uvicorn|vite|electron|\.\/[\w./-]+)(?:\s+((?:[^\n`]|`[^`]*`)+))?/im.exec(responseText)
+  if (!commandMatch) return undefined
+  const command = commandMatch[1].trim()
+  const rawArgs = (commandMatch[2] ?? '').trim().replace(/[`。；]+$/g, '').trim()
+  const args = rawArgs ? splitNarrativeCommandArgs(rawArgs) : []
+  const background = /(?:后台|background|桌面|electron|客户端|app|应用)/i.test(prompt)
+  const service = /(?:服务|server|web|网页|前端|接口|http|端口)/i.test(prompt) && !background
+  return {
+    name: service ? 'start_service' : 'run_command',
+    arguments: { command, args, ...(background ? { background: true } : {}) }
+  }
+}
+
+function promptRequestsCommand(prompt: string): boolean {
+  return /(?:运行|执行|启动|打开|重启|构建|编译|测试|安装|命令|服务|客户端|应用|app|server|web|启动一下|帮我启动)/i.test(prompt)
+}
+
+function splitNarrativeCommandArgs(value: string): string[] {
+  return value.match(/"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|\S+/g)?.map((item) => item.replace(/^['"]|['"]$/g, '')) ?? []
+}
+
 function promptRequiresToolUse(prompt: string): boolean {
   if (!prompt.trim()) return false
   const chineseAction = /(?:读取|查看|看一下|检查|列出|遍历|搜索|查找|打开|修改|编辑|写入|创建|新建|生成|保存|删除|重命名|移动|复制).{0,20}(?:文件|目录|文件夹|代码|仓库|项目|配置|脚本|工作区|文档)/i.test(prompt)
@@ -1343,7 +1544,8 @@ function promptRequiresToolUse(prompt: string): boolean {
 
 function hasReactProtocolPayload(content: string): boolean {
   const payload = stripThoughtTags(content)
-  return /"(?:action|tool_calls|choice|final)"\s*:/i.test(payload) ||
+  return /"(?:action|tool_calls|function_call|tools|choice|final)"\s*:/i.test(payload) ||
+    /<\s*tool(?:_|-)call\s*>/i.test(payload) ||
     /(?:^|\n)\s*(?:action|行动|动作|final|最终答案)\s*[:：]/im.test(payload)
 }
 
@@ -1356,7 +1558,7 @@ function resolveToolIntentPrompt(prompt: string, history: ConversationMessage[])
 function looksLikeMalformedReactReply(content: string): boolean {
   return /(?:^|\n)\s*(?:thought|action|action\s*input|observation|final\s*answer|思考|行动|动作|行动输入|观察|最终答案)\s*[:：]/im.test(content) ||
     /```(?:json|react)?\s*\{/i.test(content) ||
-    /"(?:action|tool_calls|choice|final)"\s*:/i.test(content) ||
+    /"(?:thought|action|tool_calls|choice|final)"\s*:/i.test(content) ||
     (/<\s*(?:think|thought)\s*>/i.test(content) && !hasReactProtocolPayload(content))
 }
 
@@ -1389,6 +1591,7 @@ function buildReactCorrectionPrompt(missingRequiredAction: boolean): string {
       : '上一条响应不是可解析的 ReAct JSON，不能把计划、解释或未验证结果当作 Final。',
     '请立刻只返回一个合法 JSON 对象，不要 Markdown、代码块、XML、前后解释，也不要返回多个对象。',
     '需要工具时严格使用：{"thought":"准备执行的简短计划","action":{"name":"工具名","arguments":{}}}',
+    '多个互不依赖的工具可使用：{"thought":"准备执行的简短计划","tool_calls":[{"name":"工具名","arguments":{}}]}',
     '任务完成时严格使用：{"thought":"已根据 Observation 完成验证","final":"给用户的答复"}',
     '每轮只能有 action、choice、final 三者之一；输出 action 后立即停止，等待宿主发送 Observation。'
   ].join('\n')
@@ -1403,7 +1606,7 @@ function sanitizeThoughtBeforeAction(thought: string): string {
 }
 
 function sanitizeThoughtText(thought: string): string {
-  return stripThoughtTags(thought).replace(THOUGHT_TAG_PATTERN, '').trim()
+  return hideReactObservationReferences(stripThoughtTags(thought).replace(THOUGHT_TAG_PATTERN, '')).trim()
 }
 
 function sanitizeAssistantText(text: string): string {
@@ -1438,13 +1641,29 @@ function modelReplyForHistory(reply: ReactModelReply, originalContent: string): 
   return stripThoughtTags(originalContent).trim()
 }
 
+function nativeAssistantToolMessage(reply: ReactModelReply): ModelMessage {
+  const calls = (reply.tool_calls ?? []).flatMap((item) => normalizeRawToolCall(item).call ?? [])
+  return {
+    role: 'assistant',
+    content: '',
+    tool_calls: calls.flatMap((call) => call.id ? [{
+      id: call.id,
+      type: 'function' as const,
+      function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+    }] : [])
+  }
+}
+
 function isIncompleteFinal(finalText: string): boolean {
   return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目|构建|验证|修复|定位).{0,8}(?:尚未|未).{0,8}(?:完成|结束|通过|解决)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
 }
 
 function looksLikeIncompleteToolCall(content: string): boolean {
   const payload = stripThoughtTags(content)
-  if (!/"(?:action|tool_calls)"\s*:/.test(payload)) return false
+  const openQwenCalls = payload.match(/<\s*tool(?:_|-)call\s*>/gi)?.length ?? 0
+  const closedQwenCalls = payload.match(/<\s*\/\s*tool(?:_|-)call\s*>/gi)?.length ?? 0
+  if (openQwenCalls > closedQwenCalls) return true
+  if (!/"(?:action|tool_calls|function_call|tools)"\s*:/.test(payload)) return false
   const toolName = /"name"\s*:\s*"([^"]+)"/.exec(payload)?.[1]
   return Boolean(toolName && isToolName(normalizeToolName(toolName)))
 }
@@ -1455,6 +1674,167 @@ function normalizeToolName(name: string): string {
 
 function commandSignature(command: string, args: string[]): string {
   return command.trim().toLowerCase() + '\n' + JSON.stringify(args)
+}
+
+function isQwenModel(model: string): boolean {
+  return /(?:^|[/_-])qwen(?:\d|[/_-]|$)/i.test(model.trim())
+}
+
+function normalizeToolDependencies(value: unknown): string[] | undefined {
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
+  const result = [...new Set(values.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean))]
+  return result.length ? result : undefined
+}
+
+type ToolExecutionItem = { index: number; call: ToolCall }
+type ToolExecutionBatch = {
+  mode: 'parallel' | 'serial' | 'deferred'
+  reason: 'independent' | 'resource_conflict' | 'execution_barrier' | 'explicit_dependency' | 'unresolved_dependency'
+  items: ToolExecutionItem[]
+}
+type ToolResource = { path: string; mode: 'read' | 'write'; tree: boolean }
+
+function planToolExecution(calls: ToolCall[]): ToolExecutionBatch[] {
+  const callIndexes = new Map(calls.flatMap((call, index) => call.id ? [[call.id, index] as const] : []))
+  const batches: ToolExecutionBatch[] = []
+  const deferredIndexes = new Set<number>()
+
+  calls.forEach((call, index) => {
+    const item = { index, call }
+    const dependencies = call.dependsOn ?? []
+    const dependencyIndexes = dependencies.map((id) => callIndexes.get(id))
+    const unresolvedDependency = dependencyIndexes.some((dependencyIndex) => dependencyIndex === undefined || dependencyIndex >= index || deferredIndexes.has(dependencyIndex)) ||
+      hasDynamicToolReference(call, new Set(calls.slice(0, index).flatMap((candidate) => candidate.id ? [candidate.id] : [])))
+    if (unresolvedDependency) {
+      deferredIndexes.add(index)
+      batches.push({ mode: 'deferred', reason: 'unresolved_dependency', items: [item] })
+      return
+    }
+    if (isToolExecutionBarrier(call)) {
+      batches.push({ mode: 'serial', reason: 'execution_barrier', items: [item] })
+      return
+    }
+
+    const previousBatch = batches.at(-1)
+    const dependsOnPreviousBatch = Boolean(previousBatch && dependencyIndexes.some((dependencyIndex) => previousBatch.items.some((candidate) => candidate.index === dependencyIndex)))
+    const hasResourceConflict = Boolean(previousBatch && previousBatch.mode !== 'deferred' && previousBatch.items.some((candidate) => toolCallsConflict(candidate.call, call)))
+    if (!previousBatch || previousBatch.mode === 'deferred' || dependsOnPreviousBatch || hasResourceConflict) {
+      batches.push({
+        mode: 'serial',
+        reason: dependsOnPreviousBatch ? 'explicit_dependency' : hasResourceConflict ? 'resource_conflict' : dependencies.length ? 'explicit_dependency' : 'independent',
+        items: [item]
+      })
+      return
+    }
+
+    previousBatch.items.push(item)
+    previousBatch.mode = previousBatch.items.length > 1 ? 'parallel' : 'serial'
+    if (previousBatch.reason !== 'explicit_dependency') previousBatch.reason = 'independent'
+  })
+  return batches
+}
+
+function isToolExecutionBarrier(call: ToolCall): boolean {
+  return call.name === 'run_command' || call.name === 'start_service' || call.name === 'decrypt_file' || call.name === 'parse_powerpoint'
+}
+
+function toolCallsConflict(left: ToolCall, right: ToolCall): boolean {
+  const leftResources = toolResources(left)
+  const rightResources = toolResources(right)
+  if (!leftResources.length || !rightResources.length) return true
+  return leftResources.some((leftResource) => rightResources.some((rightResource) => resourcesConflict(leftResource, rightResource)))
+}
+
+function toolResources(call: ToolCall): ToolResource[] {
+  const path = normalizeToolResourcePath(call.arguments.path)
+  if (!path) return []
+  if (call.name === 'read_file' || call.name === 'parse_word' || call.name === 'parse_excel') return [{ path, mode: 'read', tree: false }]
+  if (call.name === 'list_files') return [{ path, mode: 'read', tree: true }]
+  if (call.name === 'write_file') {
+    const parent = resourceParentPath(path)
+    return [
+      { path, mode: 'write', tree: false },
+      ...(parent ? [{ path: parent, mode: 'write' as const, tree: true }] : [])
+    ]
+  }
+  if (call.name === 'edit_file') return [{ path, mode: 'write', tree: false }]
+  if (call.name === 'create_directory') return [{ path, mode: 'write', tree: true }]
+  return []
+}
+
+function resourcesConflict(left: ToolResource, right: ToolResource): boolean {
+  if (left.mode === 'read' && right.mode === 'read') return false
+  return resourceContains(left, right.path) || resourceContains(right, left.path)
+}
+
+function resourceContains(resource: ToolResource, path: string): boolean {
+  return resource.path === path || resource.tree && (resource.path === '.' || path.startsWith(resource.path + '/'))
+}
+
+function normalizeToolResourcePath(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  const parts: string[] = []
+  for (const part of value.trim().replaceAll('\\', '/').split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+  return parts.join('/') || '.'
+}
+
+function resourceParentPath(path: string): string | undefined {
+  const separator = path.lastIndexOf('/')
+  if (separator <= 0) return undefined
+  return path.slice(0, separator) || '.'
+}
+
+function hasDynamicToolReference(call: ToolCall, previousIds: Set<string>): boolean {
+  const values = collectArgumentStrings(call.arguments)
+  const placeholderPattern = /\$\{(?:previous|prior|last|tool)[^}]*(?:output|result|observation|path)[^}]*}|\{\{[^}]*(?:output|result|observation|path|输出|结果|路径)[^}]*}}|\b(?:previous|prior|last)[_-]?(?:output|result|observation|path)\b|(?:上一步|前一个|上一条).{0,8}(?:输出|结果|路径)/i
+  if (values.some((value) => placeholderPattern.test(value))) return true
+  return [...previousIds].some((id) => values.some((value) => value.includes('${' + id) || value.includes('{{' + id) || value.includes('$' + id + '.')))
+}
+
+function collectArgumentStrings(value: unknown): string[] {
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) return value.flatMap(collectArgumentStrings)
+  if (!value || typeof value !== 'object') return []
+  return Object.values(value as Record<string, unknown>).flatMap(collectArgumentStrings)
+}
+
+function formatToolExecutionPlan(batches: ToolExecutionBatch[]): string {
+  return batches.map((batch, index) => {
+    const tools = batch.items.map((item) => item.call.name + formatToolPlanPath(item.call)).join('、')
+    const mode = batch.mode === 'parallel' ? '并行' : batch.mode === 'deferred' ? '延后' : '串行'
+    const reason = batch.reason === 'resource_conflict'
+      ? '资源存在读写冲突'
+      : batch.reason === 'execution_barrier'
+        ? '涉及命令、授权或外部副作用'
+        : batch.reason === 'explicit_dependency'
+          ? '存在显式前置依赖'
+          : batch.reason === 'unresolved_dependency'
+            ? '参数需要前置工具的真实输出'
+            : '资源互不冲突'
+    return '第 ' + (index + 1) + ' 批' + mode + '：' + tools + '（' + reason + '）'
+  }).join('；')
+}
+
+function formatToolPlanPath(call: ToolCall): string {
+  return call.arguments.path ? '(' + call.arguments.path + ')' : ''
+}
+
+function skippedToolResult(): { output: string; succeeded: boolean } {
+  return { output: '前置执行批次存在失败，本调用未执行。请根据已返回的 Observation 重新规划。', succeeded: false }
+}
+
+function deferredToolResult(): { output: string; succeeded: boolean } {
+  return { output: '该调用的参数依赖前置工具的真实输出，本轮已延后且未执行。', succeeded: true }
+}
+
+function observationOutput(observation: string | undefined, toolName: string): string {
+  if (!observation) return ''
+  const prefix = toolName + ': '
+  return observation.startsWith(prefix) ? observation.slice(prefix.length) : observation
 }
 
 function extractWebUrls(text: string, localOnly: boolean): string[] {
@@ -1598,7 +1978,7 @@ function estimateTokenCount(value: unknown): number {
 function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): boolean {
   const message = error instanceof Error ? error.message : String(error)
   if (/工具未启用|工具调用参数修复失败|工具调用无法执行/.test(message)) return false
-  if (toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
+  if (toolName === 'edit_file' || toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)
 }

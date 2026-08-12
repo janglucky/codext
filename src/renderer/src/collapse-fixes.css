@@ -32,7 +32,36 @@
 .agent-process.agent-process-flow .agent-flow-observation > summary {
   justify-content: flex-start;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: 0;
   border: 0;
   background: transparent;
+}
+
+/* The tool label is a shrinkable flex item. Without a zero flex basis, a
+   long JSON argument can set the row's intrinsic width and leak outside the
+   chat column even when text-overflow is enabled. */
+.agent-process.agent-process-flow .agent-flow-action > summary .agent-flow-status {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.agent-process.agent-process-flow .agent-flow-action[open] > summary {
+  align-items: flex-start;
+}
+
+.agent-process.agent-process-flow .agent-flow-action[open] > summary::before {
+  margin-top: 6px;
+}
+
+.agent-process.agent-process-flow .agent-flow-action[open] > summary .agent-flow-status {
+  align-items: flex-start;
+}
+
+.agent-process.agent-process-flow .agent-flow-action[open] > summary .agent-flow-status > svg {
+  margin-top: 3px;
 }

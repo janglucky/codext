@@ -1,14 +1,16 @@
 import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, ModelConfig, ModelProfile, PermissionMode } from '../../shared/types'
+import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, FontFamilyPreference, ModelConfig, ModelProfile, PermissionMode } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
 import { isInternalAgentPlaceholder } from '../../shared/text'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
-type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation'> & {
+type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation' | 'appearance' | 'personalization'> & {
   model?: Partial<AppSettings['model']>
   navigation?: Partial<AppSettings['navigation']>
+  appearance?: Partial<NonNullable<AppSettings['appearance']>>
+  personalization?: Partial<NonNullable<AppSettings['personalization']>>
 }
 type PersistedStateDraft = Partial<PersistedState> & {
   settings?: SettingsDraft
@@ -25,6 +27,8 @@ export const defaults: AppSettings = {
   defaultModelId: defaultModelProfile.id,
   skillsEnabled: true,
   permissionMode: 'request_approval',
+  appearance: { theme: 'system', chatFontFamily: 'system', uiFontFamily: 'system', fontSize: 14 },
+  personalization: { tone: 'balanced', customInstructions: '' },
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
 
@@ -66,6 +70,16 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
     defaultModelId,
     skillsEnabled: settings?.skillsEnabled ?? defaults.skillsEnabled,
     permissionMode: normalizePermissionMode(settings?.permissionMode),
+    appearance: {
+      theme: normalizeTheme(settings?.appearance?.theme),
+      chatFontFamily: normalizeFontFamily(settings?.appearance?.chatFontFamily ?? settings?.appearance?.fontFamily),
+      uiFontFamily: normalizeFontFamily(settings?.appearance?.uiFontFamily),
+      fontSize: normalizeFontSize(settings?.appearance?.fontSize)
+    },
+    personalization: {
+      tone: normalizeAgentTone(settings?.personalization?.tone),
+      customInstructions: typeof settings?.personalization?.customInstructions === 'string' ? settings.personalization.customInstructions.slice(0, 4000) : ''
+    },
     navigation: {
       fileApplicationPath: typeof settings?.navigation?.fileApplicationPath === 'string' ? settings.navigation.fileApplicationPath : '',
       browserApplicationPath: typeof settings?.navigation?.browserApplicationPath === 'string' ? settings.navigation.browserApplicationPath : ''
@@ -78,6 +92,23 @@ function normalizePermissionMode(value: PermissionMode | undefined): PermissionM
   return value === 'full_access' || value === 'auto_approve' || value === 'request_approval'
     ? value
     : 'request_approval'
+}
+
+function normalizeTheme(value: unknown): 'system' | 'light' | 'dark' {
+  return value === 'light' || value === 'dark' ? value : 'system'
+}
+
+function normalizeFontFamily(value: unknown): FontFamilyPreference {
+  const migrated = value === 'sans' ? 'inter' : value === 'serif' ? 'noto-serif' : value
+  return migrated === 'inter' || migrated === 'noto-sans' || migrated === 'yahei' || migrated === 'pingfang' || migrated === 'sarasa' || migrated === 'noto-serif' || migrated === 'songti' || migrated === 'kaiti' || migrated === 'wenkai' || migrated === 'mono' ? migrated : 'system'
+}
+
+function normalizeFontSize(value: number | undefined): number {
+  return Math.min(18, Math.max(12, typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : 14))
+}
+
+function normalizeAgentTone(value: unknown): 'balanced' | 'concise' | 'professional' | 'friendly' {
+  return value === 'concise' || value === 'professional' || value === 'friendly' ? value : 'balanced'
 }
 
 function modelConfigFromProfile(profile: ModelProfile): ModelConfig {

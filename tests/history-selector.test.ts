@@ -65,7 +65,7 @@ describe('task history selection', () => {
     expect(selected.every((message) => !message.attachments?.length)).toBe(true)
   })
 
-  it('keeps only the latest observations for a resumable task and drops successful traces', () => {
+  it('keeps bounded tool memory for both successful and resumable tasks', () => {
     const successful: TestMessage[] = [
       { role: 'user', content: '检查 package.json' },
       { role: 'assistant', content: '检查完成', status: 'succeeded', steps: [{ phase: 'act', title: 'Observation #1：read_file', detail: 'old trace' }] }
@@ -87,11 +87,54 @@ describe('task history selection', () => {
     const completedSelection = selectTaskHistory(successful, '继续检查 package.json')
     const resumedSelection = selectTaskHistory(resumable, '继续检查 package.json')
 
-    expect(completedSelection[1].content).toBe('检查完成')
+    expect(completedSelection[1].content).toContain('检查完成')
+    expect(completedSelection[1].content).toContain('old trace')
     expect(resumedSelection[1].content).not.toContain('trace-1')
     expect(resumedSelection[1].content).not.toContain('trace-2')
     expect(resumedSelection[1].content).toContain('trace-3')
     expect(resumedSelection[1].content).toContain('trace-5')
     expect(resumedSelection[1].steps).toBeUndefined()
+  })
+
+  it('matches follow-up questions against facts introduced by the assistant and tool trace', () => {
+    const history: TestMessage[] = [
+      { role: 'user', content: '启动这个服务' },
+      {
+        role: 'assistant',
+        content: '演示服务已启动，监听 http://localhost:3100/',
+        status: 'succeeded',
+        steps: [{ phase: 'act', title: 'Observation #1：read_file', detail: '文件 demo.js 中定义了 /api/weather 接口' }]
+      }
+    ]
+
+    const selected = selectTaskHistory(history, 'demo.js 里的天气接口为什么返回空数据？')
+
+    expect(selected).toHaveLength(2)
+    expect(selected[1].content).toContain('demo.js')
+    expect(selected[1].content).toContain('/api/weather')
+  })
+
+  it('retains the latest durable file observation alongside recent command results', () => {
+    const history: TestMessage[] = [
+      { role: 'user', content: '检查并启动 demo.js' },
+      {
+        role: 'assistant',
+        content: '检查和启动已完成',
+        status: 'succeeded',
+        steps: [
+          { phase: 'act', title: 'Observation #1：read_file', detail: '关键配置 port = 3100' },
+          { phase: 'act', title: 'Observation #2：run_command', detail: 'command-2' },
+          { phase: 'act', title: 'Observation #3：run_command', detail: 'command-3' },
+          { phase: 'act', title: 'Observation #4：run_command', detail: 'command-4' },
+          { phase: 'act', title: 'Observation #5：run_command', detail: 'command-5' }
+        ]
+      }
+    ]
+
+    const selected = selectTaskHistory(history, '继续检查 demo.js')
+
+    expect(selected[1].content).toContain('关键配置 port = 3100')
+    expect(selected[1].content).not.toContain('command-2')
+    expect(selected[1].content).toContain('command-5')
   })
 })

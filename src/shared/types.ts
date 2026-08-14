@@ -3,6 +3,11 @@ export type AgentArtifact = { type: 'file'; path: string } | { type: 'service'; 
 export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number; contextWindowTokens?: number; maxOutputTokens?: number }
 export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
+export type ThemePreference = 'system' | 'light' | 'dark'
+export type FontFamilyPreference = 'system' | 'inter' | 'noto-sans' | 'yahei' | 'pingfang' | 'sarasa' | 'noto-serif' | 'songti' | 'kaiti' | 'wenkai' | 'mono'
+export interface AppearanceSettings { theme: ThemePreference; chatFontFamily: FontFamilyPreference; uiFontFamily: FontFamilyPreference; fontSize: number; fontFamily?: FontFamilyPreference }
+export type AgentTone = 'balanced' | 'concise' | 'professional' | 'friendly'
+export interface PersonalizationSettings { tone: AgentTone; customInstructions: string }
 export type PermissionMode = 'full_access' | 'auto_approve' | 'request_approval'
 export interface TaskStep { id: string; phase: 'reason' | 'skill' | 'act' | 'validate'; title: string; detail: string; timestamp: string }
 export interface TokenUsage { inputTokens: number; outputTokens: number; durationMs: number; estimated: boolean }
@@ -11,7 +16,7 @@ export interface AgentTask { id: string; prompt: string; status: TaskStatus; res
 export interface ChatAttachment { id: string; name: string; mimeType: string; size: number; dataUrl: string; workspacePath?: string }
 export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage; contextUsage?: ContextUsage }
 export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; modelId?: string }
-export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings; permissionMode?: PermissionMode }
+export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings; permissionMode?: PermissionMode; appearance?: AppearanceSettings; personalization?: PersonalizationSettings }
 export interface AgentPolicy { systemPrompt: string; workspacePath: string; enabledTools: string[] }
 export interface ConnectionTestResult { ok: boolean; message: string }
 export interface NavigationResult { ok: boolean; message?: string }

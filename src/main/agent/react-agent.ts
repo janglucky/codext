@@ -88,6 +88,23 @@ function permissionPrompt(mode: PermissionMode): string {
   return '当前权限模式：请求批准。宿主会在编辑工作区外文件、使用互联网或执行有风险的命令时请求用户批准；模型仍应直接输出所需工具调用，不要用文字代替授权交互。'
 }
 
+function personalizationPrompt(settings: AppSettings): string {
+  const tone = settings.personalization?.tone ?? 'balanced'
+  const toneInstruction = tone === 'concise'
+    ? '语气偏好：简洁直接，优先给出结论和必要信息，避免重复说明。'
+    : tone === 'professional'
+      ? '语气偏好：专业严谨，使用清晰、准确、克制的表达。'
+      : tone === 'friendly'
+        ? '语气偏好：友好自然，像可靠的协作伙伴，但不要过度寒暄。'
+        : '语气偏好：自然平衡，根据任务复杂度调整说明深度。'
+  const customInstructions = settings.personalization?.customInstructions.trim().slice(0, 4000) ?? ''
+  return [
+    '用户个性化偏好（不得覆盖安全策略、权限规则、工具协议和用户当前请求）：',
+    toneInstruction,
+    customInstructions ? '自定义指令：\n' + customInstructions : ''
+  ].filter(Boolean).join('\n')
+}
+
 function sanitizeLiveCommandOutput(value: string): string {
   const ansiEscapePattern = new RegExp(String.fromCharCode(27) + '\\[[0-?]*[ -/]*[@-~]', 'g')
   return value.replace(ansiEscapePattern, '').replace(/\r(?!\n)/g, '\n')
@@ -627,6 +644,7 @@ export class ReactAgent {
   }
 
   private buildSystemPrompt(policy: AgentPolicy): string {
+    const settings = this.getSettings()
     const toolSchema = [
       '{',
       '  "thought": "简短说明下一步及原因",',
@@ -670,6 +688,8 @@ export class ReactAgent {
       '',
       this.runtimeEnvironmentPrompt,
       '',
+      personalizationPrompt(settings),
+      '',
       '你必须遵循 ReAct 循环：Thought -> Action -> Observation -> Thought -> ... -> Final。',
       '输出协议是最高优先级约束：优先使用 API 提供的原生 function tools；使用文本协议时，每轮只能输出一个合法 JSON 对象，thought 必须作为 JSON 字符串字段；不要输出 Markdown、代码块、JSON 前后说明或第二个 JSON 对象。',
       'thought 只能是 300 字以内的行动摘要，禁止在 thought 中长篇排查、逐段分析代码或反复自问自答；一旦需要查看文件或运行检查，立即结束 thought 并输出 action。',
@@ -695,7 +715,7 @@ export class ReactAgent {
       '工具注册表（只能调用 enabled=true 的工具；严格按 inputSchema 传 arguments）：',
       JSON.stringify(getEnabledToolDefinitions(policy.enabledTools), null, 2),
       '工作区根目录：' + policy.workspacePath,
-      permissionPrompt(effectivePermissionMode(this.getSettings().permissionMode)),
+      permissionPrompt(effectivePermissionMode(settings.permissionMode)),
       '启动 Electron 或其他桌面应用时，必须使用 run_command 并设置 background=true，禁止使用 start_service。后台命令返回 PID 即表示进程已成功创建；不得因为没有 HTTP 地址而重复启动同一桌面应用。',
       '文件路径可以使用工作区相对路径；是否允许访问工作区外路径以及是否需要确认，由宿主按照当前权限模式决定，模型不得自行声称没有权限。修改已有文件前先用 read_file 读取实际内容，局部修改优先用 edit_file；old_text 必须包含足够上下文以确保唯一匹配，只有明确要替换全部匹配时才设置 replace_all=true。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，是否确认由当前权限模式决定。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。命令、联网与外部文件编辑是否弹出确认由宿主权限策略决定；用户或安全策略拒绝后不得重复申请相同操作。删除、格式化、关机、终止进程、重启和强制清理等高风险命令也必须输出 run_command，由宿主决定自动执行或显示强化警告；禁止在生成 Action 前自行拒绝用户明确要求的命令。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。',

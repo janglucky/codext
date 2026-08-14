@@ -21,7 +21,7 @@ export interface HistorySelectionOptions {
   maxMessages?: number
 }
 
-type Segment<T> = { messages: T[]; userText: string }
+type Segment<T> = { messages: T[]; userText: string; searchText: string }
 
 const DEFAULT_MAX_MESSAGES = 12
 const CONTINUATION_PATTERN = /^\s*(?:继续|接着|接着做|继续执行|继续处理|重试|再试一次|然后呢|下一步|刚才那个|上一个|这个问题|该问题|按刚才的|continue|go on|retry)\s*[。.!！]?\s*$/i
@@ -48,10 +48,13 @@ export function selectTaskHistory<T extends HistoryMessage>(history: T[], curren
   const resumableAssistantIndex = trimmed.findLastIndex((message) =>
     message.role === 'assistant' && Boolean(message.status && /^(?:pending|reasoning|acting|validating|paused|failed)$/.test(message.status))
   )
+  const latestAssistantWithTraceIndex = trimmed.findLastIndex((message) =>
+    message.role === 'assistant' && message.steps?.some(isObservationStep)
+  )
 
   return trimmed.map((message, index) => ({
     ...message,
-    content: formatHistoryContent(message, index === resumableAssistantIndex),
+    content: formatHistoryContent(message, index === resumableAssistantIndex || index === latestAssistantWithTraceIndex),
     attachments: index === attachmentMessageIndex ? message.attachments : undefined,
     steps: undefined
   }))
@@ -69,19 +72,24 @@ function buildSegments<T extends HistoryMessage>(history: T[]): Array<Segment<T>
   for (const message of history) {
     if (message.role === 'user') {
       if (!current || !isContinuationMessage(message)) {
-        const next: Segment<T> = { messages: [], userText: '' }
+        const next: Segment<T> = { messages: [], userText: '', searchText: '' }
         current = next
         segments.push(next)
       }
       current.messages.push(message)
-      if (message.content.trim()) current.userText += (current.userText ? '\n' : '') + message.content.trim()
+      if (message.content.trim()) {
+        current.userText += (current.userText ? '\n' : '') + message.content.trim()
+        current.searchText += (current.searchText ? '\n' : '') + message.content.trim()
+      }
       continue
     }
     if (!current) {
-      current = { messages: [], userText: '' }
+      current = { messages: [], userText: '', searchText: '' }
       segments.push(current)
     }
     current.messages.push(message)
+    const assistantSearchText = buildAssistantSearchText(message)
+    if (assistantSearchText) current.searchText += (current.searchText ? '\n' : '') + assistantSearchText
   }
   return segments.filter((segment) => segment.messages.length)
 }
@@ -90,7 +98,7 @@ function selectSegment<T extends HistoryMessage>(segments: Array<Segment<T>>, cu
   if (!segments.length) return undefined
   if (isContinuationText(currentRequest)) return segments.at(-1)
   for (let index = segments.length - 1; index >= 0; index--) {
-    if (relevanceScore(currentRequest, segments[index].userText) >= 2) return segments[index]
+    if (relevanceScore(currentRequest, segments[index].searchText) >= 2) return segments[index]
   }
   if (shouldReuseHistoricalAttachments(currentRequest)) {
     return [...segments].reverse().find((segment) => segment.messages.some((message) => Boolean(message.attachments?.length)))
@@ -152,11 +160,36 @@ function intersectionSize<T>(left: Set<T>, right: Set<T>): number {
 
 function formatHistoryContent(message: HistoryMessage, includeTrace: boolean): string {
   if (message.role !== 'assistant' || !includeTrace || !message.steps?.length) return message.content
-  const observations = message.steps
-    .filter((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
-    .slice(-3)
+  const observations = selectMemoryObservations(message.steps)
     .map((item) => item.title + ': ' + compactTrace(item.detail))
-  return [message.content, observations.length ? 'Previous execution trace:\n' + observations.join('\n') : ''].filter(Boolean).join('\n\n')
+  return [message.content, observations.length ? 'Previous task memory:\n' + observations.join('\n') : ''].filter(Boolean).join('\n\n')
+}
+
+function buildAssistantSearchText(message: HistoryMessage): string {
+  const observationTerms = message.steps
+    ?.filter(isObservationStep)
+    .flatMap((item) => [item.title, ...extractFiles(item.detail)])
+    .join('\n') ?? ''
+  return [message.content.trim(), observationTerms].filter(Boolean).join('\n')
+}
+
+function selectMemoryObservations(steps: HistoryStep[]): HistoryStep[] {
+  const observations = steps.filter(isObservationStep)
+  if (observations.length <= 4) return observations
+  const selectedIndexes = new Set(observations.slice(-3).map((item) => observations.indexOf(item)))
+  for (const pattern of [
+    /：(?:read_file|list_files|parse_word|parse_excel|parse_powerpoint)$/,
+    /：(?:write_file|edit_file|decrypt_file)$/,
+    /：start_service$/
+  ]) {
+    const index = observations.findLastIndex((item) => pattern.test(item.title))
+    if (index >= 0) selectedIndexes.add(index)
+  }
+  return [...selectedIndexes].sort((left, right) => left - right).map((index) => observations[index])
+}
+
+function isObservationStep(step: HistoryStep): boolean {
+  return step.phase === 'act' && step.title.startsWith('Observation #')
 }
 
 function compactTrace(value: string): string {

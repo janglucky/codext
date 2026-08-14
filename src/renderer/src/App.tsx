@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Moon, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Sun, Trash2 } from 'lucide-react'
+import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
@@ -49,6 +49,8 @@ const initialSettings: AppSettings = {
   models: [],
   skillsEnabled: true,
   permissionMode: 'request_approval',
+  appearance: { theme: 'system', chatFontFamily: 'system', uiFontFamily: 'system', fontSize: 14 },
+  personalization: { tone: 'balanced', customInstructions: '' },
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
 const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败', paused: '已暂停' }
@@ -59,7 +61,7 @@ const SHOW_SCROLL_BUTTON_THRESHOLD = 220
 const LOCAL_ASSISTANT_PREFIX = 'local-agent-'
 const LOCAL_STEP_PREFIX = 'local-step-'
 type View = 'chat' | 'settings'
-type SettingTab = '常规' | '外观' | '配置' | '个性化' | '打开方式' | 'Git' | '环境'
+type SettingTab = '常规' | '外观' | '配置' | '个性化' | 'Git' | '环境'
 
 function Icon({ name, ...props }: IconProps): ReactElement {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{paths[name]}</svg>
@@ -70,6 +72,46 @@ const permissionModes: Array<{ value: PermissionMode; label: string; description
   { value: 'auto_approve', label: '替我审批', description: '仅对检测到的风险操作请求批准。' },
   { value: 'request_approval', label: '请求批准', description: '编辑外部文件和使用互联网时始终询问。' }
 ]
+
+const defaultAppearance: AppearanceSettings = { theme: 'system', chatFontFamily: 'system', uiFontFamily: 'system', fontSize: 14 }
+const fontStacks: Record<FontFamilyPreference, string> = {
+  system: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif',
+  inter: 'Inter, "Noto Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif',
+  'noto-sans': '"Noto Sans CJK SC", "Source Han Sans SC", "Noto Sans SC", sans-serif',
+  yahei: '"Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif',
+  pingfang: '"PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif',
+  sarasa: '"Sarasa UI SC", "Sarasa Gothic SC", "Noto Sans CJK SC", sans-serif',
+  'noto-serif': '"Noto Serif CJK SC", "Source Han Serif SC", "Noto Serif SC", serif',
+  songti: '"Songti SC", SimSun, "Noto Serif CJK SC", serif',
+  kaiti: 'KaiTi, "Kaiti SC", STKaiti, "Noto Serif CJK SC", serif',
+  wenkai: '"LXGW WenKai", "霞鹜文楷", KaiTi, "Noto Serif CJK SC", serif',
+  mono: '"SFMono-Regular", Consolas, "Liberation Mono", "Noto Sans Mono CJK SC", monospace'
+}
+
+const fontOptions: Array<{ value: FontFamilyPreference; label: string }> = [
+  { value: 'system', label: '系统默认' },
+  { value: 'inter', label: 'Inter / 现代无衬线' },
+  { value: 'noto-sans', label: '思源黑体 / Noto Sans' },
+  { value: 'yahei', label: '微软雅黑' },
+  { value: 'pingfang', label: '苹方' },
+  { value: 'sarasa', label: '更纱黑体' },
+  { value: 'noto-serif', label: '思源宋体 / Noto Serif' },
+  { value: 'songti', label: '宋体' },
+  { value: 'kaiti', label: '楷体' },
+  { value: 'wenkai', label: '霞鹜文楷' },
+  { value: 'mono', label: '等宽字体' }
+]
+
+function appearanceSettings(settings: AppSettings): AppearanceSettings {
+  const appearance = settings.appearance
+  if (!appearance) return defaultAppearance
+  return {
+    theme: appearance.theme,
+    chatFontFamily: appearance.chatFontFamily ?? appearance.fontFamily ?? 'system',
+    uiFontFamily: appearance.uiFontFamily ?? 'system',
+    fontSize: appearance.fontSize
+  }
+}
 
 function permissionModeLabel(mode?: PermissionMode): string {
   return permissionModes.find((item) => item.value === mode)?.label ?? '请求批准'
@@ -119,6 +161,23 @@ export function App(): ReactElement {
   const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
   const latestContextUsage = useMemo(() => [...(activeConversation?.messages ?? [])].reverse().find((message) => message.role === 'assistant' && message.contextUsage)?.contextUsage, [activeConversation?.messages])
   const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.steps?.reduce((total, step) => total + step.detail.length, 0) ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
+  const appearance = appearanceSettings(settings)
+
+  useEffect(() => {
+    const root = document.documentElement
+    const darkMode = window.matchMedia('(prefers-color-scheme: dark)')
+    const applyTheme = (): void => {
+      const theme = appearance.theme === 'system' ? darkMode.matches ? 'dark' : 'light' : appearance.theme
+      root.dataset.theme = theme
+      root.style.colorScheme = theme
+    }
+    applyTheme()
+    root.style.setProperty('--app-font-family', fontStacks[appearance.uiFontFamily])
+    root.style.setProperty('--chat-font-family', fontStacks[appearance.chatFontFamily])
+    root.style.setProperty('--app-content-font-size', Math.min(18, Math.max(12, appearance.fontSize)) + 'px')
+    if (appearance.theme === 'system') darkMode.addEventListener('change', applyTheme)
+    return () => darkMode.removeEventListener('change', applyTheme)
+  }, [appearance.chatFontFamily, appearance.fontSize, appearance.theme, appearance.uiFontFamily])
 
   useEffect(() => {
     void Promise.all([window.api.getConversations(), window.api.getSettings(), window.api.getPolicy()]).then(([savedConversations, savedSettings, savedPolicy]) => {
@@ -1134,17 +1193,34 @@ function formatElapsed(durationMs: number): string {
 }
 
 function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => Promise<void> }): ReactElement {
-  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '集成', tabs: ['打开方式'] }, { title: '编码', tabs: ['Git', '环境'] }]
-  const isGeneral = tab === '常规'
-  return <div className="settings-app"><header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header><aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === '常规' ? <SettingsIcon /> : <Icon name={item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : item === '外观' ? 'message' : item === '打开方式' ? 'folder' : 'shield'} />}{item}</button>)}</section>)}</aside><main className="settings-content">{isGeneral ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : tab === '打开方式' ? <NavigationSettings settings={settings} setSettings={setSettings} onSave={onSave} /> : <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />}</main></div>
+  const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '编码', tabs: ['Git', '环境'] }]
+  const content = tab === '常规'
+    ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} />
+    : tab === '外观'
+      ? <AppearanceSettingsPage settings={settings} setSettings={setSettings} onSave={onSave} />
+      : tab === '个性化'
+        ? <PersonalizationSettingsPage settings={settings} setSettings={setSettings} onSave={onSave} />
+        : tab === '配置'
+          ? <ConfigSettings title={tab} settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} onSave={onSave} />
+          : <SettingsPlaceholder title={tab} />
+  const tabIcon = (item: SettingTab): ReactElement => item === '常规'
+    ? <SettingsIcon />
+    : item === '外观'
+      ? <Palette />
+      : item === '个性化'
+        ? <Bot />
+        : <Icon name={item === 'Git' ? 'branch' : item === '环境' ? 'monitor' : 'shield'} />
+  return <div className="settings-app">
+    <header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span></header>
+    <aside className="settings-nav"><button className="back-to-app" onClick={onBack}><Icon name="chevron-left" />返回应用</button><div className="settings-search"><Icon name="search-small" /><input placeholder="搜索设置…" /></div>{groups.map((group) => <section key={group.title}><p>{group.title}</p>{group.tabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{tabIcon(item)}{item}</button>)}</section>)}</aside>
+    <main className="settings-content">{content}</main>
+  </div>
 }
 
-function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+function NavigationSettingsSection({ settings, setSettings }: { settings: AppSettings; setSettings: (value: AppSettings) => void }): ReactElement {
   const [selecting, setSelecting] = useState<'file' | 'browser' | undefined>()
-  const [saved, setSaved] = useState(false)
   async function selectApplication(kind: 'file' | 'browser'): Promise<void> {
     setSelecting(kind)
-    setSaved(false)
     try {
       const selectedPath = await window.api.selectApplication(kind)
       if (!selectedPath) return
@@ -1160,7 +1236,6 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
     }
   }
   function resetApplication(kind: 'file' | 'browser'): void {
-    setSaved(false)
     setSettings({
       ...settings,
       navigation: {
@@ -1169,19 +1244,13 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
       }
     })
   }
-  async function save(): Promise<void> {
-    await onSave()
-    setSaved(true)
-  }
   const rows = [
     { kind: 'file' as const, title: '代码和文本文件', description: '用于打开代码、Markdown、配置和其他文本文件。', path: settings.navigation.fileApplicationPath, icon: <FileCode2 /> },
     { kind: 'browser' as const, title: 'Web 浏览器', description: '用于打开任务产生的 HTTP 和 HTTPS 服务地址。', path: settings.navigation.browserApplicationPath, icon: <Globe2 /> }
   ]
-  return <div className="settings-inner navigation-settings">
-    <h1>打开方式</h1>
-    <section className="settings-section">
-      <h2>默认应用</h2>
-      <p>未指定应用时，将使用 Windows 的系统默认设置。</p>
+  return <section className="settings-section navigation-settings">
+      <h2>打开方式</h2>
+      <p>配置代码文件和网页服务的默认打开应用；未指定时使用操作系统默认设置。</p>
       <div className="application-list">{rows.map((row) => <div className="application-row" key={row.kind}>
         <span className="application-type-icon">{row.icon}</span>
         <div className="application-details"><strong>{row.title}</strong><p>{row.description}</p><code title={row.path || '使用系统默认'}>{row.path || '使用系统默认'}</code></div>
@@ -1191,15 +1260,53 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
         </div>
       </div>)}</div>
     </section>
-    <button className="settings-save" onClick={() => void save()}>保存更改</button>
-    {saved && <div className="config-notice success"><Check />打开方式已保存到本地。</div>}
-  </div>
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
 function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
   const selectedMode = settings.permissionMode ?? 'request_approval'
-  return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><p>选择 Agent 何时可自动执行，以及哪些操作需要您的批准。</p><div className="permission-option-list">{permissionModes.map((mode) => <button type="button" className={'permission-option ' + (selectedMode === mode.value ? 'selected' : '')} key={mode.value} onClick={() => setSettings({ ...settings, permissionMode: mode.value })}><span className="permission-option-icon"><Icon name="shield" /></span><span><strong>{mode.label}</strong><small>{mode.description}</small></span><b>{selectedMode === mode.value ? <Check /> : null}</b></button>)}</div></section><button className="settings-save" onClick={() => void onSave()}>保存更改</button></div>
+  const [saved, setSaved] = useState(false)
+  async function save(): Promise<void> { await onSave(); setSaved(true) }
+  return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><p>选择 Agent 何时可自动执行，以及哪些操作需要您的批准。</p><div className="permission-option-list">{permissionModes.map((mode) => <button type="button" className={'permission-option ' + (selectedMode === mode.value ? 'selected' : '')} key={mode.value} onClick={() => { setSaved(false); setSettings({ ...settings, permissionMode: mode.value }) }}><span className="permission-option-icon"><Icon name="shield" /></span><span><strong>{mode.label}</strong><small>{mode.description}</small></span><b>{selectedMode === mode.value ? <Check /> : null}</b></button>)}</div></section><NavigationSettingsSection settings={settings} setSettings={(value) => { setSaved(false); setSettings(value) }} /><button className="settings-save" onClick={() => void save()}>保存更改</button>{saved ? <div className="config-notice success"><Check />常规设置已保存。</div> : null}</div>
+}
+
+function AppearanceSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+  const appearance = appearanceSettings(settings)
+  const [saved, setSaved] = useState(false)
+  const themes: Array<{ value: ThemePreference; label: string; description: string; icon: ReactElement }> = [
+    { value: 'system', label: '跟随系统', description: '自动匹配操作系统外观', icon: <Icon name="monitor" /> },
+    { value: 'light', label: '浅色', description: '始终使用明亮界面', icon: <Sun /> },
+    { value: 'dark', label: '深色', description: '始终使用深色界面', icon: <Moon /> }
+  ]
+  function update(patch: Partial<AppearanceSettings>): void { setSaved(false); setSettings({ ...settings, appearance: { ...appearance, ...patch } }) }
+  async function save(): Promise<void> { await onSave(); setSaved(true) }
+  return <div className="settings-inner appearance-settings"><h1>外观</h1>
+    <section className="settings-section"><h2>主题</h2><p>主题会立即预览，保存后在下次启动时继续使用。</p><div className="preference-cards theme-cards">{themes.map((theme) => <button type="button" key={theme.value} className={'preference-card ' + (appearance.theme === theme.value ? 'selected' : '')} onClick={() => update({ theme: theme.value })}>{theme.icon}<span><strong>{theme.label}</strong><small>{theme.description}</small></span><b>{appearance.theme === theme.value ? <Check /> : null}</b></button>)}</div></section>
+    <section className="settings-section"><h2>字体</h2><p>分别设置对话内容和客户端界面的字体；对话字号不会缩放侧栏与菜单。</p><div className="appearance-fields"><label>对话字体<select value={appearance.chatFontFamily} onChange={(event) => update({ chatFontFamily: event.target.value as FontFamilyPreference })}>{fontOptions.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label><label>客户端字体<select value={appearance.uiFontFamily} onChange={(event) => update({ uiFontFamily: event.target.value as FontFamilyPreference })}>{fontOptions.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label><label className="chat-font-size">对话字号 <output>{appearance.fontSize}px</output><input type="range" min="12" max="18" step="1" value={appearance.fontSize} onChange={(event) => update({ fontSize: Number(event.target.value) })} /></label></div><div className="font-preview"><span>对话字体预览</span><p style={{ fontFamily: fontStacks[appearance.chatFontFamily], fontSize: appearance.fontSize }}>Agent 会使用清晰舒适的文字陪你完成任务。Aa 123</p></div></section>
+    <button className="settings-save" onClick={() => void save()}>保存更改</button>{saved ? <div className="config-notice success"><Check />外观设置已保存。</div> : null}
+  </div>
+}
+
+function PersonalizationSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+  const personalization = settings.personalization ?? { tone: 'balanced' as AgentTone, customInstructions: '' }
+  const [saved, setSaved] = useState(false)
+  const tones: Array<{ value: AgentTone; label: string; description: string }> = [
+    { value: 'balanced', label: '自然平衡', description: '根据任务自动调整表达深度' },
+    { value: 'concise', label: '简洁直接', description: '优先结论，减少重复说明' },
+    { value: 'professional', label: '专业严谨', description: '表达准确、克制且结构清晰' },
+    { value: 'friendly', label: '友好自然', description: '像可靠的协作伙伴一样沟通' }
+  ]
+  function update(patch: Partial<typeof personalization>): void { setSaved(false); setSettings({ ...settings, personalization: { ...personalization, ...patch } }) }
+  async function save(): Promise<void> { await onSave(); setSaved(true) }
+  return <div className="settings-inner personalization-settings"><h1>个性化</h1>
+    <section className="settings-section"><h2>Agent 语气</h2><p>控制最终回复的表达风格，不影响工具能力和安全规则。</p><div className="tone-grid">{tones.map((tone) => <button type="button" key={tone.value} className={'tone-card ' + (personalization.tone === tone.value ? 'selected' : '')} onClick={() => update({ tone: tone.value })}><span><strong>{tone.label}</strong><small>{tone.description}</small></span><b>{personalization.tone === tone.value ? <Check /> : null}</b></button>)}</div></section>
+    <section className="settings-section"><h2>自定义指令</h2><p>告诉 Agent 长期需要遵循的偏好。当前任务、安全策略和工具协议始终优先。</p><textarea className="custom-instructions" maxLength={4000} value={personalization.customInstructions} onChange={(event) => update({ customInstructions: event.target.value })} placeholder="例如：默认使用中文回答；修改代码后说明验证结果；不要在结论中重复问题。" /><div className="instruction-count">{personalization.customInstructions.length.toLocaleString('zh-CN')} / 4,000</div></section>
+    <button className="settings-save" onClick={() => void save()}>保存更改</button>{saved ? <div className="config-notice success"><Check />个性化设置已保存。</div> : null}
+  </div>
+}
+
+function SettingsPlaceholder({ title }: { title: string }): ReactElement {
+  return <div className="settings-inner"><h1>{title}</h1><section className="settings-section"><h2>即将支持</h2><p>此区域将在后续版本中提供更多配置。</p></section></div>
 }
 function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => Promise<void> }): ReactElement {
   const [saving, setSaving] = useState(false)

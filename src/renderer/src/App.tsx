@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { cloneElement, FormEvent, isValidElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Moon, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Sun, Trash2 } from 'lucide-react'
 import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
@@ -7,6 +7,7 @@ import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultMod
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
 import { isHiddenInternalAgentStep } from '../../shared/agent-steps'
+import { searchConversationHistory, type ConversationSearchResult } from '../../shared/conversation-search'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -142,6 +143,11 @@ export function App(): ReactElement {
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [view, setView] = useState<View>('chat')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchJumpTarget, setSearchJumpTarget] = useState<{ conversationId: string; messageId: string } | undefined>()
+  const [highlightedMessageId, setHighlightedMessageId] = useState('')
+  const [highlightedSearchQuery, setHighlightedSearchQuery] = useState('')
   const [tab, setTab] = useState<SettingTab>('常规')
   const messageListRef = useRef<HTMLElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -152,6 +158,7 @@ export function App(): ReactElement {
   const modelControlRef = useRef<HTMLDivElement | null>(null)
   const permissionControlRef = useRef<HTMLDivElement | null>(null)
   const stickToBottomRef = useRef(true)
+  const pendingSearchJumpRef = useRef<{ conversationId: string; messageId: string } | undefined>(undefined)
 
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
   const visibleConversations = useMemo(() => conversations.filter((item) => item.messages.length > 0), [conversations])
@@ -160,6 +167,7 @@ export function App(): ReactElement {
   const defaultModel = useMemo(() => getDefaultModelProfile(settings), [settings])
   const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
   const latestContextUsage = useMemo(() => [...(activeConversation?.messages ?? [])].reverse().find((message) => message.role === 'assistant' && message.contextUsage)?.contextUsage, [activeConversation?.messages])
+  const searchResults = useMemo(() => searchConversationHistory(conversations, searchQuery), [conversations, searchQuery])
   const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.steps?.reduce((total, step) => total + step.detail.length, 0) ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
   const appearance = appearanceSettings(settings)
 
@@ -337,6 +345,7 @@ export function App(): ReactElement {
   useLayoutEffect(() => {
     const list = messageListRef.current
     if (!list || view !== 'chat') return
+    if (pendingSearchJumpRef.current?.conversationId === activeConversation?.id) return
     const jumpToBottom = (): void => {
       list.scrollTop = list.scrollHeight
       stickToBottomRef.current = true
@@ -346,6 +355,49 @@ export function App(): ReactElement {
     const frame = requestAnimationFrame(jumpToBottom)
     return () => cancelAnimationFrame(frame)
   }, [activeConversation?.id, view])
+
+  useLayoutEffect(() => {
+    const list = messageListRef.current
+    if (!list || view !== 'chat' || !searchJumpTarget || searchJumpTarget.conversationId !== activeConversation?.id) return
+    const frame = requestAnimationFrame(() => {
+      const target = Array.from(list.querySelectorAll<HTMLElement>('[data-message-id]'))
+        .find((element) => element.dataset.messageId === searchJumpTarget.messageId)
+      pendingSearchJumpRef.current = undefined
+      setSearchJumpTarget(undefined)
+      if (!target) return
+      const listRect = list.getBoundingClientRect()
+      const focusTarget = target.querySelector<HTMLElement>('[data-message-content]') ?? target
+      const targetRect = focusTarget.getBoundingClientRect()
+      const composerRect = list.parentElement?.querySelector<HTMLElement>('.chat-composer')?.getBoundingClientRect()
+      const visibleBottom = composerRect ? Math.min(listRect.bottom, composerRect.top) : listRect.bottom
+      const visibleCenter = listRect.top + Math.max(1, visibleBottom - listRect.top) / 2
+      const targetCenter = targetRect.top + targetRect.height / 2
+      list.scrollTo({ top: list.scrollTop + targetCenter - visibleCenter, behavior: 'auto' })
+      const distance = Math.max(0, list.scrollHeight - list.clientHeight - list.scrollTop)
+      stickToBottomRef.current = distance <= SCROLL_BOTTOM_THRESHOLD
+      setShowScrollToBottom(distance > SHOW_SCROLL_BUTTON_THRESHOLD)
+      setHighlightedMessageId(searchJumpTarget.messageId)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [activeConversation?.id, searchJumpTarget, view])
+
+  useEffect(() => {
+    if (!highlightedMessageId) return
+    const timer = window.setTimeout(() => {
+      setHighlightedMessageId('')
+      setHighlightedSearchQuery('')
+    }, 1800)
+    return () => window.clearTimeout(timer)
+  }, [highlightedMessageId])
+
+  useEffect(() => {
+    if (!searchOpen) return
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setSearchOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [searchOpen])
 
   useEffect(() => {
     const list = messageListRef.current
@@ -518,6 +570,8 @@ export function App(): ReactElement {
     const conversation = await window.api.createConversation()
     setConversations((current) => [conversation, ...current])
     setActiveId(conversation.id)
+    setSearchOpen(false)
+    setView('chat')
   }
 
   async function deleteConversation(conversationId: string): Promise<void> {
@@ -605,6 +659,28 @@ export function App(): ReactElement {
     setShowScrollToBottom(false)
   }
 
+  function openConversation(conversationId: string): void {
+    pendingSearchJumpRef.current = undefined
+    setSearchJumpTarget(undefined)
+    setHighlightedMessageId('')
+    setHighlightedSearchQuery('')
+    setActiveId(conversationId)
+    setSearchOpen(false)
+    setView('chat')
+  }
+
+  function openSearchResult(result: ConversationSearchResult): void {
+    const target = { conversationId: result.conversationId, messageId: result.messageId }
+    pendingSearchJumpRef.current = target
+    setSearchJumpTarget(target)
+    setHighlightedMessageId('')
+    setHighlightedSearchQuery(searchQuery)
+    stickToBottomRef.current = false
+    setActiveId(result.conversationId)
+    setSearchOpen(false)
+    setView('chat')
+  }
+
   if (view === 'settings' && policy) return <>
     <SettingsPage settings={settings} setSettings={setSettings} policy={policy} setPolicy={setPolicy} tab={tab} setTab={setTab} onBack={() => void closeSettings()} onSave={saveSettings} />
   </>
@@ -612,12 +688,12 @@ export function App(): ReactElement {
   return <div className="chat-app">
     <header className="window-bar"><Icon name="panel" className="bar-icon" /><button className="bar-icon-button"><Icon name="chevron-left" /></button><button className="bar-icon-button"><Icon name="chevron-right" /></button><span>文件</span><span>编辑</span><span>视图</span><span>帮助</span><div className="bar-spacer" /><button className="top-settings" onClick={() => setView('settings')}><SettingsIcon />设置</button></header>
     <aside className="sidebar">
-      <nav className="quick-nav"><button className="quick-nav-active"><Icon name="message" /><span>快速对话</span></button><button><Icon name="search" /><span>搜索</span></button><button><Icon name="skills" /><span>技能</span></button><button><Icon name="clock" /><span>自动化</span></button></nav>
-      <section className="project-list"><p>会话</p><button className="new-chat" onClick={() => void createConversation()}><Icon name="plus" />新对话</button><div className="task-list">{visibleConversations.map((conversation) => <div className={'conversation-row ' + (conversation.id === activeConversation?.id ? 'selected' : '')} key={conversation.id}><button onClick={() => setActiveId(conversation.id)}><span>{conversation.title}</span><small>{conversation.messages.length}</small></button><button className="delete-chat" onClick={() => void deleteConversation(conversation.id)} title="删除会话"><Icon name="trash" /></button></div>)}</div></section>
+      <nav className="quick-nav"><button type="button" className={view === 'chat' && !searchOpen ? 'quick-nav-active' : ''} onClick={() => { setSearchOpen(false); setView('chat') }}><Icon name="message" /><span>快速对话</span></button><button type="button" className={searchOpen ? 'quick-nav-active' : ''} aria-expanded={searchOpen} onClick={() => setSearchOpen(true)}><Icon name="search" /><span>搜索</span></button><button type="button"><Icon name="skills" /><span>技能</span></button><button type="button"><Icon name="clock" /><span>自动化</span></button></nav>
+      <section className="project-list"><p>会话</p><button className="new-chat" onClick={() => void createConversation()}><Icon name="plus" />新对话</button><div className="task-list">{visibleConversations.map((conversation) => <div className={'conversation-row ' + (view === 'chat' && conversation.id === activeConversation?.id ? 'selected' : '')} key={conversation.id}><button onClick={() => openConversation(conversation.id)}><span>{conversation.title}</span><small>{conversation.messages.length}</small></button><button className="delete-chat" onClick={() => void deleteConversation(conversation.id)} title="删除会话"><Icon name="trash" /></button></div>)}</div></section>
       <button className="sidebar-settings" onClick={() => setView('settings')}><SettingsIcon /><span>设置</span></button>
     </aside>
     <main className="chat-main">
-      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
+      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} highlighted={highlightedMessageId === message.id} highlightQuery={highlightedSearchQuery} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
       {showScrollToBottom ? <button type="button" className="scroll-to-bottom" title="回到底部" aria-label="回到底部" onClick={scrollToLatest}><ArrowDown /></button> : null}
       <form className="chat-composer" onSubmit={submit}>
         <input ref={fileInputRef} className="attachment-input" type="file" accept={ATTACHMENT_ACCEPT} multiple onChange={(event) => { queueFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = '' }} />
@@ -630,7 +706,89 @@ export function App(): ReactElement {
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
+    {searchOpen ? <ConversationSearchOverlay query={searchQuery} onQueryChange={setSearchQuery} results={searchResults} conversationCount={visibleConversations.length} onOpenResult={openSearchResult} onClose={() => setSearchOpen(false)} /> : null}
   </div>
+}
+
+function ConversationSearchOverlay({ query, onQueryChange, results, conversationCount, onOpenResult, onClose }: {
+  query: string
+  onQueryChange: (query: string) => void
+  results: ConversationSearchResult[]
+  conversationCount: number
+  onOpenResult: (result: ConversationSearchResult) => void
+  onClose: () => void
+}): ReactElement {
+  const hasQuery = Boolean(query.trim())
+  return <div className="conversation-search-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="conversation-search-dialog" role="dialog" aria-modal="true" aria-label="搜索对话历史">
+    <header className="conversation-search-header">
+      <div><h1>搜索对话</h1><p>在全部 {conversationCount} 个会话中查找消息</p></div>
+      <button type="button" className="conversation-search-close" onClick={onClose} title="关闭搜索" aria-label="关闭搜索"><Icon name="close" /></button>
+    </header>
+    <label className="conversation-search-input"><Icon name="search" /><input autoFocus type="search" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索消息或附件名称…" aria-label="搜索全部对话" />{query ? <button type="button" onClick={() => onQueryChange('')} title="清空搜索" aria-label="清空搜索"><Icon name="close" /></button> : null}</label>
+    <div className="conversation-search-summary">{hasQuery ? <><strong>{results.length}</strong> 条结果</> : '输入关键词开始搜索'}</div>
+    <div className="conversation-search-results">
+      {!hasQuery ? <div className="conversation-search-empty"><Icon name="search" /><strong>搜索全部对话历史</strong><p>可搜索你与 Agent 的消息正文和附件名称，多个关键词用空格分隔。</p></div> : null}
+      {hasQuery && !results.length ? <div className="conversation-search-empty"><Icon name="search" /><strong>没有找到相关消息</strong><p>换一个关键词，或减少关键词后再试。</p></div> : null}
+      {results.map((result) => <button type="button" className="conversation-search-result" key={result.conversationId + ':' + result.messageId} onClick={() => onOpenResult(result)}>
+        <span className={'conversation-search-role ' + result.role}>{result.role === 'user' ? '你' : 'Agent'}</span>
+        <span className="conversation-search-result-body"><span className="conversation-search-result-meta"><strong>{result.conversationTitle}</strong><time dateTime={result.createdAt}>{formatSearchTimestamp(result.createdAt)}</time></span><span className="conversation-search-snippet"><HighlightedSearchText text={result.snippet} query={query} /></span></span>
+        <Icon name="chevron-right" />
+      </button>)}
+    </div>
+  </section></div>
+}
+
+function HighlightedSearchText({ text, query }: { text: string; query: string }): ReactElement {
+  return <>{highlightSearchText(text, query, 'conversation-search-match')}</>
+}
+
+function highlightSearchText(text: string, query: string, className: string): ReactNode {
+  const terms = searchHighlightTerms(query)
+  if (!terms.length) return text
+  const pattern = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+  const matcher = new RegExp('(' + pattern + ')', 'giu')
+  return text.split(matcher).map((part, index) => terms.some((term) => normalizeHighlightTerm(part) === normalizeHighlightTerm(term))
+    ? <mark className={className} key={index} data-search-match>{part}</mark>
+    : part)
+}
+
+function highlightSearchNode(node: ReactNode, query: string): ReactNode {
+  if (typeof node === 'string') return highlightSearchText(node, query, 'message-search-match')
+  if (Array.isArray(node)) return node.map((child) => highlightSearchNode(child, query))
+  if (!isValidElement<{ children?: ReactNode }>(node) || node.props.children === undefined) return node
+  if (node.type === 'mark') return node
+  return cloneElement(node, undefined, highlightSearchNode(node.props.children, query))
+}
+
+function searchHighlightTerms(query: string): string[] {
+  return [...new Set(query.normalize('NFKC').trim().split(/\s+/).filter(Boolean))].sort((left, right) => right.length - left.length)
+}
+
+function normalizeHighlightTerm(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase()
+}
+
+function markdownComponentsWithSearchHighlight(query: string): Components {
+  const components: Components = { a: MarkdownExternalLink }
+  if (!query.trim()) return components
+  const highlight = (children: ReactNode): ReactNode => highlightSearchNode(children, query)
+  components.p = ({ children }) => <p>{highlight(children)}</p>
+  components.li = ({ children }) => <li>{highlight(children)}</li>
+  components.h1 = ({ children }) => <h1>{highlight(children)}</h1>
+  components.h2 = ({ children }) => <h2>{highlight(children)}</h2>
+  components.h3 = ({ children }) => <h3>{highlight(children)}</h3>
+  components.h4 = ({ children }) => <h4>{highlight(children)}</h4>
+  components.h5 = ({ children }) => <h5>{highlight(children)}</h5>
+  components.h6 = ({ children }) => <h6>{highlight(children)}</h6>
+  components.td = ({ children, style }) => <td style={style}>{highlight(children)}</td>
+  components.th = ({ children, style }) => <th style={style}>{highlight(children)}</th>
+  return components
+}
+
+function formatSearchTimestamp(value: string): string {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ''
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date)
 }
 
 function McpApprovalMessage({ request, onRespond }: { request: McpApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
@@ -713,17 +871,18 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
   return upsertStep(currentSteps, nextStep)
 }
 
-function MessageView({ conversationId, message, onPreview }: { conversationId: string; message: ChatMessage; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
+function MessageView({ conversationId, message, highlighted, highlightQuery, onPreview }: { conversationId: string; message: ChatMessage; highlighted: boolean; highlightQuery: string; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
-  return <article className={'message-item ' + message.role}>
+  const activeHighlightQuery = highlighted ? highlightQuery : ''
+  return <article data-message-id={message.id} className={'message-item ' + message.role + (highlighted ? ' search-highlight' : '')}>
     <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
     {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
-    <div className="message-content-group">
+    <div className="message-content-group" data-message-content>
       {message.content ? message.role === 'assistant'
-        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: MarkdownExternalLink }}>{message.content}</ReactMarkdown></div>
-        : <div className="message-bubble">{message.content}</div> : null}
+        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponentsWithSearchHighlight(activeHighlightQuery)}>{message.content}</ReactMarkdown></div>
+        : <div className="message-bubble">{highlightSearchNode(message.content, activeHighlightQuery)}</div> : null}
       {message.role === 'assistant' && message.artifacts?.length ? <ResultArtifacts conversationId={conversationId} artifacts={message.artifacts} /> : null}
-      {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onPreview={() => onPreview(attachment)} />)}</div> : null}
+      {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} highlightQuery={activeHighlightQuery} onPreview={() => onPreview(attachment)} />)}</div> : null}
       {message.role === 'assistant' && message.tokenUsage ? <TokenUsageView usage={message.tokenUsage} /> : null}
     </div>
   </article>
@@ -893,11 +1052,11 @@ function normalizeServiceArtifactUrl(value: string): string | undefined {
   }
 }
 
-function AttachmentCard({ attachment, onRemove, onPreview }: { attachment: ChatAttachment; onRemove?: () => void; onPreview?: () => void }): ReactElement {
+function AttachmentCard({ attachment, highlightQuery = '', onRemove, onPreview }: { attachment: ChatAttachment; highlightQuery?: string; onRemove?: () => void; onPreview?: () => void }): ReactElement {
   const isImage = isImageAttachmentType(attachment.mimeType)
   return <div className={'attachment-card ' + (isImage ? 'image' : 'file')} title={attachment.name}>
     {isImage ? <button type="button" className="attachment-image-button" aria-label={'查看原图 ' + attachment.name} onClick={onPreview}><img src={attachment.dataUrl} alt={attachment.name} /></button> : <div className="attachment-file-icon"><Icon name="file" /></div>}
-    {!isImage ? <div className="attachment-file-meta"><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)}</small></div> : <span className="attachment-image-name">{attachment.name}</span>}
+    {!isImage ? <div className="attachment-file-meta"><strong>{highlightSearchNode(attachment.name, highlightQuery)}</strong><small>{formatBytes(attachment.size)}</small></div> : <span className="attachment-image-name">{highlightSearchNode(attachment.name, highlightQuery)}</span>}
     {onRemove ? <button type="button" className="attachment-remove" aria-label={'移除附件 ' + attachment.name} onClick={onRemove}><Icon name="close" /></button> : null}
   </div>
 }

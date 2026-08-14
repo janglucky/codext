@@ -119,12 +119,13 @@ function createProtocolServer(processingService: PptProcessingService): McpServe
       path: z.string().min(1).describe('工作区内 PPTX 文件的相对路径。'),
       workspace_path: z.string().min(1).optional().describe('由宿主应用授权的会话工作区绝对路径。'),
       include_notes: z.boolean().optional().default(true).describe('是否包含演讲者备注。'),
+      allow_external_path: z.boolean().optional().default(false).describe('宿主是否已授权读取工作区外路径。'),
       max_characters: z.number().int().min(1000).max(120000).optional().describe('最多返回的字符数。')
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
-  }, async ({ path, workspace_path, include_notes, max_characters }) => {
+  }, async ({ path, workspace_path, include_notes, allow_external_path, max_characters }) => {
     try {
-      const text = await processingService.parse(path, { includeNotes: include_notes, maxCharacters: max_characters }, workspace_path)
+      const text = await processingService.parse(path, { includeNotes: include_notes, maxCharacters: max_characters, allowExternalPaths: allow_external_path }, workspace_path)
       return { content: [{ type: 'text', text }] }
     } catch (error) {
       return { content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }], isError: true }

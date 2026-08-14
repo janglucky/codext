@@ -2,10 +2,11 @@ import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type 
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
+import { isHiddenInternalAgentStep } from '../../shared/agent-steps'
 import {
   ATTACHMENT_ACCEPT,
   inferAttachmentMimeType,
@@ -47,6 +48,7 @@ const initialSettings: AppSettings = {
   model: { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS },
   models: [],
   skillsEnabled: true,
+  permissionMode: 'request_approval',
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
 const statusText: Record<TaskStatus, string> = { pending: '等待中', reasoning: '分析中', acting: '执行中', validating: '校验中', succeeded: '已完成', failed: '失败', paused: '已暂停' }
@@ -61,6 +63,20 @@ type SettingTab = '常规' | '外观' | '配置' | '个性化' | '打开方式' 
 
 function Icon({ name, ...props }: IconProps): ReactElement {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{paths[name]}</svg>
+}
+
+const permissionModes: Array<{ value: PermissionMode; label: string; description: string }> = [
+  { value: 'full_access', label: '完全访问', description: '可不受限制地访问互联网和您电脑上的任何文件。' },
+  { value: 'auto_approve', label: '替我审批', description: '仅对检测到的风险操作请求批准。' },
+  { value: 'request_approval', label: '请求批准', description: '编辑外部文件和使用互联网时始终询问。' }
+]
+
+function permissionModeLabel(mode?: PermissionMode): string {
+  return permissionModes.find((item) => item.value === mode)?.label ?? '请求批准'
+}
+
+function PermissionMenu({ value, onChange }: { value: PermissionMode; onChange: (value: PermissionMode) => void }): ReactElement {
+  return <div className="permission-menu" role="menu"><p>Agent 权限</p>{permissionModes.map((mode) => <button type="button" role="menuitemradio" aria-checked={value === mode.value} className={value === mode.value ? 'selected' : ''} key={mode.value} onClick={() => onChange(mode.value)}><span><strong>{mode.label}</strong><small>{mode.description}</small></span>{value === mode.value ? <Check /> : null}</button>)}</div>
 }
 
 export function App(): ReactElement {
@@ -81,6 +97,7 @@ export function App(): ReactElement {
   const [selectedChoiceId, setSelectedChoiceId] = useState('')
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
+  const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [view, setView] = useState<View>('chat')
   const [tab, setTab] = useState<SettingTab>('常规')
@@ -89,7 +106,9 @@ export function App(): ReactElement {
   const attachmentsRef = useRef<ChatAttachment[]>([])
   const pendingAttachmentReadsRef = useRef<Promise<void> | null>(null)
   const runningConversationIdRef = useRef('')
+  const workspaceControlRef = useRef<HTMLDivElement | null>(null)
   const modelControlRef = useRef<HTMLDivElement | null>(null)
+  const permissionControlRef = useRef<HTMLDivElement | null>(null)
   const stickToBottomRef = useRef(true)
 
   const activeConversation = useMemo(() => conversations.find((item) => item.id === activeId) ?? conversations[0], [activeId, conversations])
@@ -126,6 +145,22 @@ export function App(): ReactElement {
   }, [])
 
   useEffect(() => {
+    if (!workspaceMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent): void => {
+      if (!workspaceControlRef.current?.contains(event.target as Node)) setWorkspaceMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setWorkspaceMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [workspaceMenuOpen])
+
+  useEffect(() => {
     if (!modelMenuOpen) return
     const closeOnPointerDown = (event: PointerEvent): void => {
       if (!modelControlRef.current?.contains(event.target as Node)) setModelMenuOpen(false)
@@ -140,6 +175,22 @@ export function App(): ReactElement {
       window.removeEventListener('keydown', closeOnEscape)
     }
   }, [modelMenuOpen])
+
+  useEffect(() => {
+    if (!permissionMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent): void => {
+      if (!permissionControlRef.current?.contains(event.target as Node)) setPermissionMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setPermissionMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [permissionMenuOpen])
 
   useEffect(() => {
     return window.api.onAgentDelta(({ conversationId, messageId, delta }) => {
@@ -428,6 +479,17 @@ export function App(): ReactElement {
     }
   }
 
+  async function selectPermissionMode(permissionMode: PermissionMode): Promise<void> {
+    if (running) return
+    const nextSettings = { ...settings, permissionMode }
+    setSettings(nextSettings)
+    setPermissionMenuOpen(false)
+    const savedSettings = await window.api.saveSettings(nextSettings)
+    // Keep the user's explicit choice when talking to a main process from an
+    // older hot-reload session that does not return the new field yet.
+    setSettings({ ...savedSettings, permissionMode: savedSettings.permissionMode ?? permissionMode })
+  }
+
   async function saveSettings(): Promise<void> {
     const savedSettings = await window.api.saveSettings(settings)
     const validModelIds = new Set(getModelProfiles(savedSettings).map((profile) => profile.id))
@@ -490,8 +552,8 @@ export function App(): ReactElement {
         <textarea aria-label="向 Agent 描述任务" value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => { const files = getClipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); queueFiles(files) } }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="输入任务，或直接粘贴截图；Enter 发送，Shift+Enter 换行" />
         {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
         {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
-        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><button type="button" className="permission"><Icon name="shield" />完全访问<Icon name="chevron-down" /></button></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
-        <footer><div className="workspace-control"><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + modelDisplayName(activeModel)} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{modelDisplayName(activeModel)}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {modelDisplayName(defaultModel)}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{modelDisplayName(profile)}</strong><small>{profile.name && profile.name !== modelDisplayName(profile) ? profile.name + ' · ' : ''}{profile.provider || 'OpenAI 兼容'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
+        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><div className="permission-control" ref={permissionControlRef}><button type="button" className={'permission mode-' + (settings.permissionMode ?? 'request_approval')} disabled={running} aria-expanded={permissionMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen(false); setPermissionMenuOpen((open) => !open) }}><Icon name="shield" />{permissionModeLabel(settings.permissionMode)}<Icon name="chevron-down" /></button>{permissionMenuOpen ? <PermissionMenu value={settings.permissionMode ?? 'request_approval'} onChange={(mode) => void selectPermissionMode(mode)} /> : null}</div></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
+        <footer><div className="workspace-control" ref={workspaceControlRef}><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setPermissionMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + modelDisplayName(activeModel)} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setPermissionMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{modelDisplayName(activeModel)}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {modelDisplayName(defaultModel)}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{modelDisplayName(profile)}</strong><small>{profile.name && profile.name !== modelDisplayName(profile) ? profile.name + ' · ' : ''}{profile.provider || 'OpenAI 兼容'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
@@ -511,12 +573,16 @@ function McpApprovalMessage({ request, onRespond }: { request: McpApprovalReques
 
 function CommandApprovalMessage({ request, onRespond }: { request: CommandApprovalRequest; onRespond: (approved: boolean) => void }): ReactElement {
   const highRisk = request.riskLevel === 'blocked'
+  const isNetwork = request.approvalKind === 'network'
+  const isExternalFile = request.approvalKind === 'external-file'
+  const title = isNetwork ? '联网访问确认' : isExternalFile ? '外部文件编辑确认' : '执行命令确认'
+  const label = isNetwork ? '操作' : isExternalFile ? '文件' : '命令'
   return <article className={'message-item assistant mcp-approval-message ' + (highRisk ? 'high-risk-command' : '')} role="group" aria-labelledby="command-approval-title">
     <div className="message-meta"><span>Codext Agent</span><b className="run-status command-waiting">{highRisk ? '等待高风险确认' : '等待确认'}</b></div>
     <section className={'mcp-approval-inline command-approval-inline ' + (highRisk ? 'high-risk' : '')}>
-      <div className="mcp-approval-heading"><span className="mcp-approval-icon command"><SquareTerminal /></span><div><h2 id="command-approval-title">执行命令确认</h2><p>{request.reason}</p></div></div>
-      <dl className="mcp-approval-details"><div><dt>命令</dt><dd>{request.displayCommand}</dd></div>{request.background ? <div><dt>模式</dt><dd>后台启动，成功创建进程后返回</dd></div> : null}{request.workspacePath ? <div><dt>目录</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
-      <div className="mcp-approval-footer"><span>{highRisk ? '高风险操作，仅确认本次' : '仅确认本次命令'}</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className={'mcp-allow ' + (highRisk ? 'danger' : '')} autoFocus={!highRisk} onClick={() => onRespond(true)}>{highRisk ? '仍然执行' : '执行一次'}</button></div></div>
+      <div className="mcp-approval-heading"><span className="mcp-approval-icon command">{isNetwork ? <Globe2 /> : isExternalFile ? <FileCog /> : <SquareTerminal />}</span><div><h2 id="command-approval-title">{title}</h2><p>{request.reason}</p></div></div>
+      <dl className="mcp-approval-details"><div><dt>{label}</dt><dd>{isExternalFile ? request.path ?? request.displayCommand : request.displayCommand}</dd></div>{request.background ? <div><dt>模式</dt><dd>后台启动，成功创建进程后返回</dd></div> : null}{request.workspacePath ? <div><dt>工作区</dt><dd>{request.workspacePath}</dd></div> : null}</dl>
+      <div className="mcp-approval-footer"><span>{highRisk ? '高风险操作，仅确认本次' : '仅批准本次操作'}</span><div className="mcp-approval-actions"><button type="button" className="mcp-cancel" onClick={() => onRespond(false)}>拒绝</button><button type="button" className={'mcp-allow ' + (highRisk ? 'danger' : '')} autoFocus={!highRisk} onClick={() => onRespond(true)}>{highRisk ? '仍然执行' : '允许一次'}</button></div></div>
     </section>
   </article>
 }
@@ -793,7 +859,7 @@ function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
     <summary><span>{isRunning ? '正在处理 ' + elapsed : '已处理 ' + elapsed}</span><small>{flowItems.length || 1} 个步骤 · {actionCount} 个工具</small></summary>
     <div className="agent-flow">
       {flowItems.length ? flowItems.map((item) => item.kind === 'tool'
-        ? <AgentToolCallView key={item.action.id} action={item.action} observation={item.observation} />
+        ? <AgentToolCallView key={item.action.id} action={item.action} liveOutput={item.liveOutput} observation={item.observation} />
         : <AgentStepView key={item.step.id} step={item.step} />
       ) : <AgentStatusLine status="thinking" text={isRunning ? THINKING_PLACEHOLDER : '本次没有返回执行过程。'} />}
     </div>
@@ -802,19 +868,27 @@ function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
 
 type AgentFlowItem =
   | { kind: 'step'; step: TaskStep }
-  | { kind: 'tool'; action: TaskStep; observation?: TaskStep }
+  | { kind: 'tool'; action: TaskStep; liveOutput?: TaskStep; observation?: TaskStep }
 
 function buildAgentFlowItems(steps: TaskStep[]): AgentFlowItem[] {
   const items: AgentFlowItem[] = []
   const pendingTools: Array<Extract<AgentFlowItem, { kind: 'tool' }>> = []
 
   for (const taskStep of steps) {
-    if (taskStep.phase === 'reason' && (taskStep.title === '已规划工具执行顺序' || taskStep.title === '已补全工具参数')) continue
+    if (isHiddenInternalAgentStep(taskStep)) continue
     if (taskStep.phase === 'act' && taskStep.title.startsWith('正在执行工具')) {
       const item: Extract<AgentFlowItem, { kind: 'tool' }> = { kind: 'tool', action: taskStep }
       items.push(item)
       pendingTools.push(item)
       continue
+    }
+    if (taskStep.phase === 'act' && taskStep.title.startsWith('命令实时输出：')) {
+      const actionId = taskStep.title.replace(/^命令实时输出：/, '').trim()
+      const item = pendingTools.find((candidate) => candidate.action.id === actionId)
+      if (item) {
+        item.liveOutput = taskStep
+        continue
+      }
     }
     if (taskStep.phase === 'act' && isObservationStepTitle(taskStep.title)) {
       const observationTool = observationToolName(taskStep.title)
@@ -845,21 +919,49 @@ function normalizeToolLabel(value: string): string {
   return value.trim().toLowerCase().replaceAll('-', '_')
 }
 
-function AgentToolCallView({ action, observation }: { action: TaskStep; observation?: TaskStep }): ReactElement {
+function AgentToolCallView({ action, liveOutput, observation }: { action: TaskStep; liveOutput?: TaskStep; observation?: TaskStep }): ReactElement {
   const completed = Boolean(observation)
   const toolName = normalizeToolLabel(getToolName(action))
+  const showLiveOutput = !completed && Boolean(liveOutput)
+  const commandRunning = !completed && (toolName === 'run_command' || toolName === 'start_service')
   const summary = (completed ? '已执行：' : '正在执行：') + toolDisplayName(getToolName(action)) + (action.detail ? ' ' + action.detail : ' 无参数')
   const fileResult = observation && (toolName === 'edit_file' || toolName === 'write_file')
     ? parseFileChangeResult(observation.detail, toolName)
     : undefined
-  return <CollapsibleFlowBlock className={'agent-flow-action agent-flow-tool-call ' + (completed ? 'done' : 'running')}>
+  return <CollapsibleFlowBlock className={'agent-flow-action agent-flow-tool-call ' + (completed ? 'done' : 'running') + (commandRunning ? ' command-running' : '')} forceOpen={showLiveOutput}>
     <summary><AgentStatusLine status={completed ? 'done' : 'running'} text={summary} /></summary>
+    {showLiveOutput && liveOutput ? <CommandLiveOutput output={liveOutput.detail} /> : null}
     {observation ? <div className={'agent-flow-tool-result' + (fileResult?.diff ? ' has-edit-diff' : '')}>
       <span>执行结果</span>
       <pre>{fileResult?.summary ?? observation.detail}</pre>
       {fileResult?.diff ? <EditFileDiff path={fileResult.path} diff={fileResult.diff} /> : null}
     </div> : null}
   </CollapsibleFlowBlock>
+}
+
+function CommandLiveOutput({ output }: { output: string }): ReactElement {
+  const outputRef = useRef<HTMLPreElement | null>(null)
+  const startedAtRef = useRef(Date.now())
+  const lastOutputAtRef = useRef(Date.now())
+  const previousOutputRef = useRef(output)
+  const now = useNow(true)
+  if (previousOutputRef.current !== output) {
+    previousOutputRef.current = output
+    lastOutputAtRef.current = Date.now()
+  }
+  const runningFor = formatElapsed(now - startedAtRef.current)
+  const idleFor = Math.max(0, now - lastOutputAtRef.current)
+  const status = output
+    ? idleFor < 2000 ? '刚刚更新' : formatElapsed(idleFor) + '无新内容'
+    : '等待输出 · 已运行 ' + runningFor
+  useLayoutEffect(() => {
+    const element = outputRef.current
+    if (element) element.scrollTop = element.scrollHeight
+  }, [output])
+  return <div className="agent-flow-command-live" role="log" aria-live="polite">
+    <header><i /><span>实时输出</span><small>{status}</small></header>
+    <pre ref={outputRef} className={output ? '' : 'empty'}>{output || '命令尚未产生 stdout/stderr…'}</pre>
+  </div>
 }
 
 function EditFileDiff({ path, diff }: { path: string; diff: string }): ReactElement {
@@ -950,9 +1052,9 @@ function AgentStatusLine({ status, text }: { status: 'thinking' | 'running' | 'd
   return <div className={'agent-flow-status ' + status}><Icon name={status === 'thinking' ? 'clock' : status === 'observe' ? 'search-small' : 'monitor'} /><span>{text}</span></div>
 }
 
-function CollapsibleFlowBlock({ className, initialOpen = false, children }: { className: string; initialOpen?: boolean; children: ReactNode }): ReactElement {
+function CollapsibleFlowBlock({ className, initialOpen = false, forceOpen = false, children }: { className: string; initialOpen?: boolean; forceOpen?: boolean; children: ReactNode }): ReactElement {
   const [open, setOpen] = useState(initialOpen)
-  return <details className={className} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>{children}</details>
+  return <details className={className} open={forceOpen || open} onToggle={(event) => { if (!forceOpen) setOpen(event.currentTarget.open) }}>{children}</details>
 }
 
 function getToolName(taskStep: TaskStep): string {
@@ -1054,8 +1156,10 @@ function NavigationSettings({ settings, setSettings, onSave }: { settings: AppSe
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
-function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement { return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><div className="permission-list"><SettingRow title="默认权限" description="默认情况下，Agent 可以读取并编辑工作区中的文件；需要时可以请求额外访问权限。" checked={true} onChange={() => undefined} /><SettingRow title="自动审核" description="Agent 可以读取和编辑工作区中的文件，并会自动审核额外访问权限请求。" checked={settings.skillsEnabled} onChange={(skillsEnabled) => setSettings({ ...settings, skillsEnabled })} /><SettingRow title="完全访问权限" description="启用后无需每次确认，可使用本地工具来完成复杂任务。" checked={Boolean(settings.model.apiKey)} onChange={() => setSettings({ ...settings, model: { ...settings.model, apiKey: settings.model.apiKey ? '' : 'configured' } })} /></div></section><button className="settings-save" onClick={() => void onSave()}>保存更改</button></div> }
-function SettingRow({ title, description, checked, onChange }: { title: string; description: string; checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <div className="setting-row"><div><strong>{title}</strong><p>{description}</p></div><Toggle checked={checked} onChange={onChange} /></div> }
+function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+  const selectedMode = settings.permissionMode ?? 'request_approval'
+  return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><p>选择 Agent 何时可自动执行，以及哪些操作需要您的批准。</p><div className="permission-option-list">{permissionModes.map((mode) => <button type="button" className={'permission-option ' + (selectedMode === mode.value ? 'selected' : '')} key={mode.value} onClick={() => setSettings({ ...settings, permissionMode: mode.value })}><span className="permission-option-icon"><Icon name="shield" /></span><span><strong>{mode.label}</strong><small>{mode.description}</small></span><b>{selectedMode === mode.value ? <Check /> : null}</b></button>)}</div></section><button className="settings-save" onClick={() => void onSave()}>保存更改</button></div>
+}
 function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => Promise<void> }): ReactElement {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -1162,7 +1266,7 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
     </section>
     <section className="settings-section compact">
       <h2>内置工具</h2>
-      <p>工具仅能在工作区 <code>{policy.workspacePath}</code> 内访问；危险命令会被阻止。</p>
+      <p>工具默认使用工作区 <code>{policy.workspacePath}</code>；外部路径和风险操作由当前权限模式控制。</p>
       <div className="tool-list">{Object.entries(toolLabels).map(([name, label]) => <label key={name} className="tool-toggle"><span><strong>{label}</strong><small>{name}</small></span><Toggle checked={policy.enabledTools.includes(name)} onChange={() => toggleTool(name)} /></label>)}</div>
     </section>
   </div>

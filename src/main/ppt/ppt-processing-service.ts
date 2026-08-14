@@ -70,7 +70,7 @@ export class PptProcessingService {
 }
 
 export async function extractPptxOoxmlText(workspacePath: string, filePath: string, options: OfficeParseOptions = {}): Promise<string> {
-  const source = await resolveOfficeFile(workspacePath, filePath)
+  const source = await resolveOfficeFile(workspacePath, filePath, options.allowExternalPaths)
   let extractedEntries = 0
   let extractedSize = 0
   const archive = unzipSync(await readFile(source), {

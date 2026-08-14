@@ -16,10 +16,11 @@ const PARSE_TIMEOUT_MS = 60_000
 export interface OfficeParseOptions {
   includeNotes?: boolean
   maxCharacters?: number
+  allowExternalPaths?: boolean
 }
 
 export async function parseOfficeDocument(workspacePath: string, filePath: string, kind: OfficeDocumentKind, options: OfficeParseOptions = {}): Promise<string> {
-  const source = await resolveOfficeFile(workspacePath, filePath)
+  const source = await resolveOfficeFile(workspacePath, filePath, options.allowExternalPaths)
   const extension = extname(source).toLowerCase()
   if (!ALLOWED_EXTENSIONS[kind].has(extension)) throw new Error(kindLabel(kind) + ' 解析仅支持 ' + Array.from(ALLOWED_EXTENSIONS[kind]).join('、') + ' 文件。')
   const sourceStat = await stat(source)
@@ -57,12 +58,12 @@ export async function parseOfficeDocument(workspacePath: string, filePath: strin
   }
 }
 
-export async function resolveOfficeFile(workspacePath: string, filePath: string): Promise<string> {
+export async function resolveOfficeFile(workspacePath: string, filePath: string, allowExternalPaths = false): Promise<string> {
   const workspaceRoot = resolve(workspacePath)
   const target = resolve(workspaceRoot, filePath)
-  assertWithinWorkspace(workspaceRoot, target)
+  if (!allowExternalPaths) assertWithinWorkspace(workspaceRoot, target)
   const actualPath = await realpath(target)
-  assertWithinWorkspace(workspaceRoot, actualPath)
+  if (!allowExternalPaths) assertWithinWorkspace(workspaceRoot, actualPath)
   return actualPath
 }
 

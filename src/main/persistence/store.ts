@@ -1,8 +1,9 @@
 import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, ModelConfig, ModelProfile } from '../../shared/types'
+import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, ModelConfig, ModelProfile, PermissionMode } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
+import { isInternalAgentPlaceholder } from '../../shared/text'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
 type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation'> & {
@@ -23,6 +24,7 @@ export const defaults: AppSettings = {
   models: [defaultModelProfile],
   defaultModelId: defaultModelProfile.id,
   skillsEnabled: true,
+  permissionMode: 'request_approval',
   navigation: { fileApplicationPath: '', browserApplicationPath: '' }
 }
 
@@ -63,12 +65,19 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
     models: profiles,
     defaultModelId,
     skillsEnabled: settings?.skillsEnabled ?? defaults.skillsEnabled,
+    permissionMode: normalizePermissionMode(settings?.permissionMode),
     navigation: {
       fileApplicationPath: typeof settings?.navigation?.fileApplicationPath === 'string' ? settings.navigation.fileApplicationPath : '',
       browserApplicationPath: typeof settings?.navigation?.browserApplicationPath === 'string' ? settings.navigation.browserApplicationPath : ''
     }
   }
   return normalized
+}
+
+function normalizePermissionMode(value: PermissionMode | undefined): PermissionMode {
+  return value === 'full_access' || value === 'auto_approve' || value === 'request_approval'
+    ? value
+    : 'request_approval'
 }
 
 function modelConfigFromProfile(profile: ModelProfile): ModelConfig {
@@ -108,19 +117,33 @@ const previousServiceSystemPrompt = [
   '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
   '最终答复要简洁、可验证，并说明实际完成了什么。'
 ].join('\n')
+const previousPermissionSystemPrompt = [
+  '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
+  '你必须遵循 ReAct 模式：先判断是否需要工具，再执行一个明确动作，读取 Observation 后继续下一轮，直到可以给出 Final。',
+  '你可以读取、写入或局部编辑文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过需用户单次授权的 PPT MCP 解析 PowerPoint，以及执行命令行；所有文件操作必须限制在工作区内。',
+  '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
+  '最终答复要简洁、可验证，并说明实际完成了什么。'
+].join('\n')
+const previousFixedWindowsSystemPrompt = [
+  '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
+  '你必须遵循 ReAct 模式：先判断是否需要工具，再执行一个明确动作，读取 Observation 后继续下一轮，直到可以给出 Final。',
+  '你可以读取、写入或局部编辑文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过 PPT MCP 解析 PowerPoint，以及执行命令行；文件、网络和命令权限由宿主按照用户选择的权限模式统一裁决。',
+  '需要操作时直接输出对应工具调用；不要自行声称没有权限，也不要在工具调用前用文字请求批准，宿主会在需要时显示交互确认。',
+  '最终答复要简洁、可验证，并说明实际完成了什么。'
+].join('\n')
 const legacyEnabledTools = ['read_file', 'write_file', 'run_command']
 const previousDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'run_command']
 const previousOfficeDefaultEnabledTools = ['read_file', 'write_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command']
 const previousServiceDefaultEnabledTools = [...previousOfficeDefaultEnabledTools, 'start_service']
 export const defaultPolicy: AgentPolicy = {
   systemPrompt: [
-    '你是 Codext Agent，一个运行在 Windows 桌面工作区内的工程代理。',
+    '你是 Codext Agent，一个运行在当前宿主环境中的工程代理。宿主会在运行时提供真实的操作系统与桌面会话信息。',
     '你必须遵循 ReAct 模式：先判断是否需要工具，再执行一个明确动作，读取 Observation 后继续下一轮，直到可以给出 Final。',
-    '你可以读取、写入或局部编辑文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过需用户单次授权的 PPT MCP 解析 PowerPoint，以及执行命令行；所有文件操作必须限制在工作区内。',
-    '执行命令前只选择必要且低风险的命令；遇到删除、格式化、关机、修改注册表等危险操作必须拒绝。',
+    '你可以读取、写入或局部编辑文件、创建目录、列举文件、解密文件、在本地解析 Word 和 Excel、通过 PPT MCP 解析 PowerPoint，以及执行命令行；文件、网络和命令权限由宿主按照用户选择的权限模式统一裁决。',
+    '需要操作时直接输出对应工具调用；不要自行声称没有权限，也不要在工具调用前用文字请求批准，宿主会在需要时显示交互确认。',
     '最终答复要简洁、可验证，并说明实际完成了什么。'
   ].join('\n'),
-  workspacePath: 'D:/work/codext',
+  workspacePath: process.cwd(),
   enabledTools: ['read_file', 'write_file', 'edit_file', 'create_directory', 'list_files', 'decrypt_file', 'parse_word', 'parse_excel', 'parse_powerpoint', 'run_command', 'start_service']
 }
 
@@ -133,6 +156,14 @@ function normalizePersistedMessage(message: ChatMessage): ChatMessage {
   const normalized = filteredSteps?.length !== message.steps?.length ? { ...message, steps: filteredSteps } : message
   if (normalized.role !== 'assistant') return normalized
   const protocolError = '模型未按 ReAct 协议返回最终结果，原始思考内容已隐藏。'
+  if (isInternalAgentPlaceholder(normalized.content)) {
+    return {
+      ...normalized,
+      content: '模型响应中断，任务尚未完成。请重试或继续本次任务。',
+      status: 'failed',
+      completedAt: normalized.completedAt ?? now()
+    }
+  }
   try {
     const payload = JSON.parse(normalized.content.trim()) as { thought?: unknown; action?: unknown; tool_calls?: unknown; choice?: unknown; final?: unknown }
     const thoughtOnly = typeof payload.thought === 'string' && payload.action === undefined && payload.tool_calls === undefined && payload.choice === undefined && payload.final === undefined
@@ -195,7 +226,10 @@ export class LocalStore {
         policy: {
           ...defaultPolicy,
           ...draft.policy,
-          systemPrompt: draft.policy?.systemPrompt === legacySystemPrompt || draft.policy?.systemPrompt === previousOfficeMcpSystemPrompt || draft.policy?.systemPrompt === previousLocalOfficeSystemPrompt || draft.policy?.systemPrompt === previousServiceSystemPrompt
+          workspacePath: process.platform !== 'win32' && draft.policy?.workspacePath === 'D:/work/codext'
+            ? process.cwd()
+            : draft.policy?.workspacePath ?? defaultPolicy.workspacePath,
+          systemPrompt: draft.policy?.systemPrompt === legacySystemPrompt || draft.policy?.systemPrompt === previousOfficeMcpSystemPrompt || draft.policy?.systemPrompt === previousLocalOfficeSystemPrompt || draft.policy?.systemPrompt === previousServiceSystemPrompt || draft.policy?.systemPrompt === previousPermissionSystemPrompt || draft.policy?.systemPrompt === previousFixedWindowsSystemPrompt
             ? defaultPolicy.systemPrompt
             : draft.policy?.systemPrompt ?? defaultPolicy.systemPrompt,
           enabledTools: normalizeEnabledTools(draft.policy?.enabledTools)

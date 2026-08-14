@@ -127,6 +127,10 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
   const adjustments: string[] = []
 
   if (call.name === 'list_files') {
+    if (typeof args.path === 'string' && isWorkspaceRootAlias(args.path)) {
+      if (args.path.trim() !== '.') adjustments.push('path 已规范化为工作区根目录 .')
+      args.path = '.'
+    }
     if (!nonEmptyString(args.path)) {
       args.path = '.'
       adjustments.push('path 使用工作区根目录 .')
@@ -146,6 +150,14 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
       args.command = normalizedLaunch.command
       args.args = normalizedLaunch.args
       adjustments.push('已规范化 Electron 启动命令')
+    }
+  }
+  if ((toolName === 'run_command' || toolName === 'start_service') && nonEmptyString(args.command) && !(args.args ?? []).length) {
+    const normalizedCommand = normalizeInlineCommandInvocation(args.command)
+    if (normalizedCommand) {
+      args.command = normalizedCommand.command
+      args.args = normalizedCommand.args
+      adjustments.push('command 已拆分为可执行文件和参数')
     }
   }
   if ((toolName === 'run_command' || toolName === 'start_service') && nonEmptyString(args.command) && shouldRunDesktopAppInBackground(args.command, args.args ?? [], context.currentRequest)) {
@@ -200,6 +212,21 @@ export function prepareToolCall(call: ToolCall, context: ToolCallContext): ToolC
   }
 
   return { call: { id: call.id, dependsOn: call.dependsOn, name: toolName, arguments: args }, adjustments }
+}
+
+function isWorkspaceRootAlias(value: string): boolean {
+  const normalized = value.trim()
+  return normalized === '.' || normalized === './' || normalized === '.\\' || normalized === '/' || normalized === '\\'
+}
+
+function normalizeInlineCommandInvocation(command: string): { command: string; args: string[] } | undefined {
+  const value = command.trim()
+  if (!value || !/\s/.test(value) || /[;&|`$<>\r\n]/.test(value)) return undefined
+  const tokens = splitSafeCommandLine(value)
+  if (tokens.length < 2) return undefined
+  const executable = tokens[0].replaceAll('\\', '/').split('/').at(-1)?.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '') ?? ''
+  if (!executable || executable === 'env') return undefined
+  return { command: tokens[0], args: tokens.slice(1) }
 }
 
 function normalizeInlineElectronLaunch(command: string, args: string[]): { command: string; args: string[] } | undefined {

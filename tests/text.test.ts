@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../src/shared/text'
+import { hideReactObservationReferences, isInternalAgentPlaceholder, normalizeTechnicalPunctuation } from '../src/shared/text'
 
 describe('normalizeTechnicalPunctuation', () => {
   it('repairs full-width punctuation inside technical identifiers', () => {
@@ -21,5 +21,19 @@ describe('hideReactObservationReferences', () => {
       .toBe('之前的 CSS 编辑已成功，但 JS 仍需修改。')
     expect(hideReactObservationReferences('根据 Observation #12 继续检查。'))
       .toBe('根据工具结果继续检查。')
+  })
+})
+
+describe('isInternalAgentPlaceholder', () => {
+  it('recognizes host-only ReAct recovery markers', () => {
+    expect(isInternalAgentPlaceholder('[上一条工具调用在 Action JSON 闭合前被截断，未执行。]')).toBe(true)
+    expect(isInternalAgentPlaceholder('[上一条 read_file Action 参数无效，未执行。]')).toBe(true)
+    expect(isInternalAgentPlaceholder('[模型重复调用已成功执行的工具，已停止重复执行。]')).toBe(true)
+    expect(isInternalAgentPlaceholder('[REACT_PROTOCOL_DRIFT]')).toBe(true)
+  })
+
+  it('does not hide ordinary bracketed user-facing text', () => {
+    expect(isInternalAgentPlaceholder('[已完成]')).toBe(false)
+    expect(isInternalAgentPlaceholder('上一条工具调用失败，请重试。')).toBe(false)
   })
 })

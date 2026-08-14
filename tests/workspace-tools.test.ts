@@ -149,6 +149,67 @@ describe('WorkspaceTools.startService', () => {
 })
 
 describe('WorkspaceTools.runCommand', () => {
+  it('forces progress output for streamed git transfers', () => {
+    const tools = workspaceTools as unknown as { withLiveProgress(command: string, args: string[], enabled: boolean): string[] }
+
+    expect(tools.withLiveProgress('git', ['clone', '--depth', '1', 'https://example.com/repo.git'], true))
+      .toEqual(['clone', '--progress', '--depth', '1', 'https://example.com/repo.git'])
+    expect(tools.withLiveProgress('git', ['clone', '--progress', 'https://example.com/repo.git'], true))
+      .toEqual(['clone', '--progress', 'https://example.com/repo.git'])
+  })
+
+  it.runIf(process.platform !== 'win32')('kills the complete foreground process tree after a timeout', async () => {
+    const tools = workspaceTools as unknown as {
+      runExecutable(command: string, args: string[], signal: undefined, timeoutMs: number, onOutput: (chunk: string) => void): Promise<string>
+    }
+    let output = ''
+    const script = [
+      "const { spawn } = require('node:child_process')",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })",
+      "process.stdout.write(String(child.pid) + '\\n')",
+      "setInterval(() => {}, 1000)"
+    ].join(';')
+
+    await expect(tools.runExecutable(process.execPath, ['-e', script], undefined, 150, (chunk) => { output += chunk }))
+      .rejects.toThrow('命令执行超过')
+
+    const descendantPid = Number(output.trim().split(/\s+/)[0])
+    expect(descendantPid).toBeGreaterThan(0)
+    let alive = true
+    for (let attempt = 0; attempt < 20 && alive; attempt++) {
+      try {
+        process.kill(descendantPid, 0)
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      } catch {
+        alive = false
+      }
+    }
+    if (alive) {
+      try { process.kill(descendantPid, 'SIGKILL') } catch { /* 已退出。 */ }
+    }
+    expect(alive).toBe(false)
+  })
+
+  it('streams stdout and stderr chunks while the command is running', async () => {
+    const chunks: Array<{ chunk: string; source: 'stdout' | 'stderr' }> = []
+    const script = "process.stdout.write('first\\n');setTimeout(()=>{process.stderr.write('second\\n')},30)"
+
+    const result = await workspaceTools.runCommand(
+      process.execPath,
+      ['-e', script],
+      undefined,
+      true,
+      false,
+      false,
+      (chunk, source) => chunks.push({ chunk, source })
+    )
+
+    expect(chunks.map(({ chunk }) => chunk).join('')).toContain('first\nsecond\n')
+    expect(chunks.map(({ source }) => source)).toEqual(['stdout', 'stderr'])
+    expect(result).toContain('first')
+    expect(result).toContain('second')
+  })
+
   it('requires approval for state-changing commands and blocks destructive commands', async () => {
     await expect(workspaceTools.runCommand(process.execPath, ['-e', "process.stdout.write('script')"]))
       .rejects.toThrow('需要用户授权')

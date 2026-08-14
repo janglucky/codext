@@ -67,6 +67,20 @@ describe('tool call recovery', () => {
     expect(command.call).toEqual({ name: 'run_command', arguments: { command: 'git', args: [] } })
   })
 
+  it('normalizes root aliases to the current workspace for directory listing', () => {
+    for (const path of ['/', '\\', './', '.\\']) {
+      const prepared = prepareToolCall({ name: 'list_files', arguments: { path, recursive: false } }, { currentRequest: '查看项目结构' })
+      expect(prepared.call?.arguments.path).toBe('.')
+    }
+  })
+
+  it('splits a command accidentally merged with its arguments', () => {
+    const prepared = prepareToolCall({ name: 'run_command', arguments: { command: '/usr/bin/git --version', args: [] } }, { currentRequest: '检查 git 版本' })
+
+    expect(prepared.call?.arguments).toEqual({ command: '/usr/bin/git', args: ['--version'] })
+    expect(prepared.adjustments).toContain('command 已拆分为可执行文件和参数')
+  })
+
   it('forces Electron desktop launches into background mode', () => {
     const direct = prepareToolCall({
       name: 'run_command',

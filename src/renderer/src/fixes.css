@@ -46,6 +46,30 @@ html, body, #root { width: 100%; height: 100%; overflow: hidden; }.chat-app { he
 .composer-controls .send.pause { color: #fff; background: #d75a62; box-shadow: 0 0 0 3px rgba(215, 90, 98, .12); transition: background .15s ease, box-shadow .15s ease, transform .15s ease; }
 .composer-controls .send.pause:hover:not(:disabled) { background: #bd444d; transform: scale(1.04); }
 .composer-controls .send.pause.pausing, .composer-controls .send.pause:disabled { color: #fff; background: #d98b90; opacity: 1; }
+.permission-control { position: relative; }
+.composer-controls .permission { font-size: 11px !important; font-weight: 400 !important; }
+.permission.mode-auto_approve { color: #3f7658 !important; }
+.permission.mode-request_approval { color: #5f6670 !important; }
+.permission-menu { position: absolute; z-index: 14; bottom: 35px; left: -5px; display: grid; gap: 3px; width: min(340px, calc(100vw - 48px)); padding: 10px; border: 1px solid #dfe2e4; border-radius: 9px; color: #34373a; background: #fff; box-shadow: 0 12px 32px rgba(0, 0, 0, .16); }
+.permission-menu > p { margin: 0 0 4px; padding: 0 8px; color: #777c82; font-size: 11px; }
+.permission-menu > button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; height: auto; min-height: 52px; padding: 7px 8px; color: #44494e; background: transparent; text-align: left; }
+.permission-menu > button:hover, .permission-menu > button.selected { background: #f0f2f3; }
+.permission-menu > button > span { display: grid; min-width: 0; gap: 3px; }
+.permission-menu strong { font-size: 11px; font-weight: 500; }
+.permission-menu small { color: #838990; font-size: 10px; line-height: 1.45; white-space: normal; }
+.permission-menu > button > svg { flex: 0 0 auto; width: 14px; height: 14px; color: #3f805e; }
+.permission-option-list { display: grid; gap: 8px; }
+.permission-option { display: grid; grid-template-columns: 34px minmax(0, 1fr) 20px; align-items: center; gap: 11px; width: 100%; padding: 13px; border: 1px solid #e3e5e7; border-radius: 10px; color: #383c40; background: #fff; text-align: left; }
+.permission-option:hover { background: #fafafa; }
+.permission-option.selected { border-color: #a9c8b6; background: #f3f8f5; box-shadow: 0 0 0 2px rgba(76, 139, 100, .08); }
+.permission-option-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 8px; color: #667078; background: #f0f2f3; }
+.permission-option.selected .permission-option-icon { color: #397050; background: #e2f0e7; }
+.permission-option > span:nth-child(2) { display: grid; gap: 4px; }
+.permission-option strong { font-size: 13px; font-weight: 500; }
+.permission-option small { color: #777d82; font-size: 12px; line-height: 1.5; }
+.permission-option > b { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid #d3d7da; border-radius: 50%; color: #fff; }
+.permission-option.selected > b { border-color: #4a9667; background: #4a9667; }
+.permission-option > b svg { width: 11px; height: 11px; }
 .run-status.paused { color: #a96623; background: #fff4e7; }
 .chat-composer footer { position: relative; align-items: center; }
 .workspace-control { position: relative; min-width: 0; }
@@ -435,6 +459,104 @@ html, body, #root { width: 100%; height: 100%; overflow: hidden; }.chat-app { he
   text-overflow: clip;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.agent-flow-tool-call.command-running > summary {
+  position: relative;
+  overflow: hidden;
+  padding: 4px 7px 4px 0;
+  border-radius: 7px;
+  isolation: isolate;
+}
+
+.agent-flow-tool-call.command-running > summary::after {
+  position: absolute;
+  z-index: 0;
+  top: -70%;
+  bottom: -70%;
+  left: -42%;
+  width: 42%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(232, 151, 47, .18) 0%, rgba(240, 162, 58, .09) 42%, rgba(240, 162, 58, 0) 72%);
+  content: "";
+  pointer-events: none;
+  animation: command-surface-ripple 1.75s ease-in-out infinite;
+}
+
+.agent-flow-tool-call.command-running > summary::before,
+.agent-flow-tool-call.command-running > summary .agent-flow-status {
+  position: relative;
+  z-index: 1;
+}
+
+.agent-flow-command-live {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 3px 0 0 21px;
+  overflow: hidden;
+  border: 1px solid #e2e5e8;
+  border-radius: 7px;
+  background: #f8f9fa;
+}
+
+.agent-flow-command-live header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px 0;
+  color: #7c838a;
+  font-size: 10px;
+}
+
+.agent-flow-command-live header small { margin-left: auto; color: #a0a5aa; font-size: 9px; font-weight: 400; }
+
+.agent-flow-command-live header i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e49a38;
+  box-shadow: 0 0 0 0 rgba(228, 154, 56, .32);
+  animation: command-output-pulse 1.35s ease-out infinite;
+}
+
+.agent-flow-command-live pre {
+  max-height: 190px;
+  margin: 0;
+  padding: 0 9px 9px;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  color: #4f575f;
+  background: transparent;
+  box-shadow: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  scrollbar-width: thin;
+  scrollbar-color: #c7ccd0 transparent;
+}
+
+.agent-flow-command-live pre.empty { color: #9aa0a6; font-style: italic; }
+
+.agent-flow-command-live pre::-webkit-scrollbar { width: 6px; height: 6px; }
+.agent-flow-command-live pre::-webkit-scrollbar-thumb { border: 1px solid transparent; border-radius: 99px; background: #c7ccd0; background-clip: content-box; }
+.agent-flow-tool-call.running .agent-flow-command-live pre { border: 0; box-shadow: none; }
+
+@keyframes command-surface-ripple {
+  0% { opacity: 0; transform: translateX(0) scale(.75); }
+  24% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(340%) scale(1.25); }
+}
+
+@keyframes command-output-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(228, 154, 56, .35); }
+  70%, 100% { box-shadow: 0 0 0 6px rgba(228, 154, 56, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-flow-tool-call.command-running > summary::after,
+  .agent-flow-command-live header i { animation: none; }
 }
 
 .agent-flow-tool-result {

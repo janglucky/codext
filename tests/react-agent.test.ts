@@ -364,6 +364,9 @@ describe('ReactAgent.execute', () => {
       const systemPrompt = body.messages.find((message) => message.role === 'system')?.content ?? ''
       expect(systemPrompt).toContain('未完成措辞')
       expect(systemPrompt).toContain('严禁声称文件已经创建')
+      expect(systemPrompt).toContain('宿主运行环境（应用启动时自动检测')
+      expect(systemPrompt).toContain('操作系统：')
+      expect(systemPrompt).toContain('（' + process.platform + '）')
     })
     beforeEach(() => {
       globalThis.fetch = vi.fn().mockResolvedValue({
@@ -726,6 +729,48 @@ describe('ReactAgent.execute', () => {
       expect(task.status).toBe('succeeded')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'ssh', args: ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'] }))
       expect(runCommand).toHaveBeenCalledWith('ssh', ['user@166-server', 'find /home/guider/work -maxdepth 2 -type f'], undefined, true, false)
+    })
+
+    it('publishes live command output and clears it after the final observation', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: 'node', args: ['build.js'] } } })
+          : JSON.stringify({ final: '构建已完成。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockImplementation(async (_command, _args, _signal, _writeApproved, _dangerousApproved, _background, onOutput) => {
+        onOutput?.('\u001b[32mcompiling\u001b[0m\r', 'stdout')
+        await new Promise((resolve) => setTimeout(resolve, 90))
+        onOutput?.('done\n', 'stderr')
+        await new Promise((resolve) => setTimeout(resolve, 90))
+        return 'compiling\ndone'
+      })
+      const stepSnapshots: Array<{ title: string; detail: string }> = []
+      const approval = vi.fn(async () => true)
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run(
+        '执行构建',
+        [],
+        (taskStep) => stepSnapshots.push({ title: taskStep.title, detail: taskStep.detail }),
+        undefined,
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        approval
+      )
+
+      const liveSnapshots = stepSnapshots.filter((item) => item.title.startsWith('命令实时输出：'))
+      expect(liveSnapshots.some((item) => item.detail.includes('compiling'))).toBe(true)
+      expect(liveSnapshots.some((item) => item.detail.includes('done'))).toBe(true)
+      expect(liveSnapshots.at(-1)?.detail).toBe('')
+      expect(task.steps.find((item) => item.title.startsWith('命令实时输出：'))?.detail).toBe('')
+      expect(task.steps.some((item) => item.title.includes('Observation') && item.detail.includes('compiling\ndone'))).toBe(true)
+      expect(task.status).toBe('succeeded')
     })
 
     it('starts a desktop app with a confirmed background run_command', async () => {
@@ -1653,7 +1698,35 @@ describe('ReactAgent.execute', () => {
       expect(task.steps.some((item) => item.title === '工具调用响应不完整')).toBe(true)
       expect(requestBodies[1]).toContain('单次 content 不得超过 6000 个字符')
       expect(requestBodies[1]).not.toContain('const page = `<html>`')
+      expect(requestBodies[1]).not.toContain('[上一条工具调用')
       expect(writeFile).toHaveBeenCalledWith('tests/fixtures/generated-after-truncation.txt', 'complete')
+    })
+
+    it('rejects an echoed internal recovery marker and continues from existing observations', async () => {
+      let callCount = 0
+      const requestBodies: string[] = []
+      globalThis.fetch = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestBodies.push(String(init?.body ?? ''))
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'package.json' } } })
+          : callCount === 2
+            ? '[上一条工具调用在 Action JSON 闭合前被截断，未执行。]'
+            : JSON.stringify({ final: '已根据现有工具结果完成检查。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{"name":"codext-agent"}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json 并总结')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('已根据现有工具结果完成检查。')
+      expect(task.result).not.toContain('上一条工具调用')
+      expect(task.steps.some((item) => item.title === '模型响应无效，正在恢复')).toBe(true)
+      expect(requestBodies[2]).not.toContain('[上一条工具调用')
+      expect(requestBodies[2]).toContain('INTERNAL_PLACEHOLDER_ECHO')
+      expect(callCount).toBe(3)
     })
 
     it('recovers a model connection failure after a successful file write', async () => {
@@ -2058,6 +2131,31 @@ describe('ReactAgent.execute', () => {
 
       const { execute } = makeAgent(makeSettings())
       await expect(execute('test', makeTask())).rejects.toThrow('模型返回为空')
+    })
+
+    it('continues after a tool Observation when the next model response is empty', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'run_command', arguments: { command: '/usr/bin/git --version', args: [] } } })
+          : callCount === 2
+            ? JSON.stringify({ choices: [] })
+            : JSON.stringify({ final: '已继续完成检查。' })
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(callCount === 2 ? { choices: [{ message: { content: '' } }] } : { choices: [{ message: { content } }] })
+        })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'runCommand').mockResolvedValue('git version 2.40.0')
+
+      const { execute } = makeAgent(makeSettings())
+      const task = makeTask('检查 git 版本')
+      const result = await execute('检查 git 版本', task)
+
+      expect(result).toBe('已继续完成检查。')
+      expect(callCount).toBe(3)
+      expect(task.steps.some((item) => item.title === '模型响应为空，正在恢复')).toBe(true)
     })
 
     it('throws on AbortError with timeout message', async () => {

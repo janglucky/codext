@@ -3,13 +3,14 @@ export type AgentArtifact = { type: 'file'; path: string } | { type: 'service'; 
 export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number; contextWindowTokens?: number; maxOutputTokens?: number }
 export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
+export type PermissionMode = 'full_access' | 'auto_approve' | 'request_approval'
 export interface TaskStep { id: string; phase: 'reason' | 'skill' | 'act' | 'validate'; title: string; detail: string; timestamp: string }
 export interface TokenUsage { inputTokens: number; outputTokens: number; durationMs: number; estimated: boolean }
 export interface AgentTask { id: string; prompt: string; status: TaskStatus; result?: string; error?: string; createdAt: string; steps: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
 export interface ChatAttachment { id: string; name: string; mimeType: string; size: number; dataUrl: string; workspacePath?: string }
 export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage }
 export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; modelId?: string }
-export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings }
+export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings; permissionMode?: PermissionMode }
 export interface AgentPolicy { systemPrompt: string; workspacePath: string; enabledTools: string[] }
 export interface ConnectionTestResult { ok: boolean; message: string }
 export interface NavigationResult { ok: boolean; message?: string }
@@ -19,7 +20,8 @@ export interface AgentDoneEvent { conversationId: string; messageId: string; sta
 export interface AgentRunResult { conversation: Conversation; task: AgentTask }
 export interface McpApprovalDetails { toolName: string; serverUrl: string; path?: string; workspacePath?: string; conversationId?: string }
 export interface McpApprovalRequest extends McpApprovalDetails { id: string; expiresAt: string }
-export interface CommandApprovalDetails { command: string; args: string[]; displayCommand: string; reason: string; background?: boolean; riskLevel?: 'read' | 'write' | 'blocked'; workspacePath?: string; conversationId?: string }
+export type ApprovalKind = 'command' | 'network' | 'external-file'
+export interface CommandApprovalDetails { command: string; args: string[]; displayCommand: string; reason: string; background?: boolean; riskLevel?: 'read' | 'write' | 'blocked'; approvalKind?: ApprovalKind; path?: string; toolName?: string; workspacePath?: string; conversationId?: string }
 export interface CommandApprovalRequest extends CommandApprovalDetails { id: string; expiresAt: string }
 export interface UserChoiceOption { id: string; label: string; description?: string; workspacePath?: string }
 export interface UserChoiceDetails { title: string; description?: string; options: UserChoiceOption[]; conversationId?: string }

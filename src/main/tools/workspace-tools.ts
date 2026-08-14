@@ -24,6 +24,7 @@ const EDIT_DIFF_TIMEOUT_MS = 10_000
 const MAX_EDIT_DIFF_CHARACTERS = 20_000
 
 interface RunningWorkspaceService { child: ChildProcess; url?: string; logPath: string }
+export type CommandOutputListener = (chunk: string, source: 'stdout' | 'stderr') => void
 const runningWorkspaceServices = new Map<string, RunningWorkspaceService>()
 
 export async function stopAllWorkspaceServices(): Promise<void> {
@@ -46,7 +47,27 @@ export async function stopAllWorkspaceServices(): Promise<void> {
 }
 
 export class WorkspaceTools {
-  constructor(private readonly workspacePath: string) {}
+  constructor(private readonly workspacePath: string, private readonly options: { allowExternalPaths?: boolean } = {}) {}
+
+  async isExternalPath(filePath: string): Promise<boolean> {
+    const target = resolve(this.workspacePath, filePath)
+    if (this.isOutsideWorkspace(target)) return true
+    try {
+      return this.isOutsideWorkspace(await realpath(target))
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
+      let parent = dirname(target)
+      while (parent !== dirname(parent)) {
+        try {
+          return this.isOutsideWorkspace(await realpath(parent))
+        } catch (parentError) {
+          if (!(parentError instanceof Error && 'code' in parentError && parentError.code === 'ENOENT')) throw parentError
+          parent = dirname(parent)
+        }
+      }
+      return false
+    }
+  }
 
   async readFile(filePath: string): Promise<string> {
     return readFile(await this.resolveExistingPath(filePath), 'utf8')
@@ -186,30 +207,31 @@ export class WorkspaceTools {
     }
   }
 
-  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false, dangerousApproved = false, background = false): Promise<string> {
+  async runCommand(command: string, args: string[] = [], signal?: AbortSignal, writeApproved = false, dangerousApproved = false, background = false, onOutput?: CommandOutputListener): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('命令不能为空。')
     const risk = classifyCommandRisk(executable, args)
     if ((risk.level === 'blocked' || blockedCommands.test([executable, ...args].join(' '))) && !dangerousApproved) throw new Error('高风险命令需要用户明确确认：' + risk.reason)
     if (risk.level === 'write' && !writeApproved) throw new Error('该命令可能修改状态，需要用户授权后执行。')
-    if (background) return this.runBackgroundCommand(executable, args, signal)
+    if (background) return this.runBackgroundCommand(executable, args, signal, onOutput)
     const timeoutMs = this.commandTimeout(executable, args)
+    const executionArgs = this.withLiveProgress(executable, args, Boolean(onOutput))
 
     if (process.platform === 'win32' && this.isWindowsBatchCommand(executable)) {
-      return this.runWindowsBatchCommand(executable, args, signal, timeoutMs)
+      return this.runWindowsBatchCommand(executable, executionArgs, signal, timeoutMs, onOutput)
     }
 
     try {
-      return await this.runExecutable(executable, args, signal, timeoutMs)
+      return await this.runExecutable(executable, executionArgs, signal, timeoutMs, onOutput)
     } catch (error) {
       if (process.platform !== 'win32' || !this.isMissingExecutableError(error)) throw error
       const batchCommand = await this.findWindowsBatchCommand(executable, signal)
       if (!batchCommand) throw error
-      return this.runWindowsBatchCommand(batchCommand, args, signal, timeoutMs)
+      return this.runWindowsBatchCommand(batchCommand, executionArgs, signal, timeoutMs, onOutput)
     }
   }
 
-  async startService(command: string, args: string[] = [], signal?: AbortSignal, dangerousApproved = false): Promise<string> {
+  async startService(command: string, args: string[] = [], signal?: AbortSignal, dangerousApproved = false, onOutput?: CommandOutputListener): Promise<string> {
     const executable = this.normalizeExecutableName(command)
     if (!executable) throw new Error('服务命令不能为空。')
     if (blockedCommands.test([executable, ...args].join(' ')) && !dangerousApproved) throw new Error('高风险命令需要用户明确确认。')
@@ -246,13 +268,21 @@ export class WorkspaceTools {
     return new Promise((resolveService, rejectService) => {
       let settled = false
       let output = ''
+      let publishedOutput = ''
       let pollTimer: ReturnType<typeof setTimeout> | undefined
       const timer = setTimeout(() => settle(new Error('服务在 ' + SERVICE_START_TIMEOUT_MS / 1000 + ' 秒内没有输出可访问的 HTTP 地址。')), SERVICE_START_TIMEOUT_MS)
       const onAbort = (): void => settle(new DOMException('服务启动已暂停', 'AbortError'))
+      const publishOutput = (): void => {
+        if (output === publishedOutput) return
+        const delta = output.startsWith(publishedOutput) ? output.slice(publishedOutput.length) : output
+        if (delta) onOutput?.(delta, 'stdout')
+        publishedOutput = output
+      }
       const pollOutput = async (): Promise<void> => {
         if (settled) return
         try {
           output = this.decodeCommandOutput(await readFile(logPath)).slice(-16_000)
+          publishOutput()
         } catch {
           /* 进程刚启动时日志文件可能尚未可读，继续轮询。 */
         }
@@ -295,6 +325,7 @@ export class WorkspaceTools {
           } catch {
             /* 日志文件可能未创建，保留已有输出。 */
           }
+          publishOutput()
           settle(new Error('服务进程提前退出' + (code === null ? '' : '（退出码 ' + code + '）') + '。' + (output ? '\n' + output.trim() : '')))
         })()
       })
@@ -303,22 +334,120 @@ export class WorkspaceTools {
     })
   }
 
-  private async runExecutable(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
-    try {
-      const result = await execFileAsync(command, args, this.commandOptions(signal, timeoutMs)) as unknown as { stdout: Buffer; stderr: Buffer }
-      return (this.decodeCommandOutput(result.stdout) || this.decodeCommandOutput(result.stderr) || '命令执行完成。').trim()
-    } catch (error) {
-      if (this.isMissingExecutableError(error)) throw error
-      const details = this.commandErrorDetails(error)
-      if (this.isCommandTimeoutError(error)) {
-        throw new Error('命令执行超过 ' + Math.ceil(timeoutMs / 1000) + ' 秒，已停止。' + (details ? '\n' + details : ''))
+  private runExecutable(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS, onOutput?: CommandOutputListener): Promise<string> {
+    return new Promise((resolveCommand, rejectCommand) => {
+      if (signal?.aborted) {
+        rejectCommand(new DOMException('命令执行已暂停', 'AbortError'))
+        return
       }
-      const exitCode = this.commandExitCode(error)
-      throw new Error('命令执行失败' + (exitCode ? '（退出码 ' + exitCode + '）' : '') + '。' + (details ? '\n' + details : ''))
+      let timedOut = false
+      let outputExceeded = false
+      let settled = false
+      let spawnError: Error | undefined
+      const stdoutChunks: Buffer[] = []
+      const stderrChunks: Buffer[] = []
+      let outputBytes = 0
+      const maxOutputBytes = 1024 * 1024
+      const child = spawn(command, args, {
+        cwd: this.workspacePath,
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+      const finish = (code: number | null): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutTimer)
+        signal?.removeEventListener('abort', onAbort)
+        const stdoutText = this.decodeCommandValue(Buffer.concat(stdoutChunks))
+        const stderrText = this.decodeCommandValue(Buffer.concat(stderrChunks))
+        if (signal?.aborted) {
+          rejectCommand(new DOMException('命令执行已暂停', 'AbortError'))
+          return
+        }
+        if (!spawnError && !timedOut && !outputExceeded && code === 0) {
+          const output = [stdoutText, stderrText].filter(Boolean).join(stdoutText && stderrText ? '\n' : '')
+          resolveCommand((output || '命令执行完成。').trim())
+          return
+        }
+        if (spawnError && this.isMissingExecutableError(spawnError)) {
+          rejectCommand(spawnError)
+          return
+        }
+        const rawDetails = [stdoutText, stderrText].filter(Boolean).join('\n').trim()
+        const details = rawDetails.length > 32_000
+          ? rawDetails.slice(0, 24_000) + '\n...输出已截断...\n' + rawDetails.slice(-8_000)
+          : rawDetails
+        if (timedOut) {
+          rejectCommand(new Error('命令执行超过 ' + Math.ceil(timeoutMs / 1000) + ' 秒，已停止。' + (details ? '\n' + details : '')))
+          return
+        }
+        if (outputExceeded) {
+          rejectCommand(new Error('命令输出超过 1 MB，已停止。' + (details ? '\n' + details : '')))
+          return
+        }
+        const exitCode = code === null ? '' : String(code)
+        rejectCommand(new Error('命令执行失败' + (exitCode ? '（退出码 ' + exitCode + '）' : '') + '。' + (details ? '\n' + details : spawnError ? '\n' + spawnError.message : '')))
+      }
+      const onAbort = (): void => this.terminateCommandTree(child, true)
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true
+        this.terminateCommandTree(child, true)
+      }, timeoutMs)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      child.once('error', (error) => {
+        spawnError = error
+        finish(null)
+      })
+      child.once('exit', () => {
+        // Foreground commands must not leave descendants holding stdout/stderr
+        // pipes open after the root process exits. Long-lived processes use
+        // background=true or start_service instead.
+        this.terminateCommandTree(child, false)
+      })
+      child.once('close', (code) => finish(code))
+      const captureOutput = (chunk: Buffer | string, source: 'stdout' | 'stderr'): void => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        outputBytes += buffer.length
+        const target = source === 'stdout' ? stdoutChunks : stderrChunks
+        target.push(buffer)
+        if (outputBytes > maxOutputBytes && !outputExceeded) {
+          outputExceeded = true
+          this.terminateCommandTree(child, true)
+        }
+        const text = this.decodeCommandValue(buffer)
+        if (text) onOutput?.(text, source)
+      }
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        captureOutput(chunk, 'stdout')
+      })
+      child.stderr?.on('data', (chunk: Buffer | string) => {
+        captureOutput(chunk, 'stderr')
+      })
+    })
+  }
+
+  private terminateCommandTree(child: ChildProcess, force: boolean): void {
+    const pid = child.pid
+    if (!pid) return
+    if (process.platform === 'win32') {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/t', ...(force ? ['/f'] : [])], {
+        windowsHide: true,
+        detached: true,
+        stdio: 'ignore'
+      })
+      killer.on('error', () => undefined)
+      killer.unref()
+      return
+    }
+    try {
+      process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM')
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) child.kill(force ? 'SIGKILL' : 'SIGTERM')
     }
   }
 
-  private async runBackgroundCommand(command: string, args: string[], signal?: AbortSignal): Promise<string> {
+  private async runBackgroundCommand(command: string, args: string[], signal?: AbortSignal, onOutput?: CommandOutputListener): Promise<string> {
     if (signal?.aborted) throw new DOMException('后台命令已暂停', 'AbortError')
     const invocation = await this.resolveServiceInvocation(command, args, signal)
     const logPath = join(tmpdir(), 'codext-background-' + crypto.randomUUID() + '.log')
@@ -344,8 +473,25 @@ export class WorkspaceTools {
     return new Promise((resolveBackground, rejectBackground) => {
       let settled = false
       let graceTimer: ReturnType<typeof setTimeout> | undefined
+      let outputPollTimer: ReturnType<typeof setTimeout> | undefined
+      let publishedOutput = ''
+      const publishOutput = async (): Promise<void> => {
+        if (settled) return
+        try {
+          const output = this.decodeCommandOutput(await readFile(logPath))
+          if (output !== publishedOutput) {
+            const delta = output.startsWith(publishedOutput) ? output.slice(publishedOutput.length) : output
+            if (delta) onOutput?.(delta, 'stdout')
+            publishedOutput = output
+          }
+        } catch {
+          /* 进程刚启动时日志可能尚未可读。 */
+        }
+        if (!settled) outputPollTimer = setTimeout(() => void publishOutput(), 80)
+      }
       const cleanup = (): void => {
         if (graceTimer) clearTimeout(graceTimer)
+        if (outputPollTimer) clearTimeout(outputPollTimer)
         signal?.removeEventListener('abort', onAbort)
         child.removeListener('error', onError)
         child.removeListener('exit', onExit)
@@ -385,14 +531,17 @@ export class WorkspaceTools {
         graceTimer = setTimeout(() => settle(), BACKGROUND_START_GRACE_MS)
       })
       if (earlySpawnError) settle(earlySpawnError)
-      else if (spawnedEarly) graceTimer = setTimeout(() => settle(), BACKGROUND_START_GRACE_MS)
+      else {
+        void publishOutput()
+        if (spawnedEarly) graceTimer = setTimeout(() => settle(), BACKGROUND_START_GRACE_MS)
+      }
     })
   }
 
-  private async runWindowsBatchCommand(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS): Promise<string> {
+  private async runWindowsBatchCommand(command: string, args: string[], signal?: AbortSignal, timeoutMs = COMMAND_TIMEOUT_MS, onOutput?: CommandOutputListener): Promise<string> {
     this.assertSafeWindowsBatchArguments(command, args)
     const commandProcessor = process.env.ComSpec?.trim() || 'cmd.exe'
-    return this.runExecutable(commandProcessor, ['/d', '/s', '/c', command, ...args], signal, timeoutMs)
+    return this.runExecutable(commandProcessor, ['/d', '/s', '/c', command, ...args], signal, timeoutMs, onOutput)
   }
 
   private async findWindowsBatchCommand(command: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -442,28 +591,19 @@ export class WorkspaceTools {
     return command.trim().replace(/[。．](?=(?:cmd|bat|exe)$)/i, '.')
   }
 
+  private withLiveProgress(command: string, args: string[], enabled: boolean): string[] {
+    if (!enabled || basename(command).toLowerCase().replace(/\.(?:cmd|bat|exe)$/, '') !== 'git') return args
+    const operation = args[0]?.toLowerCase()
+    if (!operation || !['clone', 'fetch', 'pull'].includes(operation) || args.includes('--progress') || args.includes('--no-progress')) return args
+    return [args[0], '--progress', ...args.slice(1)]
+  }
+
   private commandTimeout(command: string, args: string[]): number {
     const executableName = basename(command).toLowerCase().replace(/\.(?:cmd|bat|exe)$/, '')
     const operation = args[0]?.toLowerCase()
     const packageManagers = new Set(['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'yarnpkg', 'corepack'])
     const longOperations = new Set(['install', 'i', 'ci', 'add', 'create', 'exec', 'dlx'])
     return packageManagers.has(executableName) && operation && longOperations.has(operation) ? PACKAGE_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS
-  }
-
-  private isCommandTimeoutError(error: unknown): boolean {
-    if (typeof error !== 'object' || error === null) return false
-    const details = error as { code?: unknown; killed?: unknown }
-    return details.code === 'ETIMEDOUT' || details.killed === true
-  }
-
-  private commandErrorDetails(error: unknown): string {
-    if (typeof error !== 'object' || error === null) return ''
-    const details = error as { stdout?: unknown; stderr?: unknown; message?: unknown }
-    const output = [details.stdout, details.stderr]
-      .map((value) => Buffer.isBuffer(value) ? this.decodeCommandOutput(value) : typeof value === 'string' ? value : '')
-      .filter(Boolean)
-      .join('\n') || (typeof details.message === 'string' ? details.message : '')
-    return output.length > 32_000 ? output.slice(0, 24_000) + '\n...输出已截断...\n' + output.slice(-8_000) : output.trim()
   }
 
   private commandExitCode(error: unknown): string {
@@ -577,6 +717,7 @@ export class WorkspaceTools {
   }
 
   private assertWorkspacePath(target: string): void {
+    if (this.options.allowExternalPaths) return
     const pathRelative = relative(resolve(this.workspacePath), target)
     if (pathRelative === '..' || pathRelative.startsWith('..\\') || pathRelative.startsWith('../') || isAbsolute(pathRelative)) throw new Error('文件操作仅允许在当前工作区内进行。')
   }
@@ -594,6 +735,10 @@ export class WorkspaceTools {
   }
 
   private async ensureSafeDirectoryPath(target: string): Promise<void> {
+    if (this.options.allowExternalPaths && this.isOutsideWorkspace(target)) {
+      await mkdir(target, { recursive: true })
+      return
+    }
     this.assertWorkspacePath(target)
     const workspaceRoot = resolve(this.workspacePath)
     const pathRelative = relative(workspaceRoot, target)
@@ -618,6 +763,11 @@ export class WorkspaceTools {
     }
   }
 
+  private isOutsideWorkspace(target: string): boolean {
+    const pathRelative = relative(resolve(this.workspacePath), resolve(target))
+    return pathRelative === '..' || pathRelative.startsWith('..\\') || pathRelative.startsWith('../') || isAbsolute(pathRelative)
+  }
+
   private validateDownloadUrl(value: string): string {
     const url = new URL(value, DECRYPT_SERVICE_ORIGIN)
     if (url.origin !== DECRYPT_SERVICE_ORIGIN || !url.pathname.startsWith(DECRYPT_DOWNLOAD_PATH)) throw new Error('解密服务返回了不安全的下载地址。')
@@ -635,7 +785,7 @@ export class WorkspaceTools {
   }
 
   private displayPath(target: string): string {
-    return relative(resolve(this.workspacePath), target) || '.'
+    return this.isOutsideWorkspace(target) ? resolve(target) : relative(resolve(this.workspacePath), target) || '.'
   }
 
   private formatBytes(size: number): string {
@@ -648,5 +798,9 @@ export class WorkspaceTools {
     if (!output.length) return ''
     const encoding = process.platform === 'win32' ? 'gbk' : 'utf-8'
     return new TextDecoder(encoding).decode(output)
+  }
+
+  private decodeCommandValue(output: Buffer | string): string {
+    return typeof output === 'string' ? output : this.decodeCommandOutput(output)
   }
 }

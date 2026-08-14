@@ -35,6 +35,7 @@ describe('agent token usage', () => {
     const task = await createAgent().run('hello')
 
     expect(task.tokenUsage).toEqual(expect.objectContaining({ inputTokens: 120, outputTokens: 20, estimated: false }))
+    expect(task.contextUsage).toEqual(expect.objectContaining({ usedTokens: 140, contextWindowTokens: 128_000, estimated: false }))
     expect(task.tokenUsage?.durationMs).toBeGreaterThan(0)
     const request = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { stream_options?: { include_usage?: boolean } }
     expect(request.stream_options?.include_usage).toBe(true)
@@ -80,10 +81,16 @@ describe('agent token usage', () => {
         })
       })
     vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('目录为空')
+    const contextUpdates: Array<{ usedTokens: number }> = []
 
-    const task = await createAgent().run('list files')
+    const task = await createAgent().run('list files', [], undefined, undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, (usage) => contextUpdates.push(usage))
 
     expect(task.tokenUsage).toEqual(expect.objectContaining({ inputTokens: 120, outputTokens: 25, estimated: false }))
+    expect(task.contextUsage).toEqual(expect.objectContaining({ usedTokens: 85, contextWindowTokens: 128_000, estimated: false }))
+    expect(contextUpdates).toEqual([
+      expect.objectContaining({ usedTokens: 60 }),
+      expect.objectContaining({ usedTokens: 85 })
+    ])
   })
 
   it('falls back to estimated counts when a compatible API omits usage', async () => {
@@ -105,6 +112,7 @@ describe('agent token usage', () => {
     expect(task.tokenUsage?.inputTokens).toBeGreaterThan(0)
     expect(task.tokenUsage?.inputTokens).toBeLessThan(5000)
     expect(task.tokenUsage?.outputTokens).toBeGreaterThan(0)
+    expect(task.contextUsage?.estimated).toBe(true)
   })
 
   it('uses a per-run model override without changing the configured default', async () => {

@@ -122,7 +122,10 @@ app.whenReady().then(async () => {
       const globalPath = resolve(store.getPolicy().workspacePath)
       const updated = await store.setConversationWorkspace(conversationId, workspaceKey(selectedPath) === workspaceKey(globalPath) ? undefined : selectedPath)
       return { optionId, workspacePath: effectiveWorkspacePath(updated) }
-    }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }), modelConfig(modelProfile))
+    }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }), modelConfig(modelProfile), (contextUsage) => {
+      assistantMessage.contextUsage = contextUsage
+      event.sender.send('agent:context-usage', { conversationId, messageId: assistantMessage.id, contextUsage })
+    })
     assistantMessage.content = task.status === 'paused' && assistantMessage.content.trim()
       ? assistantMessage.content.trimEnd() + '\n\n[已暂停]'
       : task.result ?? task.error ?? ''
@@ -130,8 +133,9 @@ app.whenReady().then(async () => {
     assistantMessage.steps = task.steps
     assistantMessage.artifacts = task.artifacts?.length ? task.artifacts : undefined
     assistantMessage.tokenUsage = task.tokenUsage
+    assistantMessage.contextUsage = task.contextUsage
     assistantMessage.completedAt = new Date().toISOString()
-    event.sender.send('agent:done', { conversationId, messageId: assistantMessage.id, status: assistantMessage.status, content: assistantMessage.content, completedAt: assistantMessage.completedAt, tokenUsage: assistantMessage.tokenUsage })
+    event.sender.send('agent:done', { conversationId, messageId: assistantMessage.id, status: assistantMessage.status, content: assistantMessage.content, completedAt: assistantMessage.completedAt, tokenUsage: assistantMessage.tokenUsage, contextUsage: assistantMessage.contextUsage })
     const conversation = await store.updateMessage(conversationId, assistantMessage)
     return { conversation, task }
     } finally {

@@ -1,4 +1,4 @@
-import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, McpApprovalDetails, ModelConfig, PermissionMode, TaskStep, TokenUsage, UserChoiceDetails } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, ContextUsage, McpApprovalDetails, ModelConfig, PermissionMode, TaskStep, TokenUsage, UserChoiceDetails } from '../../shared/types'
 import { isDecryptableAttachmentName, isImageAttachmentType, isOfficeAttachmentType, isTextAttachmentType, MAX_TEXT_ATTACHMENT_CHARACTERS, officeAttachmentTool, type OfficeAttachmentTool } from '../../shared/attachments'
 import { WorkspaceTools, type CommandOutputListener } from '../tools/workspace-tools'
 import { getEnabledToolDefinitions, isToolName, type ToolCall } from '../tools/tool-registry'
@@ -75,6 +75,7 @@ type ConversationMessage = {
 }
 type StepCallback = (step: TaskStep) => void
 type DeltaCallback = (delta: string) => void
+type ContextUsageCallback = (usage: ContextUsage) => void
 type McpApprovalCallback = (request: McpApprovalDetails) => Promise<boolean>
 type CommandApprovalCallback = (request: CommandApprovalDetails) => Promise<boolean>
 type UserChoiceSelection = string | { optionId?: string; workspacePath?: string }
@@ -116,7 +117,7 @@ export class ReactAgent {
     this.runtimeEnvironmentPrompt = formatRuntimeEnvironmentPrompt(runtimeEnvironment)
   }
 
-  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig): Promise<AgentTask> {
+  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback): Promise<AgentTask> {
     const task: AgentTask = { id: crypto.randomUUID(), prompt, status: 'reasoning', createdAt: new Date().toISOString(), steps: [] }
     const configuredPolicy = this.getPolicy()
     const policy = workspacePath?.trim() ? { ...configuredPolicy, workspacePath: workspacePath.trim() } : configuredPolicy
@@ -124,9 +125,9 @@ export class ReactAgent {
     task.status = 'acting'
 
     try {
-      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval, modelOverride)
+      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval, modelOverride, onContextUsage)
       task.result = result
-      this.recordServiceArtifacts(task, result, false)
+      this.retainFinalServiceArtifacts(task, result)
       task.status = 'validating'
       task.status = 'succeeded'
     } catch (error) {
@@ -137,7 +138,7 @@ export class ReactAgent {
     return task
   }
 
-  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig): Promise<string> {
+  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback): Promise<string> {
     throwIfAborted(signal)
     const settings = this.getSettings()
     const model = modelOverride ?? settings.model
@@ -200,7 +201,7 @@ export class ReactAgent {
       try {
         const requestMessages = focusedModelMessages ?? messages
         focusedModelMessages = undefined
-        modelResponse = await this.callModel(requestMessages, (delta) => stream.push(delta), signal, task, model, onStep, currentPolicy.enabledTools)
+        modelResponse = await this.callModel(requestMessages, (delta) => stream.push(delta), signal, task, model, onStep, currentPolicy.enabledTools, onContextUsage)
         content = modelResponse.content
       } catch (error) {
         const modelError = error instanceof Error ? error : new Error(String(error))
@@ -867,11 +868,19 @@ export class ReactAgent {
         /* 解密工具的非结构化输出不包含可导航文件。 */
       }
     }
-    if (call.name === 'run_command' || call.name === 'start_service') this.recordServiceArtifacts(task, output, true)
+    if (call.name === 'start_service') this.recordStartedServiceArtifacts(task, output)
   }
 
-  private recordServiceArtifacts(task: AgentTask, text: string, localOnly: boolean): void {
-    for (const url of extractWebUrls(text, localOnly)) this.addArtifact(task, { type: 'service', url })
+  private recordStartedServiceArtifacts(task: AgentTask, text: string): void {
+    for (const url of extractWebUrls(text, true)) this.addArtifact(task, { type: 'service', url, createdByAgent: true })
+  }
+
+  private retainFinalServiceArtifacts(task: AgentTask, finalText: string): void {
+    if (!task.artifacts?.some((artifact) => artifact.type === 'service')) return
+    const finalUrls = new Set(extractWebUrls(finalText, false).map(serviceUrlIdentity))
+    const retained = task.artifacts.filter((artifact) => artifact.type === 'file' || finalUrls.has(serviceUrlIdentity(artifact.url)))
+    if (retained.length) task.artifacts = retained
+    else delete task.artifacts
   }
 
   private addArtifact(task: AgentTask, artifact: AgentArtifact): void {
@@ -893,7 +902,8 @@ export class ReactAgent {
     }
   }
 
-  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback, enabledTools: string[] = []): Promise<ModelResponse> {
+  private async callModel(messages: ModelMessage[], onDelta: DeltaCallback | undefined, signal: AbortSignal | undefined, task: AgentTask, model: ModelConfig, onStep?: StepCallback, enabledTools: string[] = [], onContextUsage?: ContextUsageCallback): Promise<ModelResponse> {
+    const contextWindowTokens = Math.max(4096, Math.floor(model.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS))
     const prepared = prepareContext(messages, {
       contextWindowTokens: model.contextWindowTokens,
       maxOutputTokens: model.maxOutputTokens
@@ -918,7 +928,8 @@ export class ReactAgent {
       try {
         const startedAt = performance.now()
         const response = await this.callModelOnce(messages, model, onDelta, signal, remainingMs, useStreaming, enabledTools)
-        this.recordTokenUsage(task, messages, response, Math.max(1, performance.now() - startedAt))
+        this.recordTokenUsage(task, messages, response, Math.max(1, performance.now() - startedAt), contextWindowTokens)
+        if (task.contextUsage) onContextUsage?.({ ...task.contextUsage })
         return response
       } catch (error) {
         throwIfAborted(signal)
@@ -1195,14 +1206,22 @@ export class ReactAgent {
     }
   }
 
-  private recordTokenUsage(task: AgentTask, messages: ModelMessage[], response: ModelResponse, durationMs: number): void {
+  private recordTokenUsage(task: AgentTask, messages: ModelMessage[], response: ModelResponse, durationMs: number, contextWindowTokens: number): void {
     const inputTokens = normalizedTokenCount(response.usage?.prompt_tokens ?? response.usage?.input_tokens)
     const outputTokens = normalizedTokenCount(response.usage?.completion_tokens ?? response.usage?.output_tokens)
+    const currentInputTokens = inputTokens ?? estimateContextTokens(messages)
+    const currentOutputTokens = outputTokens ?? estimateTokenCount(response.content)
+    const estimated = inputTokens === undefined || outputTokens === undefined
     const current: TokenUsage = {
-      inputTokens: inputTokens ?? estimateContextTokens(messages),
-      outputTokens: outputTokens ?? estimateTokenCount(response.content),
+      inputTokens: currentInputTokens,
+      outputTokens: currentOutputTokens,
       durationMs,
-      estimated: inputTokens === undefined || outputTokens === undefined
+      estimated
+    }
+    task.contextUsage = {
+      usedTokens: Math.min(contextWindowTokens, currentInputTokens + currentOutputTokens),
+      contextWindowTokens,
+      estimated
     }
     const previous = task.tokenUsage
     task.tokenUsage = previous ? {
@@ -1959,7 +1978,7 @@ function extractWebUrls(text: string, localOnly: boolean): string[] {
   const urls = new Set<string>()
   for (const match of matches) {
     try {
-      const url = new URL(match.replace(/[),.;\]，。；]+$/, ''))
+      const url = new URL(stripTrailingUrlMarkup(match))
       if (url.protocol !== 'http:' && url.protocol !== 'https:') continue
       if (localOnly && !isLocalServiceHost(url.hostname)) continue
       if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
@@ -1969,6 +1988,22 @@ function extractWebUrls(text: string, localOnly: boolean): string[] {
     }
   }
   return [...urls]
+}
+
+function stripTrailingUrlMarkup(value: string): string {
+  return value.replace(/[),.;\]，。；]+$/, '').replace(/\*{1,3}$/, '')
+}
+
+function serviceUrlIdentity(value: string): string {
+  try {
+    const url = new URL(stripTrailingUrlMarkup(value))
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    if (host === 'localhost' || host === '0.0.0.0' || host === '::' || host === '::1' || /^127\./.test(host)) url.hostname = 'localhost'
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return value
+  }
 }
 
 function isLocalServiceHost(hostname: string): boolean {

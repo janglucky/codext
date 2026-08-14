@@ -29,6 +29,11 @@ const api: DesktopApi = {
     ipcRenderer.on('agent:delta', listener)
     return () => ipcRenderer.off('agent:delta', listener)
   },
+  onAgentContextUsage: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)
+    ipcRenderer.on('agent:context-usage', listener)
+    return () => ipcRenderer.off('agent:context-usage', listener)
+  },
   onAgentDone: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]): void => callback(payload)
     ipcRenderer.on('agent:done', listener)

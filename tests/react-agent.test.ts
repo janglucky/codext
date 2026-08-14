@@ -645,7 +645,7 @@ describe('ReactAgent.execute', () => {
 
   // 3. model returns tool_calls
   describe('with tool calls', () => {
-    it('records written files and web services as navigable artifacts', async () => {
+    it('does not turn a final-only URL into a web preview artifact', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
         callCount++
@@ -660,10 +660,7 @@ describe('ReactAgent.execute', () => {
       const task = await agent.run('创建应用')
 
       expect(task.status).toBe('succeeded')
-      expect(task.artifacts).toEqual([
-        { type: 'file', path: 'src/app.ts' },
-        { type: 'service', url: 'http://localhost:5173/app' }
-      ])
+      expect(task.artifacts).toEqual([{ type: 'file', path: 'src/app.ts' }])
     })
 
     it('executes edit_file and records the edited file as an artifact', async () => {
@@ -708,7 +705,59 @@ describe('ReactAgent.execute', () => {
       expect(task.status).toBe('succeeded')
       expect(approval).toHaveBeenCalledWith(expect.objectContaining({ command: 'node', args: ['server.js'], displayCommand: 'node server.js' }))
       expect(startService).toHaveBeenCalledWith('node', ['server.js'], undefined, false)
-      expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/' }])
+      expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/', createdByAgent: true }])
+    })
+
+    it('previews only a started service URL that is also present in the final summary', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'start_service', arguments: { command: 'node', args: ['server.js'] } } })
+          : JSON.stringify({ final: '已启动 [本地预览](http://127.0.0.1:3000/)\n\n参考文档：https://example.com/docs' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'startService').mockResolvedValue('service running at http://127.0.0.1:3000/; docs https://example.com/docs')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '启动本地服务', vi.fn(async () => true))
+
+      expect(task.artifacts).toEqual([{ type: 'service', url: 'http://127.0.0.1:3000/', createdByAgent: true }])
+      expect(task.result).toContain('https://example.com/docs')
+    })
+
+    it('keeps a started service preview when the final URL is wrapped in Markdown emphasis', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'start_service', arguments: { command: 'node', args: ['server.js'] } } })
+          : JSON.stringify({ final: '访问地址：**http://localhost:3100/**' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'startService').mockResolvedValue(JSON.stringify({ ok: true, url: 'http://localhost:3100/', pid: 123 }))
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '启动本地服务', vi.fn(async () => true))
+
+      expect(task.artifacts).toEqual([{ type: 'service', url: 'http://localhost:3100/', createdByAgent: true }])
+    })
+
+    it('removes a started service preview when the final summary omits its URL', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'start_service', arguments: { command: 'node', args: ['server.js'] } } })
+          : JSON.stringify({ final: '服务已启动。参考：https://example.com/docs' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'startService').mockResolvedValue(JSON.stringify({ ok: true, url: 'http://127.0.0.1:3000/', pid: 123 }))
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await runWithCommandApproval(agent, '启动本地服务', vi.fn(async () => true))
+
+      expect(task.artifacts).toBeUndefined()
     })
 
     it('requests approval before running an SSH read-only command', async () => {

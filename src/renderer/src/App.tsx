@@ -1,8 +1,8 @@
-import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode, type SVGProps } from 'react'
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Trash2 } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, Conversation, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
@@ -117,6 +117,7 @@ export function App(): ReactElement {
   const modelProfiles = useMemo(() => getModelProfiles(settings), [settings])
   const defaultModel = useMemo(() => getDefaultModelProfile(settings), [settings])
   const activeModel = useMemo(() => resolveModelProfile(settings, activeConversation?.modelId), [settings, activeConversation?.modelId])
+  const latestContextUsage = useMemo(() => [...(activeConversation?.messages ?? [])].reverse().find((message) => message.role === 'assistant' && message.contextUsage)?.contextUsage, [activeConversation?.messages])
   const scrollKey = useMemo(() => activeConversation?.messages.map((message) => [message.id, message.status ?? '', message.content.length, message.attachments?.length ?? 0, message.steps?.length ?? 0, message.steps?.reduce((total, step) => total + step.detail.length, 0) ?? 0, message.tokenUsage?.outputTokens ?? 0].join(':')).join('|') ?? '', [activeConversation])
 
   useEffect(() => {
@@ -209,7 +210,20 @@ export function App(): ReactElement {
   }, [])
 
   useEffect(() => {
-    return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt, tokenUsage }) => {
+    if (typeof window.api.onAgentContextUsage !== 'function') return
+    return window.api.onAgentContextUsage(({ conversationId, messageId, contextUsage }) => {
+      setConversations((current) => current.map((conversation) => {
+        if (conversation.id !== conversationId) return conversation
+        return {
+          ...conversation,
+          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({ ...message, contextUsage }))
+        }
+      }))
+    })
+  }, [])
+
+  useEffect(() => {
+    return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt, tokenUsage, contextUsage }) => {
       setMcpApproval(undefined)
       setCommandApproval(undefined)
       setUserChoice(undefined)
@@ -218,7 +232,7 @@ export function App(): ReactElement {
         if (conversation.id !== conversationId) return conversation
         return {
           ...conversation,
-          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({ ...message, content, completedAt, status, tokenUsage }))
+          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({ ...message, content, completedAt, status, tokenUsage, contextUsage }))
         }
       }))
     })
@@ -553,7 +567,7 @@ export function App(): ReactElement {
         {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
         {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
         <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><div className="permission-control" ref={permissionControlRef}><button type="button" className={'permission mode-' + (settings.permissionMode ?? 'request_approval')} disabled={running} aria-expanded={permissionMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen(false); setPermissionMenuOpen((open) => !open) }}><Icon name="shield" />{permissionModeLabel(settings.permissionMode)}<Icon name="chevron-down" /></button>{permissionMenuOpen ? <PermissionMenu value={settings.permissionMode ?? 'request_approval'} onChange={(mode) => void selectPermissionMode(mode)} /> : null}</div></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
-        <footer><div className="workspace-control" ref={workspaceControlRef}><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setPermissionMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + modelDisplayName(activeModel)} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setPermissionMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{modelDisplayName(activeModel)}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {modelDisplayName(defaultModel)}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{modelDisplayName(profile)}</strong><small>{profile.name && profile.name !== modelDisplayName(profile) ? profile.name + ' · ' : ''}{profile.provider || 'OpenAI 兼容'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span></footer>
+        <footer><div className="workspace-control" ref={workspaceControlRef}><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setPermissionMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + modelDisplayName(activeModel)} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setPermissionMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{modelDisplayName(activeModel)}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {modelDisplayName(defaultModel)}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{modelDisplayName(profile)}</strong><small>{profile.name && profile.name !== modelDisplayName(profile) ? profile.name + ' · ' : ''}{profile.provider || 'OpenAI 兼容'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span><ContextUsageMeter usage={latestContextUsage} configuredLimit={activeModel.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS} /></footer>
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
@@ -647,7 +661,7 @@ function MessageView({ conversationId, message, onPreview }: { conversationId: s
     {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
     <div className="message-content-group">
       {message.content ? message.role === 'assistant'
-        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div>
+        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: MarkdownExternalLink }}>{message.content}</ReactMarkdown></div>
         : <div className="message-bubble">{message.content}</div> : null}
       {message.role === 'assistant' && message.artifacts?.length ? <ResultArtifacts conversationId={conversationId} artifacts={message.artifacts} /> : null}
       {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} onPreview={() => onPreview(attachment)} />)}</div> : null}
@@ -656,12 +670,37 @@ function MessageView({ conversationId, message, onPreview }: { conversationId: s
   </article>
 }
 
+function MarkdownExternalLink({ href, children, ...props }: ComponentPropsWithoutRef<'a'>): ReactElement {
+  const isWebUrl = typeof href === 'string' && /^https?:\/\//i.test(href)
+  return <a {...props} href={href} title={isWebUrl ? '在默认浏览器中打开 ' + href : props.title} onClick={(event) => {
+    if (!isWebUrl || !href) return
+    event.preventDefault()
+    void window.api.openExternalUrl(href)
+  }}>{children}{isWebUrl ? <ExternalLink aria-hidden="true" /> : null}</a>
+}
+
+function ContextUsageMeter({ usage, configuredLimit }: { usage?: ContextUsage; configuredLimit: number }): ReactElement {
+  const limit = Math.max(1, usage?.contextWindowTokens ?? configuredLimit)
+  const used = Math.max(0, usage?.usedTokens ?? 0)
+  const percentage = Math.min(100, used / limit * 100)
+  const level = percentage >= 95 ? 'danger' : percentage >= 80 ? 'warning' : ''
+  const prefix = usage?.estimated ? '≈' : ''
+  const label = usage ? prefix + formatTokenCount(used) + ' / ' + formatTokenCount(limit) : '-- / ' + formatTokenCount(limit)
+  const title = usage
+    ? '最近一轮模型请求的' + (usage.estimated ? '估算' : '实际') + '上下文用量：' + used.toLocaleString('zh-CN') + ' / ' + limit.toLocaleString('zh-CN') + ' tokens（' + percentage.toFixed(1) + '%）。每轮模型响应结束后更新，不是整个任务的累计用量。'
+    : '尚无模型请求；上下文窗口 ' + limit.toLocaleString('zh-CN') + ' tokens'
+  return <div className={'composer-context-usage ' + level} title={title} aria-label={title}>
+    <span>当前上下文</span><i aria-hidden="true"><b style={{ width: percentage + '%' }} /></i><strong>{label}</strong>
+  </div>
+}
+
 function TokenUsageView({ usage }: { usage: TokenUsage }): ReactElement {
   const prefix = usage.estimated ? '≈' : ''
   const speed = usage.durationMs > 0 ? usage.outputTokens / (usage.durationMs / 1000) : 0
-  const inputTitle = (usage.estimated ? '估算输入' : '输入') + ' ' + usage.inputTokens.toLocaleString('zh-CN') + ' tokens'
-  const outputTitle = (usage.estimated ? '估算输出' : '输出') + ' ' + usage.outputTokens.toLocaleString('zh-CN') + ' tokens，平均 ' + formatTokenRate(speed)
+  const inputTitle = '本次 Agent 任务所有模型请求的' + (usage.estimated ? '估算累计输入' : '累计输入') + '：' + usage.inputTokens.toLocaleString('zh-CN') + ' tokens'
+  const outputTitle = '本次 Agent 任务所有模型请求的' + (usage.estimated ? '估算累计输出' : '累计输出') + '：' + usage.outputTokens.toLocaleString('zh-CN') + ' tokens，平均 ' + formatTokenRate(speed)
   return <div className={'token-usage ' + (usage.estimated ? 'estimated' : '')} aria-label={inputTitle + '；' + outputTitle}>
+    <em title="本次 Agent 任务所有模型请求的累计用量">任务累计</em>
     <span title={inputTitle}><ArrowUp />{prefix}{formatTokenCount(usage.inputTokens)}</span>
     <span title={outputTitle}><ArrowDown />{prefix}{formatTokenCount(usage.outputTokens)}<small>{formatTokenRate(speed)}</small></span>
   </div>
@@ -670,7 +709,7 @@ function TokenUsageView({ usage }: { usage: TokenUsage }): ReactElement {
 function ResultArtifacts({ conversationId, artifacts }: { conversationId: string; artifacts: AgentArtifact[] }): ReactElement {
   const files = artifacts.filter((artifact): artifact is Extract<AgentArtifact, { type: 'file' }> => artifact.type === 'file')
   const services = [...new Set(artifacts
-    .filter((artifact): artifact is Extract<AgentArtifact, { type: 'service' }> => artifact.type === 'service')
+    .filter((artifact): artifact is Extract<AgentArtifact, { type: 'service' }> => artifact.type === 'service' && artifact.createdByAgent === true)
     .map((artifact) => normalizeServiceArtifactUrl(artifact.url))
     .filter((url): url is string => Boolean(url)))]
   const [opening, setOpening] = useState('')
@@ -690,6 +729,8 @@ function ResultArtifacts({ conversationId, artifacts }: { conversationId: string
     return () => document.removeEventListener('pointerdown', closeMenu)
   }, [serviceMenu])
   useEffect(() => () => { if (copyTimer.current) clearTimeout(copyTimer.current) }, [])
+
+  if (!files.length && !services.length) return <></>
 
   async function openFile(path: string): Promise<void> {
     const key = 'file:' + path

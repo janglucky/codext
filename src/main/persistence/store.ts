@@ -208,6 +208,71 @@ function normalizePersistedMessage(message: ChatMessage): ChatMessage {
   return { ...normalized, content: protocolError, status: 'failed', completedAt: normalized.completedAt ?? now() }
 }
 
+function recoverStartedServiceArtifacts(message: ChatMessage): ChatMessage {
+  if (message.role !== 'assistant' || !message.steps?.length || !message.content.trim()) return message
+  const finalUrls = new Set(extractPersistedWebUrls(message.content).map(persistedServiceUrlIdentity))
+  if (!finalUrls.size) return message
+
+  const startedUrls = message.steps.flatMap((item) => {
+    if (!item.title.includes('start_service')) return []
+    try {
+      const payload = JSON.parse(item.detail) as { ok?: unknown; url?: unknown }
+      if (payload.ok !== true || typeof payload.url !== 'string') return []
+      const normalized = normalizePersistedWebUrl(payload.url)
+      return normalized && finalUrls.has(persistedServiceUrlIdentity(normalized)) ? [normalized] : []
+    } catch {
+      return []
+    }
+  })
+  if (!startedUrls.length) return message
+
+  const artifacts = [...(message.artifacts ?? [])]
+  let changed = false
+  for (const url of new Set(startedUrls)) {
+    const identity = persistedServiceUrlIdentity(url)
+    const index = artifacts.findIndex((artifact) => artifact.type === 'service' && persistedServiceUrlIdentity(artifact.url) === identity)
+    if (index >= 0) {
+      const artifact = artifacts[index]
+      if (artifact.type === 'service' && artifact.createdByAgent !== true) {
+        artifacts[index] = { ...artifact, createdByAgent: true }
+        changed = true
+      }
+      continue
+    }
+    artifacts.push({ type: 'service', url, createdByAgent: true })
+    changed = true
+  }
+  return changed ? { ...message, artifacts } : message
+}
+
+function extractPersistedWebUrls(text: string): string[] {
+  const markdownLinkPattern = /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi
+  const sanitized = text.replace(markdownLinkPattern, '$1')
+  const matches = sanitized.match(/https?:\/\/[^\s<>"'`()\u005b\u005d]+/gi) ?? []
+  return [...new Set(matches.map(normalizePersistedWebUrl).filter((url): url is string => Boolean(url)))]
+}
+
+function normalizePersistedWebUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value.replace(/[),.;\]，。；]+$/, '').replace(/\*{1,3}$/, ''))
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    if (url.hostname === '0.0.0.0' || url.hostname === '[::]' || url.hostname === '::') url.hostname = 'localhost'
+    return url.toString()
+  } catch {
+    return undefined
+  }
+}
+
+function persistedServiceUrlIdentity(value: string): string {
+  const normalized = normalizePersistedWebUrl(value)
+  if (!normalized) return value
+  const url = new URL(normalized)
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  if (host === 'localhost' || host === '0.0.0.0' || host === '::' || host === '::1' || /^127\./.test(host)) url.hostname = 'localhost'
+  url.hash = ''
+  return url.toString()
+}
+
 const newConversation = (title = '新对话'): Conversation => {
   const createdAt = now()
   return { id: crypto.randomUUID(), title, createdAt, updatedAt: createdAt, messages: [] }
@@ -321,7 +386,7 @@ export class LocalStore {
 
   private normalizeConversations(draft: PersistedStateDraft): Conversation[] {
     if (draft.conversations?.length) return draft.conversations.map((conversation) => {
-      const messages = conversation.messages.map(normalizePersistedMessage)
+      const messages = conversation.messages.map((message) => recoverStartedServiceArtifacts(normalizePersistedMessage(message)))
       const normalized = { ...conversation, messages } as Conversation & { activeAttachments?: ChatMessage['attachments'] }
       delete normalized.activeAttachments
       return normalized
@@ -334,7 +399,7 @@ export class LocalStore {
     const createdAt = tasks[tasks.length - 1]?.createdAt ?? now()
     const messages = tasks.flatMap((task): ChatMessage[] => [
       { id: crypto.randomUUID(), role: 'user', content: task.prompt, createdAt: task.createdAt },
-      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps, artifacts: task.artifacts, tokenUsage: task.tokenUsage }
+      { id: crypto.randomUUID(), role: 'assistant', content: task.result ?? task.error ?? '', createdAt: task.createdAt, status: task.status, steps: task.steps, artifacts: task.artifacts, tokenUsage: task.tokenUsage, contextUsage: task.contextUsage }
     ])
     return { id: crypto.randomUUID(), title: '历史任务', createdAt, updatedAt: tasks[0]?.createdAt ?? createdAt, messages }
   }

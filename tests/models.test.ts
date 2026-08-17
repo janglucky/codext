@@ -16,7 +16,7 @@ describe('model profiles', () => {
   it('migrates a legacy single model into one profile', () => {
     const profiles = getModelProfiles(baseSettings)
     expect(profiles).toHaveLength(1)
-    expect(profiles[0]).toMatchObject({ id: 'default-model', name: 'legacy-model', provider: 'OpenAI 兼容', model: 'legacy-model' })
+    expect(profiles[0]).toMatchObject({ id: 'default-model', name: 'legacy-model', provider: 'OpenAI 兼容', connectionType: 'openai_compatible', model: 'legacy-model' })
     expect(getDefaultModelProfile(baseSettings).model).toBe('legacy-model')
     expect(modelConfig(profiles[0])).toMatchObject({ contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS })
   })
@@ -25,13 +25,14 @@ describe('model profiles', () => {
     const settings: AppSettings = {
       ...baseSettings,
       models: [
-        { id: 'one', name: '一个', provider: '厂商一', ...baseSettings.model, model: 'one-model' },
-        { id: 'two', name: '两个', provider: '厂商二', ...baseSettings.model, model: 'two-model' }
+        { id: 'one', name: '一个', provider: '厂商一', connectionType: 'provider', ...baseSettings.model, model: 'one-model' },
+        { id: 'two', name: '两个', provider: '厂商二', connectionType: 'relay', ...baseSettings.model, model: 'two-model' }
       ],
       defaultModelId: 'two'
     }
     expect(resolveModelProfile(settings, 'one').model).toBe('one-model')
     expect(resolveModelProfile(settings, 'one').provider).toBe('厂商一')
     expect(resolveModelProfile(settings, 'missing').model).toBe('two-model')
+    expect(resolveModelProfile(settings, 'missing').connectionType).toBe('relay')
   })
 })

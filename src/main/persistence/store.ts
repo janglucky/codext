@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, FontFamilyPreference, ModelConfig, ModelProfile, PermissionMode } from '../../shared/types'
+import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, FontFamilyPreference, ModelConfig, ModelConnectionType, ModelProfile, PermissionMode } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
 import { isInternalAgentPlaceholder } from '../../shared/text'
 
@@ -19,7 +19,7 @@ type PersistedStateDraft = Partial<PersistedState> & {
 }
 
 const defaultModelConfig: ModelConfig = { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4.1-mini', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS }
-const defaultModelProfile: ModelProfile = { id: LEGACY_MODEL_ID, name: 'OpenAI', provider: 'OpenAI', ...defaultModelConfig }
+const defaultModelProfile: ModelProfile = { id: LEGACY_MODEL_ID, name: 'OpenAI', provider: 'OpenAI', connectionType: 'provider', ...defaultModelConfig }
 
 export const defaults: AppSettings = {
   model: defaultModelConfig,
@@ -36,7 +36,7 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
   const legacyConfig = { ...defaultModelConfig, ...settings?.model }
   const rawProfiles = settings?.models?.length
     ? settings.models
-    : [{ ...legacyConfig, id: LEGACY_MODEL_ID, name: legacyConfig.model || '默认模型', provider: 'OpenAI 兼容' }]
+    : [{ ...legacyConfig, id: LEGACY_MODEL_ID, name: legacyConfig.model || '默认模型', provider: 'OpenAI 兼容', connectionType: 'openai_compatible' as const }]
   const usedIds = new Set<string>()
   const profiles = rawProfiles.map((profile, index): ModelProfile => {
     const requestedId = typeof profile.id === 'string' && profile.id.trim() ? profile.id.trim() : 'model-' + (index + 1)
@@ -58,7 +58,8 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
       contextWindowTokens,
       maxOutputTokens
     }
-    return { ...model, id, name: typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : model.model || '模型 ' + (index + 1), provider: typeof profile.provider === 'string' && profile.provider.trim() ? profile.provider.trim() : 'OpenAI 兼容' }
+    const provider = typeof profile.provider === 'string' && profile.provider.trim() ? profile.provider.trim() : 'OpenAI 兼容'
+    return { ...model, id, name: typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : model.model || '模型 ' + (index + 1), provider, connectionType: normalizeModelConnectionType(profile.connectionType, provider) }
   })
   const defaultModelId = typeof settings?.defaultModelId === 'string' && profiles.some((profile) => profile.id === settings.defaultModelId)
     ? settings.defaultModelId
@@ -92,6 +93,11 @@ function normalizePermissionMode(value: PermissionMode | undefined): PermissionM
   return value === 'full_access' || value === 'auto_approve' || value === 'request_approval'
     ? value
     : 'request_approval'
+}
+
+function normalizeModelConnectionType(value: ModelConnectionType | undefined, provider: string): ModelConnectionType {
+  if (value === 'provider' || value === 'openai_compatible' || value === 'relay') return value
+  return provider === 'OpenAI 兼容' ? 'openai_compatible' : 'provider'
 }
 
 function normalizeTheme(value: unknown): 'system' | 'light' | 'dark' {

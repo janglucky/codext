@@ -6,7 +6,7 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 16_384
 
 export function getModelProfiles(settings: AppSettings): ModelProfile[] {
   if (settings.models?.length) return settings.models
-  return [{ id: settings.defaultModelId || LEGACY_MODEL_ID, name: settings.model.model || '默认模型', provider: 'OpenAI 兼容', ...settings.model }]
+  return [{ id: settings.defaultModelId || LEGACY_MODEL_ID, name: settings.model.model || '默认模型', provider: 'OpenAI 兼容', connectionType: 'openai_compatible', ...settings.model }]
 }
 
 export function getDefaultModelProfile(settings: AppSettings): ModelProfile {

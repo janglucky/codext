@@ -1,7 +1,8 @@
 export type TaskStatus = 'pending' | 'reasoning' | 'acting' | 'validating' | 'succeeded' | 'failed' | 'paused'
 export type AgentArtifact = { type: 'file'; path: string } | { type: 'service'; url: string; createdByAgent?: boolean }
 export interface ModelConfig { baseUrl: string; apiKey: string; model: string; timeoutMs: number; maxRetries: number; contextWindowTokens?: number; maxOutputTokens?: number }
-export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string }
+export type ModelConnectionType = 'provider' | 'openai_compatible' | 'relay'
+export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string; connectionType?: ModelConnectionType }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
 export type ThemePreference = 'system' | 'light' | 'dark'
 export type FontFamilyPreference = 'system' | 'inter' | 'noto-sans' | 'yahei' | 'pingfang' | 'sarasa' | 'noto-serif' | 'songti' | 'kaiti' | 'wenkai' | 'mono'

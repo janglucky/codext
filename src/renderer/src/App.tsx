@@ -2,7 +2,7 @@ import { cloneElement, FormEvent, isValidElement, useEffect, useLayoutEffect, us
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Moon, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Sun, Trash2 } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, McpApprovalRequest, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, McpApprovalRequest, ModelConnectionType, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
@@ -617,12 +617,12 @@ export function App(): ReactElement {
     setSettings({ ...savedSettings, permissionMode: savedSettings.permissionMode ?? permissionMode })
   }
 
-  async function saveSettings(): Promise<void> {
-    const savedSettings = await window.api.saveSettings(settings)
+  async function saveSettings(settingsOverride?: AppSettings): Promise<void> {
+    const savedSettings = await window.api.saveSettings(settingsOverride ?? settings)
     const validModelIds = new Set(getModelProfiles(savedSettings).map((profile) => profile.id))
     setSettings(savedSettings)
     setConversations((current) => current.map((conversation) => conversation.modelId && !validModelIds.has(conversation.modelId) ? { ...conversation, modelId: undefined } : conversation))
-    if (policy) await window.api.savePolicy(policy)
+    if (policy && !settingsOverride) await window.api.savePolicy(policy)
   }
 
   async function closeSettings(): Promise<void> {
@@ -1351,7 +1351,7 @@ function formatElapsed(durationMs: number): string {
   return minutes + 'm ' + seconds + 's'
 }
 
-function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: () => Promise<void> }): ReactElement {
+function SettingsPage({ settings, setSettings, policy, setPolicy, tab, setTab, onBack, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; tab: SettingTab; setTab: (value: SettingTab) => void; onBack: () => void; onSave: (settingsOverride?: AppSettings) => Promise<void> }): ReactElement {
   const groups: Array<{ title: string; tabs: SettingTab[] }> = [{ title: '个人', tabs: ['常规', '外观', '配置', '个性化'] }, { title: '编码', tabs: ['Git', '环境'] }]
   const content = tab === '常规'
     ? <GeneralSettings settings={settings} setSettings={setSettings} onSave={onSave} />
@@ -1422,14 +1422,14 @@ function NavigationSettingsSection({ settings, setSettings }: { settings: AppSet
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }): ReactElement { return <button type="button" className={'toggle-switch ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)}><i /></button> }
-function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+function GeneralSettings({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: (settingsOverride?: AppSettings) => Promise<void> }): ReactElement {
   const selectedMode = settings.permissionMode ?? 'request_approval'
   const [saved, setSaved] = useState(false)
   async function save(): Promise<void> { await onSave(); setSaved(true) }
   return <div className="settings-inner"><h1>常规</h1><section className="settings-section"><h2>工作模式</h2><p>选择 Agent 展示和执行任务的方式。</p><div className="mode-cards"><button className="mode-card selected"><Icon name="monitor" /><span><strong>适用于编程</strong><small>更具技术性的回复和控制</small></span><b><Icon name="check" /></b></button><button className="mode-card"><Icon name="message" /><span><strong>适用于日常工作</strong><small>同样强大，技术细节更少</small></span><b /></button></div></section><section className="settings-section"><h2>权限</h2><p>选择 Agent 何时可自动执行，以及哪些操作需要您的批准。</p><div className="permission-option-list">{permissionModes.map((mode) => <button type="button" className={'permission-option ' + (selectedMode === mode.value ? 'selected' : '')} key={mode.value} onClick={() => { setSaved(false); setSettings({ ...settings, permissionMode: mode.value }) }}><span className="permission-option-icon"><Icon name="shield" /></span><span><strong>{mode.label}</strong><small>{mode.description}</small></span><b>{selectedMode === mode.value ? <Check /> : null}</b></button>)}</div></section><NavigationSettingsSection settings={settings} setSettings={(value) => { setSaved(false); setSettings(value) }} /><button className="settings-save" onClick={() => void save()}>保存更改</button>{saved ? <div className="config-notice success"><Check />常规设置已保存。</div> : null}</div>
 }
 
-function AppearanceSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+function AppearanceSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: (settingsOverride?: AppSettings) => Promise<void> }): ReactElement {
   const appearance = appearanceSettings(settings)
   const [saved, setSaved] = useState(false)
   const themes: Array<{ value: ThemePreference; label: string; description: string; icon: ReactElement }> = [
@@ -1446,7 +1446,7 @@ function AppearanceSettingsPage({ settings, setSettings, onSave }: { settings: A
   </div>
 }
 
-function PersonalizationSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: () => Promise<void> }): ReactElement {
+function PersonalizationSettingsPage({ settings, setSettings, onSave }: { settings: AppSettings; setSettings: (value: AppSettings) => void; onSave: (settingsOverride?: AppSettings) => Promise<void> }): ReactElement {
   const personalization = settings.personalization ?? { tone: 'balanced' as AgentTone, customInstructions: '' }
   const [saved, setSaved] = useState(false)
   const tones: Array<{ value: AgentTone; label: string; description: string }> = [
@@ -1467,11 +1467,12 @@ function PersonalizationSettingsPage({ settings, setSettings, onSave }: { settin
 function SettingsPlaceholder({ title }: { title: string }): ReactElement {
   return <div className="settings-inner"><h1>{title}</h1><section className="settings-section"><h2>即将支持</h2><p>此区域将在后续版本中提供更多配置。</p></section></div>
 }
-function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: () => Promise<void> }): ReactElement {
+function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSave }: { title: string; settings: AppSettings; setSettings: (value: AppSettings) => void; policy: AgentPolicy; setPolicy: (value: AgentPolicy) => void; onSave: (settingsOverride?: AppSettings) => Promise<void> }): ReactElement {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [apiKeyVisible, setApiKeyVisible] = useState(false)
   const [apiKeyCopied, setApiKeyCopied] = useState(false)
+  const [addModelOpen, setAddModelOpen] = useState(false)
   const copyResetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | undefined>()
   const profiles = getModelProfiles(settings)
@@ -1482,21 +1483,33 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
     if (!profiles.some((profile) => profile.id === selectedModelId)) setSelectedModelId(defaultProfile?.id ?? '')
   }, [defaultProfile?.id, profiles, selectedModelId])
   useEffect(() => () => { if (copyResetTimer.current) clearTimeout(copyResetTimer.current) }, [])
-  function commitProfiles(nextProfiles: ModelProfile[], requestedDefaultId = settings.defaultModelId ?? profiles[0]?.id): void {
+  function settingsWithProfiles(nextProfiles: ModelProfile[], requestedDefaultId = settings.defaultModelId ?? profiles[0]?.id): AppSettings | undefined {
     const nextDefault = nextProfiles.find((profile) => profile.id === requestedDefaultId) ?? nextProfiles[0]
-    if (!nextDefault) return
-    setSettings({ ...settings, models: nextProfiles, defaultModelId: nextDefault.id, model: modelConfig(nextDefault) })
+    if (!nextDefault) return undefined
+    return { ...settings, models: nextProfiles, defaultModelId: nextDefault.id, model: modelConfig(nextDefault) }
+  }
+  function commitProfiles(nextProfiles: ModelProfile[], requestedDefaultId = settings.defaultModelId ?? profiles[0]?.id): void {
+    const nextSettings = settingsWithProfiles(nextProfiles, requestedDefaultId)
+    if (nextSettings) setSettings(nextSettings)
   }
   function updateSelectedProfile(patch: Partial<ModelProfile>): void {
     if (!selectedProfile) return
     commitProfiles(profiles.map((profile) => profile.id === selectedProfile.id ? { ...profile, ...patch } : profile))
   }
-  function addModel(): void {
-    const source = selectedProfile ?? defaultProfile
-    const profile: ModelProfile = { ...(source ?? { baseUrl: '', apiKey: '', model: '', timeoutMs: 300000, maxRetries: 3, contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS, provider: 'OpenAI 兼容' }), id: crypto.randomUUID(), name: '新模型' }
-    commitProfiles([...profiles, profile], settings.defaultModelId ?? profiles[0]?.id)
-    setSelectedModelId(profile.id)
-    setNotice({ type: 'success', text: '已添加模型配置，请填写连接信息。' })
+  async function addModel(profile: ModelProfile): Promise<void> {
+    const nextSettings = settingsWithProfiles([...profiles, profile], settings.defaultModelId ?? profiles[0]?.id)
+    if (!nextSettings) throw new Error('无法创建模型配置。')
+    setSettings(nextSettings)
+    try {
+      await onSave(nextSettings)
+      setSelectedModelId(profile.id)
+      setApiKeyVisible(false)
+      setApiKeyCopied(false)
+      setNotice({ type: 'success', text: '模型配置已保存并添加到列表。' })
+    } catch (error) {
+      setSettings(settings)
+      throw error
+    }
   }
   function removeSelectedModel(): void {
     if (!selectedProfile || profiles.length <= 1) {
@@ -1538,8 +1551,8 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
   return <div className="settings-inner">
     <h1>{title}</h1>
     <section className="settings-section compact">
-      <div className="model-settings-heading"><div><h2>模型配置</h2><p>保存多个 OpenAI 兼容模型，并在每个会话中独立选择。</p></div><button type="button" className="model-add-button" onClick={addModel} title="添加模型" aria-label="添加模型"><Plus /></button></div>
-      <div className="model-profile-list">{profiles.map((profile) => <div className={'model-profile-row ' + (profile.id === selectedProfile?.id ? 'selected' : '')} key={profile.id}><button type="button" className="model-profile-select" onClick={() => { setSelectedModelId(profile.id); setApiKeyVisible(false); setApiKeyCopied(false) }}><Bot /><span><strong>{profile.name}</strong><small>{profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span></button><button type="button" className={'model-default-button ' + (profile.id === defaultProfile?.id ? 'active' : '')} onClick={() => { setSelectedModelId(profile.id); commitProfiles(profiles, profile.id) }} title={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'} aria-label={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'}>{profile.id === defaultProfile?.id ? <Star fill="currentColor" /> : <Star />}</button></div>)}</div>
+      <div className="model-settings-heading"><div><h2>模型配置</h2><p>管理厂商模型、OpenAI 兼容服务和 API 中转站，并在每个会话中独立选择。</p></div><button type="button" className="model-add-button" onClick={() => setAddModelOpen(true)}><Plus />添加模型</button></div>
+      <div className="model-profile-list">{profiles.map((profile) => <div className={'model-profile-row ' + (profile.id === selectedProfile?.id ? 'selected' : '')} key={profile.id}><button type="button" className="model-profile-select" onClick={() => { setSelectedModelId(profile.id); setApiKeyVisible(false); setApiKeyCopied(false) }}><Bot /><span><strong>{profile.name}</strong><small>{modelConnectionTypeLabel(profile.connectionType)} · {profile.provider || 'OpenAI 兼容'} · {profile.model || '未填写模型名称'}</small></span></button><button type="button" className={'model-default-button ' + (profile.id === defaultProfile?.id ? 'active' : '')} onClick={() => { setSelectedModelId(profile.id); commitProfiles(profiles, profile.id) }} title={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'} aria-label={profile.id === defaultProfile?.id ? '默认模型' : '设为默认模型'}>{profile.id === defaultProfile?.id ? <Star fill="currentColor" /> : <Star />}</button></div>)}</div>
       {selectedProfile ? <>
         <div className="model-profile-toolbar"><span>编辑模型</span><button type="button" className="model-delete-button" onClick={removeSelectedModel} title="删除当前模型" aria-label="删除当前模型"><Trash2 />删除</button></div>
         <label>显示名称（配置标签）<input value={selectedProfile.name} onChange={(event) => updateSelectedProfile({ name: event.target.value })} placeholder="例如：生产 GPT" /></label>
@@ -1576,5 +1589,154 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
       <p>工具默认使用工作区 <code>{policy.workspacePath}</code>；外部路径和风险操作由当前权限模式控制。</p>
       <div className="tool-list">{Object.entries(toolLabels).map(([name, label]) => <label key={name} className="tool-toggle"><span><strong>{label}</strong><small>{name}</small></span><Toggle checked={policy.enabledTools.includes(name)} onChange={() => toggleTool(name)} /></label>)}</div>
     </section>
+    {addModelOpen ? <AddModelDialog onClose={() => setAddModelOpen(false)} onSave={addModel} /> : null}
+  </div>
+}
+
+interface ModelAccessOption { id: string; connectionType: ModelConnectionType; label: string; description: string; provider: string; baseUrl: string }
+
+const modelAccessOptions: ModelAccessOption[] = [
+  { id: 'openai', connectionType: 'provider', label: 'OpenAI', description: 'OpenAI 官方 API', provider: 'OpenAI', baseUrl: 'https://api.openai.com/v1' },
+  { id: 'deepseek', connectionType: 'provider', label: 'DeepSeek', description: 'DeepSeek 官方 API', provider: 'DeepSeek', baseUrl: 'https://api.deepseek.com' },
+  { id: 'qwen', connectionType: 'provider', label: '通义千问', description: '阿里云百炼 OpenAI 兼容接口', provider: '通义千问', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  { id: 'zhipu', connectionType: 'provider', label: '智谱 AI', description: '智谱开放平台 OpenAI 兼容接口', provider: '智谱 AI', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+  { id: 'moonshot', connectionType: 'provider', label: 'Moonshot', description: 'Moonshot AI 官方 API', provider: 'Moonshot', baseUrl: 'https://api.moonshot.cn/v1' },
+  { id: 'gemini', connectionType: 'provider', label: 'Google Gemini', description: 'Gemini API 的 OpenAI 兼容接口', provider: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  { id: 'xai', connectionType: 'provider', label: 'xAI', description: 'xAI 官方 API', provider: 'xAI', baseUrl: 'https://api.x.ai/v1' },
+  { id: 'openai-compatible', connectionType: 'openai_compatible', label: 'OpenAI 兼容', description: 'Ollama、vLLM、LM Studio 或其他兼容服务', provider: 'OpenAI 兼容', baseUrl: '' },
+  { id: 'relay', connectionType: 'relay', label: '中转站 / 企业网关', description: 'API 中转、聚合平台或企业内部网关', provider: '中转站', baseUrl: '' }
+]
+
+function modelConnectionTypeLabel(type?: ModelConnectionType): string {
+  return type === 'openai_compatible' ? 'OpenAI 兼容' : type === 'relay' ? '中转站' : '模型厂商'
+}
+
+function createModelDraft(accessOption: ModelAccessOption = modelAccessOptions[0]): ModelProfile {
+  return {
+    id: crypto.randomUUID(),
+    name: '',
+    provider: accessOption.provider,
+    connectionType: accessOption.connectionType,
+    baseUrl: accessOption.baseUrl,
+    apiKey: '',
+    model: '',
+    timeoutMs: 300000,
+    maxRetries: 3,
+    contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+    maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS
+  }
+}
+
+function AddModelDialog({ onClose, onSave }: { onClose: () => void; onSave: (profile: ModelProfile) => Promise<void> }): ReactElement {
+  const [draft, setDraft] = useState<ModelProfile>(() => createModelDraft())
+  const [accessOptionId, setAccessOptionId] = useState(modelAccessOptions[0].id)
+  const [apiKeyVisible, setApiKeyVisible] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const selectedAccess = modelAccessOptions.find((option) => option.id === accessOptionId) ?? modelAccessOptions[0]
+  const connectionType = selectedAccess.connectionType
+  const providerAddressLocked = connectionType === 'provider'
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape' && !saving) onClose()
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [onClose, saving])
+
+  function update(patch: Partial<ModelProfile>): void {
+    setError('')
+    setDraft((current) => ({ ...current, ...patch }))
+  }
+
+  function selectAccessOption(optionId: string): void {
+    const option = modelAccessOptions.find((item) => item.id === optionId) ?? modelAccessOptions[0]
+    setError('')
+    setApiKeyVisible(false)
+    setAccessOptionId(option.id)
+    setDraft((current) => ({ ...current, connectionType: option.connectionType, provider: option.provider, baseUrl: option.baseUrl }))
+  }
+
+  async function submit(event: FormEvent): Promise<void> {
+    event.preventDefault()
+    const provider = draft.provider?.trim() || selectedAccess.provider
+    const baseUrl = draft.baseUrl.trim().replace(/\/+$/, '')
+    const model = draft.model.trim()
+    const contextWindowTokens = Math.floor(draft.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS)
+    const maxOutputTokens = Math.floor(draft.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS)
+    if (!baseUrl) {
+      setError('请填写 API 基础地址。')
+      return
+    }
+    try {
+      const parsedUrl = new URL(baseUrl)
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') throw new Error('unsupported protocol')
+    } catch {
+      setError('API 基础地址必须是有效的 HTTP 或 HTTPS 地址。')
+      return
+    }
+    if (!model) {
+      setError('请填写请求使用的模型名称。')
+      return
+    }
+    if (contextWindowTokens < 4096 || contextWindowTokens > 4_000_000) {
+      setError('上下文窗口需要在 4,096 到 4,000,000 tokens 之间。')
+      return
+    }
+    if (maxOutputTokens < 256 || maxOutputTokens > Math.min(1_000_000, Math.floor(contextWindowTokens * 0.5))) {
+      setError('最大输出需要在 256 tokens 到上下文窗口一半之间。')
+      return
+    }
+    const profile: ModelProfile = {
+      ...draft,
+      name: draft.name.trim() || model,
+      provider,
+      baseUrl,
+      model,
+      apiKey: draft.apiKey.trim(),
+      contextWindowTokens,
+      maxOutputTokens
+    }
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(profile)
+      onClose()
+    } catch {
+      setError('保存模型失败，请检查配置后重试。')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const addressPlaceholder = connectionType === 'relay'
+      ? 'https://中转站或企业网关地址/v1'
+      : 'http://127.0.0.1:8000/v1'
+
+  return <div className="model-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose() }}>
+    <form className="model-dialog" role="dialog" aria-modal="true" aria-labelledby="add-model-title" onSubmit={(event) => void submit(event)}>
+      <header className="model-dialog-header"><div><h2 id="add-model-title">添加模型</h2><p>选择接入方式并填写模型连接信息。</p></div><button type="button" disabled={saving} onClick={onClose} aria-label="关闭添加模型窗口" title="关闭"><Icon name="close" /></button></header>
+      <div className="model-dialog-body">
+        <section className="model-dialog-section"><h3>接入方式</h3><div className="model-access-select"><select value={accessOptionId} onChange={(event) => selectAccessOption(event.target.value)} autoFocus><optgroup label="模型厂商">{modelAccessOptions.filter((option) => option.connectionType === 'provider').map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</optgroup><optgroup label="自定义服务">{modelAccessOptions.filter((option) => option.connectionType !== 'provider').map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</optgroup></select><p>{selectedAccess.description}</p></div></section>
+        <section className="model-dialog-section model-dialog-fields"><h3>连接信息</h3>
+          <div className="model-dialog-grid">
+            <label><span>显示名称 <small>（可选）</small></span><input value={draft.name} onChange={(event) => update({ name: event.target.value })} placeholder="例如：生产环境 GPT" /></label>
+            <label>{connectionType === 'provider' ? '模型厂商' : '服务提供方'}<input list={providerAddressLocked ? undefined : 'add-model-provider-options'} value={draft.provider || ''} readOnly={providerAddressLocked} onChange={(event) => update({ provider: event.target.value })} placeholder={selectedAccess.provider} /></label>
+          </div>
+          <datalist id="add-model-provider-options"><option value="OpenAI" /><option value="Azure OpenAI" /><option value="DeepSeek" /><option value="通义千问" /><option value="智谱 AI" /><option value="Moonshot" /><option value="OpenRouter" /><option value="硅基流动" /><option value="OpenAI 兼容" /><option value="企业网关" /></datalist>
+          <label><span>API 基础地址 {providerAddressLocked ? <small>（厂商默认，不可修改）</small> : null}</span><input value={draft.baseUrl} readOnly={providerAddressLocked} onChange={(event) => update({ baseUrl: event.target.value })} placeholder={addressPlaceholder} spellCheck={false} /></label>
+          <label>模型名称<input value={draft.model} onChange={(event) => { const model = event.target.value; update({ model, ...(!draft.name.trim() || draft.name.trim() === draft.model.trim() ? { name: model } : {}) }) }} placeholder="模型接口使用的 model 标识" spellCheck={false} /></label>
+          <div className="model-dialog-grid model-dialog-token-grid">
+            <label>上下文窗口（tokens）<input type="number" min="4096" max="4000000" step="1024" value={draft.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS} onChange={(event) => update({ contextWindowTokens: Number(event.target.value) || DEFAULT_CONTEXT_WINDOW_TOKENS })} /></label>
+            <label>最大输出（tokens）<input type="number" min="256" max="1000000" step="256" value={draft.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS} onChange={(event) => update({ maxOutputTokens: Number(event.target.value) || DEFAULT_MAX_OUTPUT_TOKENS })} /></label>
+          </div>
+          <div className="model-dialog-api-key"><label htmlFor="new-model-api-key"><span>API Key <small>（可选）</small></span></label><div><input id="new-model-api-key" type={apiKeyVisible ? 'text' : 'password'} value={draft.apiKey} onChange={(event) => update({ apiKey: event.target.value })} placeholder="无需鉴权时可留空" autoComplete="off" spellCheck={false} /><button type="button" onClick={() => setApiKeyVisible((visible) => !visible)} aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} title={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'}>{apiKeyVisible ? <EyeOff /> : <Eye />}</button></div></div>
+          <div className="model-dialog-protocol"><CodeXml /><span><strong>OpenAI 兼容协议</strong><small>请求将发送到 POST /chat/completions</small></span></div>
+        </section>
+        {error ? <div className="model-dialog-error" role="alert"><SettingsIcon />{error}</div> : null}
+      </div>
+      <footer className="model-dialog-footer"><button type="button" className="model-dialog-cancel" disabled={saving} onClick={onClose}>取消</button><button type="submit" className="model-dialog-save" disabled={saving}>{saving ? <><LoaderCircle />保存中…</> : '保存模型'}</button></footer>
+    </form>
   </div>
 }

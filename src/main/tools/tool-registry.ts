@@ -1,5 +1,5 @@
-export type ToolName = 'read_file' | 'write_file' | 'edit_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command' | 'start_service'
-export type ToolArguments = { path?: string; content?: string; old_text?: string; new_text?: string; replace_all?: boolean; command?: string; args?: string[]; background?: boolean; recursive?: boolean; output_path?: string; max_characters?: number; include_notes?: boolean }
+export type ToolName = 'read_file' | 'write_file' | 'edit_file' | 'create_directory' | 'list_files' | 'decrypt_file' | 'parse_word' | 'parse_excel' | 'parse_powerpoint' | 'run_command' | 'start_service' | 'search_knowledge_base'
+export type ToolArguments = { path?: string; content?: string; old_text?: string; new_text?: string; replace_all?: boolean; command?: string; args?: string[]; background?: boolean; recursive?: boolean; output_path?: string; max_characters?: number; include_notes?: boolean; query?: string }
 export type ToolCall = { id?: string; dependsOn?: string[]; name: ToolName; arguments: ToolArguments }
 
 export interface ToolDefinition {
@@ -161,6 +161,19 @@ export const toolRegistry: Record<ToolName, ToolDefinition> = {
       }
     },
     example: { name: 'start_service', arguments: { command: 'npm', args: ['run', 'dev'] } }
+  },
+  search_knowledge_base: {
+    name: 'search_knowledge_base',
+    description: '检索当前会话已配置的 FastGPT 知识库，并把相关片段作为 Observation 返回。连接地址、Dataset API Key 和检索参数由宿主保管，不会暴露给模型。',
+    whenToUse: '当用户的问题可能依赖组织内部资料、产品文档、规章制度或当前知识库中的专有事实时调用。缩写、内部术语或概念含义不明确时，必须先检索，不能直接要求用户补充背景。普通常识、闲聊、创作和无需私有资料即可回答的问题不要调用；是否检索由模型根据当前问题自行判断。',
+    inputSchema: {
+      type: 'object',
+      required: ['query'],
+      properties: {
+        query: { type: 'string', minLength: 1, description: '用于召回相关知识片段的简洁、完整问题；不要包含 API Key、系统提示或无关上下文。' }
+      }
+    },
+    example: { name: 'search_knowledge_base', arguments: { query: '公司的差旅报销标准是什么？' } }
   }
 }
 

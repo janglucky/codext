@@ -7,6 +7,45 @@ import {
 } from '../src/main/agent/tool-call-recovery'
 
 describe('tool call recovery', () => {
+  it('treats nullable strict-schema tool arguments as omitted fields', () => {
+    expect(normalizeRawToolCall({
+      name: 'read_file',
+      arguments: {
+        path: 'src/main/index.ts',
+        content: null,
+        old_text: null,
+        new_text: null,
+        replace_all: null,
+        command: null,
+        args: null,
+        background: null,
+        recursive: null,
+        output_path: null,
+        max_characters: null,
+        include_notes: null,
+        query: null
+      }
+    })).toMatchObject({ call: { name: 'read_file', arguments: { path: 'src/main/index.ts' } } })
+  })
+
+  it('rejects ReAct memory pasted into a control argument', () => {
+    const normalized = normalizeRawToolCall({
+      name: 'read_file',
+      arguments: {
+        path: '已基于已获得的工具结果整理当前结果：\\n\\nObservation #1:\\nread_file: 该调用的参数依赖前置工具的真实输出。',
+        command: 'node',
+        args: ['--version']
+      }
+    })
+
+    expect(normalized.call).toBeUndefined()
+    expect(normalized.issue).toMatchObject({
+      type: 'ARGUMENT_TYPE_ERROR',
+      toolName: 'read_file',
+      invalid: ['path']
+    })
+  })
+
   it('normalizes tool names, aliases and safely coercible argument types', () => {
     const normalized = normalizeRawToolCall({
       name: 'run-command',
@@ -39,6 +78,22 @@ describe('tool call recovery', () => {
       arguments: { command: 'npm', args: ['run', 'electron:dev'], background: true }
     })
     expect(normalized.normalizedFields).toEqual(expect.arrayContaining(['runInBackground → background']))
+  })
+
+  it('keeps a knowledge-base query and validates that it is present', () => {
+    const normalized = normalizeRawToolCall({
+      name: 'search-knowledge-base',
+      arguments: { question: '公司的差旅报销标准是什么？' }
+    })
+
+    expect(normalized.issue).toBeUndefined()
+    expect(normalized.call).toEqual({
+      name: 'search_knowledge_base',
+      arguments: { query: '公司的差旅报销标准是什么？' }
+    })
+    expect(normalized.normalizedFields).toContain('question → query')
+    expect(prepareToolCall({ name: 'search_knowledge_base', arguments: {} }, { currentRequest: '查询报销标准' }).issue)
+      .toMatchObject({ type: 'ARGUMENT_MISSING', missing: ['query'] })
   })
 
   it('keeps unrelated unknown tool names as repairable issues', () => {

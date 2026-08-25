@@ -73,7 +73,8 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
     : raw
   const rawName = typeof source.name === 'string' ? source.name : ''
   const rawId = raw.id ?? source.id
-  const id = typeof rawId === 'string' && rawId.trim() ? rawId.trim() : undefined
+  const normalizedId = typeof rawId === 'string' ? rawId.trim() : ''
+  const id = normalizedId && normalizedId.length <= 128 && !isPollutedControlText(normalizedId) ? normalizedId : undefined
   const rawArguments = source.arguments ?? source.parameters ?? source.input ?? source.action_input
   const dependsOn = normalizeDependencies(raw.depends_on ?? raw.dependsOn ?? raw.after ?? source.depends_on ?? source.dependsOn ?? source.after ?? dependencyValue(rawArguments))
   const normalizedName = normalizeToolName(rawName)
@@ -83,7 +84,7 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
     return { issue: createIssue('UNKNOWN_TOOL', rawName || undefined, value), normalizedFields: [] }
   }
 
-  const normalized = normalizeArgumentsDetailed(rawArguments)
+  const normalized = normalizeArgumentsDetailed(rawArguments, normalizedName)
   const partialCall: ToolCall = { id, dependsOn, name: normalizedName, arguments: normalized.arguments ?? {} }
   if (normalized.issueType) {
     return {
@@ -99,7 +100,7 @@ export function normalizeRawToolCall(value: unknown): ToolCallNormalization {
 
 function normalizeExecutableToolAlias(rawName: string, normalizedName: string, rawArguments: unknown, id?: string, dependsOn?: string[]): ToolCallNormalization | undefined {
   if (!EXECUTABLE_TOOL_ALIASES.has(normalizedName)) return undefined
-  const normalized = normalizeArgumentsDetailed(rawArguments)
+  const normalized = normalizeArgumentsDetailed(rawArguments, 'run_command')
   if (normalized.issueType) {
     const partialCall: ToolCall = { id, dependsOn, name: 'run_command', arguments: { command: rawName.trim(), args: [] } }
     return {
@@ -333,7 +334,7 @@ export function applyPathCandidate(issue: ToolCallIssue, path: string): ToolCall
   return { ...issue.partialCall, arguments: { ...issue.partialCall.arguments, path } }
 }
 
-function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
+function normalizeArgumentsDetailed(value: unknown, toolName?: ToolName): ArgumentNormalization {
   if (value === undefined || value === null || value === '') return { arguments: {}, invalid: [], normalizedFields: [] }
   let source: Record<string, unknown>
   if (typeof value === 'string') {
@@ -355,25 +356,34 @@ function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
   const args: ToolArguments = {}
   const invalid: string[] = []
   const normalizedFields: string[] = []
-  const path = readAlias(source, 'path', ['file_path', 'filePath', 'filepath', 'file', 'directory', 'dir', 'target_path', 'targetPath'])
-  const content = readAlias(source, 'content', ['text', 'data', 'file_content', 'fileContent'])
-  const oldText = readAlias(source, 'old_text', ['oldText', 'search', 'find', 'target'])
-  const newText = readAlias(source, 'new_text', ['newText', 'replacement', 'replace'])
-  const replaceAll = readAlias(source, 'replace_all', ['replaceAll'])
-  const command = readAlias(source, 'command', ['cmd', 'executable', 'program'])
-  const commandArgs = readAlias(source, 'args', ['argv', 'parameters', 'command_args', 'commandArgs'])
-  const background = readAlias(source, 'background', ['detached', 'run_in_background', 'runInBackground'])
-  const recursive = readAlias(source, 'recursive', ['recurse'])
-  const outputPath = readAlias(source, 'output_path', ['outputPath'])
-  const maxCharacters = readAlias(source, 'max_characters', ['maxCharacters'])
-  const includeNotes = readAlias(source, 'include_notes', ['includeNotes'])
+  const schemaProperties = toolName ? toolRegistry[toolName].inputSchema.properties : undefined
+  const allowedKeys = schemaProperties && typeof schemaProperties === 'object'
+    ? new Set(Object.keys(schemaProperties))
+    : undefined
+  const read = (canonical: string, aliases: string[]) => allowedKeys && !allowedKeys.has(canonical)
+    ? { found: false }
+    : readAlias(source, canonical, aliases)
+  const path = read('path', ['file_path', 'filePath', 'filepath', 'file', 'directory', 'dir', 'target_path', 'targetPath'])
+  const content = read('content', ['text', 'data', 'file_content', 'fileContent'])
+  const oldText = read('old_text', ['oldText', 'search', 'find', 'target'])
+  const newText = read('new_text', ['newText', 'replacement', 'replace'])
+  const replaceAll = read('replace_all', ['replaceAll'])
+  const command = read('command', ['cmd', 'executable', 'program'])
+  const commandArgs = read('args', ['argv', 'parameters', 'command_args', 'commandArgs'])
+  const background = read('background', ['detached', 'run_in_background', 'runInBackground'])
+  const recursive = read('recursive', ['recurse'])
+  const outputPath = read('output_path', ['outputPath'])
+  const maxCharacters = read('max_characters', ['maxCharacters'])
+  const includeNotes = read('include_notes', ['includeNotes'])
+  const query = read('query', ['question', 'search_query', 'searchQuery'])
 
-  assignString(args, 'path', path, invalid, normalizedFields)
+  assignString(args, 'path', path, invalid, normalizedFields, true, 2048)
   assignString(args, 'content', content, invalid, normalizedFields, false)
   assignString(args, 'old_text', oldText, invalid, normalizedFields, false)
   assignString(args, 'new_text', newText, invalid, normalizedFields, false)
-  assignString(args, 'command', command, invalid, normalizedFields)
-  assignString(args, 'output_path', outputPath, invalid, normalizedFields)
+  assignString(args, 'command', command, invalid, normalizedFields, true, 2048)
+  assignString(args, 'output_path', outputPath, invalid, normalizedFields, true, 2048)
+  assignString(args, 'query', query, invalid, normalizedFields, true, 8000)
 
   if (commandArgs.found) {
     const normalizedArgs = normalizeStringArray(commandArgs.value)
@@ -421,19 +431,37 @@ function normalizeArgumentsDetailed(value: unknown): ArgumentNormalization {
 }
 
 function readAlias(source: Record<string, unknown>, canonical: string, aliases: string[]): { found: boolean; value?: unknown; alias?: string } {
-  if (Object.prototype.hasOwnProperty.call(source, canonical)) return { found: true, value: source[canonical] }
+  if (Object.prototype.hasOwnProperty.call(source, canonical)) {
+    // Strict JSON Schema requires nullable properties to be present. A null
+    // value means that this optional tool argument was intentionally omitted.
+    if (source[canonical] === null) return { found: false }
+    return { found: true, value: source[canonical] }
+  }
   const alias = aliases.find((key) => Object.prototype.hasOwnProperty.call(source, key))
-  return alias ? { found: true, value: source[alias], alias } : { found: false }
+  return alias && source[alias] !== null ? { found: true, value: source[alias], alias } : { found: false }
 }
 
-function assignString(args: ToolArguments, key: 'path' | 'content' | 'old_text' | 'new_text' | 'command' | 'output_path', source: { found: boolean; value?: unknown; alias?: string }, invalid: string[], normalizedFields: string[], trim = true): void {
+function assignString(args: ToolArguments, key: 'path' | 'content' | 'old_text' | 'new_text' | 'command' | 'output_path' | 'query', source: { found: boolean; value?: unknown; alias?: string }, invalid: string[], normalizedFields: string[], trim = true, maxLength?: number): void {
   if (!source.found) return
   if (typeof source.value !== 'string') {
     invalid.push(key)
     return
   }
-  args[key] = trim ? source.value.trim() : source.value
+  const normalizedValue = trim ? source.value.trim() : source.value
+  if (maxLength !== undefined && normalizedValue.length > maxLength) {
+    invalid.push(key)
+    return
+  }
+  if ((key === 'path' || key === 'command' || key === 'output_path') && isPollutedControlText(normalizedValue)) {
+    invalid.push(key)
+    return
+  }
+  args[key] = normalizedValue
   if (source.alias) normalizedFields.push(source.alias + ' → ' + key)
+}
+
+function isPollutedControlText(value: string): boolean {
+  return /(?:Observation\s*#\s*\d+|Previous\s+task\s+memory|REACT_(?:PROTOCOL|FORMAT)|工具结果|调度说明)/i.test(value)
 }
 
 function normalizeStringArray(value: unknown): string[] | undefined {
@@ -455,7 +483,10 @@ function dependencyValue(value: unknown): unknown {
 
 function normalizeDependencies(value: unknown): string[] | undefined {
   const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
-  const normalized = [...new Set(values.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean))]
+  const normalized = [...new Set(values
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item && item.length <= 128 && !isPollutedControlText(item)))]
   return normalized.length ? normalized : undefined
 }
 

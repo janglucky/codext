@@ -26,6 +26,7 @@ type Segment<T> = { messages: T[]; userText: string; searchText: string }
 const DEFAULT_MAX_MESSAGES = 12
 const CONTINUATION_PATTERN = /^\s*(?:继续|接着|接着做|继续执行|继续处理|重试|再试一次|然后呢|下一步|刚才那个|上一个|这个问题|该问题|按刚才的|continue|go on|retry)\s*[。.!！]?\s*$/i
 const REFERENTIAL_PATTERN = /(?:刚才|之前|上面|上述|前面|上一(?:张|个|份)|这(?:张|个|份)|该)(?:的)?(?:截图|图片|图|附件|文件|文档|表格|PPT)|(?:继续|重新|再)(?:看|读取|分析|处理)(?:刚才|之前|上面|上述)?(?:的)?(?:截图|图片|附件|文件|文档|表格|PPT)/i
+const CONTEXT_DEPENDENT_PATTERN = /(?:这些|那些|上述|上面|前面|前述|刚才|之前|此前|上次|上一(?:次|轮|条|段)|这(?:个|些|几|种|段|部分|条)|那(?:个|些|几|种|段|部分|条)|该(?:方法|问题|文件|代码|位置|报错|错误|方案|结果|内容|步骤|操作)?|它们?|前者|后者|其中(?:的)?)/i
 const ATTACHMENT_NOUN_PATTERN = /(?:截图|图片|图像|附件|文档|表格|PPT|幻灯片|CSV|Excel|Word)/i
 const FILE_PATTERN = /(?:[A-Za-z0-9_.@+-]+[\\/])+[A-Za-z0-9_.@+ -]+|\b[A-Za-z0-9_.@+-]+\.(?:ts|tsx|js|jsx|json|md|txt|csv|log|py|html|css|ya?ml|toml|docx?|xlsx?|pptx?|pdf)\b/gi
 const ASCII_STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'please', 'agent', 'continue', 'retry'])
@@ -113,7 +114,8 @@ function isContinuationMessage(message: HistoryMessage): boolean {
 
 function isContinuationText(text: string): boolean {
   const normalized = text.trim()
-  return CONTINUATION_PATTERN.test(normalized) || (normalized.length <= 28 && /^(?:还是|刚才|上次|前面|上述|这个|该|它|再)/.test(normalized))
+  return CONTINUATION_PATTERN.test(normalized) || CONTEXT_DEPENDENT_PATTERN.test(normalized) ||
+    (normalized.length <= 28 && /^(?:还是|刚才|上次|前面|上述|这个|该|它|再)/.test(normalized))
 }
 
 function relevanceScore(left: string, right: string): number {
@@ -159,10 +161,18 @@ function intersectionSize<T>(left: Set<T>, right: Set<T>): number {
 }
 
 function formatHistoryContent(message: HistoryMessage, includeTrace: boolean): string {
-  if (message.role !== 'assistant' || !includeTrace || !message.steps?.length) return message.content
+  const assistantContent = message.role === 'assistant' ? sanitizeAssistantHistoryContent(message.content) : message.content
+  if (message.role !== 'assistant' || !includeTrace || !message.steps?.length) return assistantContent
   const observations = selectMemoryObservations(message.steps)
     .map((item) => item.title + ': ' + compactTrace(item.detail))
-  return [message.content, observations.length ? 'Previous task memory:\n' + observations.join('\n') : ''].filter(Boolean).join('\n\n')
+  return [assistantContent, observations.length ? 'Previous task memory:\n' + observations.join('\n') : ''].filter(Boolean).join('\n\n')
+}
+
+function sanitizeAssistantHistoryContent(content: string): string {
+  const normalized = content.trim()
+  if (!normalized) return ''
+  const isProtocolEcho = /(?:Observation\s*#\s*\d+|Previous\s+task\s+memory|REACT_(?:PROTOCOL|FORMAT))/i.test(normalized)
+  return isProtocolEcho ? '' : content
 }
 
 function buildAssistantSearchText(message: HistoryMessage): string {

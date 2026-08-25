@@ -4,6 +4,9 @@ export interface ModelConfig { baseUrl: string; apiKey: string; model: string; t
 export type ModelConnectionType = 'provider' | 'openai_compatible' | 'relay'
 export interface ModelProfile extends ModelConfig { id: string; name: string; provider?: string; connectionType?: ModelConnectionType }
 export interface NavigationSettings { fileApplicationPath: string; browserApplicationPath: string }
+export type KnowledgeBaseSearchMode = 'mixedRecall' | 'embedding' | 'fullTextRecall'
+export type KnowledgeBaseApiMode = 'searchTest' | 'datasetSearch'
+export interface KnowledgeBaseConfig { name: string; baseUrl: string; apiKey: string; datasetId: string; apiMode: KnowledgeBaseApiMode; limit: number; similarity: number; searchMode: KnowledgeBaseSearchMode; usingReRank: boolean }
 export type ThemePreference = 'system' | 'light' | 'dark'
 export type FontFamilyPreference = 'system' | 'inter' | 'noto-sans' | 'yahei' | 'pingfang' | 'sarasa' | 'noto-serif' | 'songti' | 'kaiti' | 'wenkai' | 'mono'
 export interface AppearanceSettings { theme: ThemePreference; chatFontFamily: FontFamilyPreference; uiFontFamily: FontFamilyPreference; fontSize: number; fontFamily?: FontFamilyPreference }
@@ -16,8 +19,8 @@ export interface ContextUsage { usedTokens: number; contextWindowTokens: number;
 export interface AgentTask { id: string; prompt: string; status: TaskStatus; result?: string; error?: string; createdAt: string; steps: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage; contextUsage?: ContextUsage }
 export interface ChatAttachment { id: string; name: string; mimeType: string; size: number; dataUrl: string; workspacePath?: string }
 export interface ChatMessage { id: string; role: 'user' | 'assistant'; content: string; attachments?: ChatAttachment[]; createdAt: string; completedAt?: string; status?: TaskStatus; steps?: TaskStep[]; artifacts?: AgentArtifact[]; tokenUsage?: TokenUsage; contextUsage?: ContextUsage }
-export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; modelId?: string }
-export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings; permissionMode?: PermissionMode; appearance?: AppearanceSettings; personalization?: PersonalizationSettings }
+export interface Conversation { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[]; workspacePath?: string; modelId?: string; knowledgeBaseEnabled?: boolean }
+export interface AppSettings { model: ModelConfig; models?: ModelProfile[]; defaultModelId?: string; skillsEnabled: boolean; navigation: NavigationSettings; permissionMode?: PermissionMode; appearance?: AppearanceSettings; personalization?: PersonalizationSettings; knowledgeBase?: KnowledgeBaseConfig }
 export interface AgentPolicy { systemPrompt: string; workspacePath: string; enabledTools: string[] }
 export interface ConnectionTestResult { ok: boolean; message: string }
 export interface NavigationResult { ok: boolean; message?: string }
@@ -46,6 +49,8 @@ export interface DesktopApi {
   saveSettings(settings: AppSettings): Promise<AppSettings>
   testConnection(settings: AppSettings, modelId?: string): Promise<ConnectionTestResult>
   setConversationModel(conversationId: string, modelId?: string): Promise<Conversation>
+  setConversationKnowledgeBaseEnabled(conversationId: string, enabled: boolean): Promise<Conversation>
+  testKnowledgeBase(config: KnowledgeBaseConfig, query?: string): Promise<ConnectionTestResult>
   selectApplication(kind: 'file' | 'browser'): Promise<string | undefined>
   getPolicy(): Promise<AgentPolicy>
   savePolicy(policy: AgentPolicy): Promise<AgentPolicy>

@@ -1,9 +1,10 @@
 import { app } from 'electron'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, FontFamilyPreference, ModelConfig, ModelConnectionType, ModelProfile, PermissionMode } from '../../shared/types'
+import type { AgentPolicy, AgentTask, AppSettings, ChatMessage, Conversation, FontFamilyPreference, KnowledgeBaseConfig, ModelConfig, ModelConnectionType, ModelProfile, PermissionMode } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_MODEL_ID, getModelProfiles } from '../../shared/models'
 import { isInternalAgentPlaceholder } from '../../shared/text'
+import { normalizeKnowledgeBaseConfig } from '../knowledge-base'
 
 interface PersistedState { settings: AppSettings; policy: AgentPolicy; conversations: Conversation[] }
 type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation' | 'appearance' | 'personalization'> & {
@@ -12,9 +13,11 @@ type SettingsDraft = Omit<Partial<AppSettings>, 'model' | 'navigation' | 'appear
   appearance?: Partial<NonNullable<AppSettings['appearance']>>
   personalization?: Partial<NonNullable<AppSettings['personalization']>>
 }
-type PersistedStateDraft = Partial<PersistedState> & {
+type LegacyConversation = Conversation & { knowledgeBase?: KnowledgeBaseConfig }
+type PersistedStateDraft = Omit<Partial<PersistedState>, 'settings' | 'policy' | 'conversations'> & {
   settings?: SettingsDraft
   policy?: Partial<AgentPolicy>
+  conversations?: LegacyConversation[]
   tasks?: AgentTask[]
 }
 
@@ -65,6 +68,7 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
     ? settings.defaultModelId
     : profiles[0].id
   const selected = profiles.find((profile) => profile.id === defaultModelId) ?? profiles[0]
+  const knowledgeBase = normalizeKnowledgeBaseConfig(settings?.knowledgeBase)
   const normalized: AppSettings = {
     model: modelConfigFromProfile(selected),
     models: profiles,
@@ -84,7 +88,8 @@ function normalizeSettings(settings?: SettingsDraft): AppSettings {
     navigation: {
       fileApplicationPath: typeof settings?.navigation?.fileApplicationPath === 'string' ? settings.navigation.fileApplicationPath : '',
       browserApplicationPath: typeof settings?.navigation?.browserApplicationPath === 'string' ? settings.navigation.browserApplicationPath : ''
-    }
+    },
+    ...(knowledgeBase ? { knowledgeBase } : {})
   }
   return normalized
 }
@@ -323,6 +328,11 @@ export class LocalStore {
     try {
       const draft = JSON.parse(await readFile(this.path, 'utf8')) as PersistedStateDraft
       const settings = normalizeSettings(draft.settings)
+      if (!settings.knowledgeBase) {
+        settings.knowledgeBase = draft.conversations
+          ?.map((conversation) => normalizeKnowledgeBaseConfig(conversation.knowledgeBase))
+          .find((config): config is KnowledgeBaseConfig => Boolean(config))
+      }
       this.state = {
         settings,
         policy: {
@@ -353,6 +363,7 @@ export class LocalStore {
     const validModelIds = new Set(getModelProfiles(this.state.settings).map((profile) => profile.id))
     for (const conversation of this.state.conversations) {
       if (conversation.modelId && !validModelIds.has(conversation.modelId)) delete conversation.modelId
+      if (!this.state.settings.knowledgeBase) delete conversation.knowledgeBaseEnabled
     }
     await this.save()
     return this.state.settings
@@ -394,6 +405,17 @@ export class LocalStore {
     return conversation
   }
 
+  async setConversationKnowledgeBaseEnabled(conversationId: string, enabled: boolean): Promise<Conversation> {
+    const conversation = this.ensureConversation(conversationId)
+    if (enabled && !this.state.settings.knowledgeBase) throw new Error('请先在设置中完成知识库配置。')
+    if (enabled) conversation.knowledgeBaseEnabled = true
+    else delete conversation.knowledgeBaseEnabled
+    conversation.updatedAt = now()
+    this.bumpConversation(conversation.id)
+    await this.save()
+    return conversation
+  }
+
   async addMessage(conversationId: string, message: ChatMessage): Promise<Conversation> {
     const conversation = this.ensureConversation(conversationId)
     conversation.messages.push(message)
@@ -424,9 +446,12 @@ export class LocalStore {
   private normalizeConversations(draft: PersistedStateDraft): Conversation[] {
     if (draft.conversations?.length) return draft.conversations.map((conversation) => {
       const messages = conversation.messages.map((message) => recoverStartedServiceArtifacts(normalizePersistedMessage(message)))
-      const normalized = { ...conversation, messages } as Conversation & { activeAttachments?: ChatMessage['attachments'] }
+      const normalized = { ...conversation, messages } as LegacyConversation & { activeAttachments?: ChatMessage['attachments'] }
       delete normalized.activeAttachments
-      return normalized
+      if (conversation.knowledgeBaseEnabled === true || normalizeKnowledgeBaseConfig(conversation.knowledgeBase)) normalized.knowledgeBaseEnabled = true
+      else delete normalized.knowledgeBaseEnabled
+      delete normalized.knowledgeBase
+      return normalized as Conversation
     })
     if (draft.tasks?.length) return [this.conversationFromTasks(draft.tasks)]
     return [newConversation()]

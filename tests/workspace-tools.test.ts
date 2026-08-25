@@ -49,7 +49,7 @@ describe('WorkspaceTools directories and listing', () => {
 
 describe('tool registry', () => {
   it('registers workspace and service tools', () => {
-    const names = ['edit_file', 'create_directory', 'list_files', 'decrypt_file', 'start_service']
+    const names = ['edit_file', 'create_directory', 'list_files', 'decrypt_file', 'start_service', 'search_knowledge_base']
     expect(names.every(isToolName)).toBe(true)
     expect(getEnabledToolDefinitions(names).map((tool) => tool.name)).toEqual(names)
   })

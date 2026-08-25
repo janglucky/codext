@@ -1,8 +1,8 @@
-import { cloneElement, FormEvent, isValidElement, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
+import { cloneElement, FormEvent, isValidElement, memo, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type ReactElement, type ReactNode, type SVGProps } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Moon, Palette, Plus, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Sun, Trash2 } from 'lucide-react'
-import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, McpApprovalRequest, ModelConnectionType, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
+import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, CodeXml, Copy, Database, ExternalLink, Eye, EyeOff, FileCode2, FileCog, FileJson2, FileText, FolderOpen, Globe2, LoaderCircle, Moon, Palette, Paperclip, Plus, Puzzle, RotateCcw, Settings as SettingsIcon, Square, SquareTerminal, Star, Sun, Trash2 } from 'lucide-react'
+import type { AgentArtifact, AgentPolicy, AgentTone, AppearanceSettings, AppSettings, ChatAttachment, ChatMessage, CommandApprovalRequest, ContextUsage, Conversation, FontFamilyPreference, KnowledgeBaseApiMode, KnowledgeBaseConfig, KnowledgeBaseSearchMode, McpApprovalRequest, ModelConnectionType, ModelProfile, PermissionMode, TaskStatus, TaskStep, ThemePreference, TokenUsage, UserChoiceRequest } from '../../shared/types'
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, getDefaultModelProfile, getModelProfiles, modelConfig, modelDisplayName, resolveModelProfile } from '../../shared/models'
 import { hideReactObservationReferences, normalizeTechnicalPunctuation } from '../../shared/text'
 import { parseUnifiedDiff, type UnifiedDiffLine } from '../../shared/unified-diff'
@@ -141,6 +141,8 @@ export function App(): ReactElement {
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false)
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [pluginMenuOpen, setPluginMenuOpen] = useState(false)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [view, setView] = useState<View>('chat')
   const [searchOpen, setSearchOpen] = useState(false)
@@ -157,6 +159,9 @@ export function App(): ReactElement {
   const workspaceControlRef = useRef<HTMLDivElement | null>(null)
   const modelControlRef = useRef<HTMLDivElement | null>(null)
   const permissionControlRef = useRef<HTMLDivElement | null>(null)
+  const addMenuRef = useRef<HTMLDivElement | null>(null)
+  const pendingAgentDeltasRef = useRef(new Map<string, { conversationId: string; messageId: string; delta: string }>())
+  const agentDeltaTimerRef = useRef<number | undefined>(undefined)
   const stickToBottomRef = useRef(true)
   const pendingSearchJumpRef = useRef<{ conversationId: string; messageId: string } | undefined>(undefined)
 
@@ -261,19 +266,63 @@ export function App(): ReactElement {
   }, [permissionMenuOpen])
 
   useEffect(() => {
-    return window.api.onAgentDelta(({ conversationId, messageId, delta }) => {
-      setConversations((current) => current.map((conversation) => {
-        if (conversation.id !== conversationId) return conversation
+    if (!addMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent): void => {
+      if (!addMenuRef.current?.contains(event.target as Node)) {
+        setAddMenuOpen(false)
+        setPluginMenuOpen(false)
+      }
+    }
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        setAddMenuOpen(false)
+        setPluginMenuOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [addMenuOpen])
+
+  useEffect(() => {
+    const flushAgentDeltas = (): void => {
+      agentDeltaTimerRef.current = undefined
+      const pending = [...pendingAgentDeltasRef.current.values()]
+      pendingAgentDeltasRef.current.clear()
+      if (!pending.length) return
+      setConversations((current) => pending.reduce((conversations, item) => conversations.map((conversation) => {
+        if (conversation.id !== item.conversationId) return conversation
         return {
           ...conversation,
-          messages: updateAssistantMessage(conversation.messages, messageId, (message) => ({
+          messages: updateAssistantMessage(conversation.messages, item.messageId, (message) => ({
             ...message,
-            content: message.content + delta,
+            content: message.content + item.delta,
             status: 'acting'
           }))
         }
-      }))
+      }), current))
+    }
+    const unsubscribe = window.api.onAgentDelta(({ conversationId, messageId, delta }) => {
+      const key = conversationId + ':' + messageId
+      const previous = pendingAgentDeltasRef.current.get(key)
+      pendingAgentDeltasRef.current.set(key, {
+        conversationId,
+        messageId,
+        delta: (previous?.delta ?? '') + delta
+      })
+      if (agentDeltaTimerRef.current === undefined) {
+        agentDeltaTimerRef.current = window.setTimeout(flushAgentDeltas, 32)
+      }
     })
+    return () => {
+      if (agentDeltaTimerRef.current !== undefined) window.clearTimeout(agentDeltaTimerRef.current)
+      agentDeltaTimerRef.current = undefined
+      pendingAgentDeltasRef.current.clear()
+      unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
@@ -291,6 +340,9 @@ export function App(): ReactElement {
 
   useEffect(() => {
     return window.api.onAgentDone(({ conversationId, messageId, status, content, completedAt, tokenUsage, contextUsage }) => {
+      for (const key of pendingAgentDeltasRef.current.keys()) {
+        if (key === conversationId + ':' + messageId) pendingAgentDeltasRef.current.delete(key)
+      }
       setMcpApproval(undefined)
       setCommandApproval(undefined)
       setUserChoice(undefined)
@@ -439,6 +491,8 @@ export function App(): ReactElement {
     setAttachmentError('')
     setWorkspaceMenuOpen(false)
     setModelMenuOpen(false)
+    setAddMenuOpen(false)
+    setPluginMenuOpen(false)
   }, [activeId])
 
   function queueFiles(files: File[]): void {
@@ -606,6 +660,17 @@ export function App(): ReactElement {
     }
   }
 
+  async function toggleConversationKnowledgeBase(): Promise<void> {
+    if (!activeConversation || running) return
+    try {
+      const conversation = await window.api.setConversationKnowledgeBaseEnabled(activeConversation.id, !activeConversation.knowledgeBaseEnabled)
+      setConversations((current) => [conversation, ...current.filter((item) => item.id !== conversation.id)])
+      setAttachmentError('')
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : '切换知识库插件失败，请重试。')
+    }
+  }
+
   async function selectPermissionMode(permissionMode: PermissionMode): Promise<void> {
     if (running) return
     const nextSettings = { ...settings, permissionMode }
@@ -621,7 +686,11 @@ export function App(): ReactElement {
     const savedSettings = await window.api.saveSettings(settingsOverride ?? settings)
     const validModelIds = new Set(getModelProfiles(savedSettings).map((profile) => profile.id))
     setSettings(savedSettings)
-    setConversations((current) => current.map((conversation) => conversation.modelId && !validModelIds.has(conversation.modelId) ? { ...conversation, modelId: undefined } : conversation))
+    setConversations((current) => current.map((conversation) => ({
+      ...conversation,
+      ...(conversation.modelId && !validModelIds.has(conversation.modelId) ? { modelId: undefined } : {}),
+      ...(!savedSettings.knowledgeBase ? { knowledgeBaseEnabled: undefined } : {})
+    })))
     if (policy && !settingsOverride) await window.api.savePolicy(policy)
   }
 
@@ -693,7 +762,7 @@ export function App(): ReactElement {
       <button className="sidebar-settings" onClick={() => setView('settings')}><SettingsIcon /><span>设置</span></button>
     </aside>
     <main className="chat-main">
-      <section className="message-list" ref={messageListRef}>{activeConversation?.messages.length ? activeConversation.messages.map((message) => <MessageView key={message.id} conversationId={activeConversation.id} message={message} highlighted={highlightedMessageId === message.id} highlightQuery={highlightedSearchQuery} onPreview={setPreviewAttachment} />) : <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>}{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
+      <section className="message-list" ref={messageListRef}><MessageItems conversation={activeConversation} highlightedMessageId={highlightedMessageId} highlightedSearchQuery={highlightedSearchQuery} onPreview={setPreviewAttachment} />{mcpApproval ? <McpApprovalMessage request={mcpApproval} onRespond={respondToMcpApproval} /> : null}{commandApproval ? <CommandApprovalMessage request={commandApproval} onRespond={respondToCommandApproval} /> : null}{userChoice ? <UserChoiceMessage request={userChoice} selectedId={selectedChoiceId} onSelect={setSelectedChoiceId} onConfirm={confirmUserChoice} /> : null}</section>
       {showScrollToBottom ? <button type="button" className="scroll-to-bottom" title="回到底部" aria-label="回到底部" onClick={scrollToLatest}><ArrowDown /></button> : null}
       <form className="chat-composer" onSubmit={submit}>
         <input ref={fileInputRef} className="attachment-input" type="file" accept={ATTACHMENT_ACCEPT} multiple onChange={(event) => { queueFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = '' }} />
@@ -701,13 +770,162 @@ export function App(): ReactElement {
         <textarea aria-label="向 Agent 描述任务" value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => { const files = getClipboardFiles(event.clipboardData); if (files.length) { event.preventDefault(); queueFiles(files) } }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="输入任务，或直接粘贴截图；Enter 发送，Shift+Enter 换行" />
         {attachmentsLoading ? <p className="attachment-loading" role="status">正在读取附件...</p> : null}
         {attachmentError ? <p className="attachment-error" role="alert">{attachmentError}</p> : null}
-        <div className="composer-controls"><div className="composer-left"><button type="button" className="icon-control" title="添加附件" aria-label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="plus" /></button><div className="permission-control" ref={permissionControlRef}><button type="button" className={'permission mode-' + (settings.permissionMode ?? 'request_approval')} disabled={running} aria-expanded={permissionMenuOpen} onClick={() => { setModelMenuOpen(false); setWorkspaceMenuOpen(false); setPermissionMenuOpen((open) => !open) }}><Icon name="shield" />{permissionModeLabel(settings.permissionMode)}<Icon name="chevron-down" /></button>{permissionMenuOpen ? <PermissionMenu value={settings.permissionMode ?? 'request_approval'} onChange={(mode) => void selectPermissionMode(mode)} /> : null}</div></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
+        <div className="composer-controls"><div className="composer-left"><div className="add-menu-control" ref={addMenuRef}><button type="button" className={'icon-control add-menu-trigger ' + (addMenuOpen ? 'open' : '')} title="添加附件或插件" aria-label="打开添加菜单" aria-expanded={addMenuOpen} onClick={() => { setPermissionMenuOpen(false); setModelMenuOpen(false); setWorkspaceMenuOpen(false); setPluginMenuOpen(false); setAddMenuOpen((open) => !open) }}><Icon name="plus" /></button>{addMenuOpen ? <div className="add-menu" role="menu"><button type="button" role="menuitem" aria-label="添加照片和文件" className="add-menu-upload" onClick={() => { fileInputRef.current?.click(); setAddMenuOpen(false) }}><Paperclip /><span><strong>添加照片和文件</strong><small>支持图片、文档和文本文件</small></span></button><div className="add-menu-separator" /><button type="button" role="menuitem" aria-label="打开插件列表" className={'add-menu-plugin-trigger ' + (pluginMenuOpen ? 'selected' : '')} aria-expanded={pluginMenuOpen} onClick={() => setPluginMenuOpen((open) => !open)}><Puzzle /><span><strong>插件</strong><small>为当前对话添加能力</small></span><Icon name="chevron-right" /></button>{pluginMenuOpen ? <div className="plugin-menu" role="menu" aria-label="插件列表"><p>当前对话插件</p><button type="button" role="menuitemcheckbox" aria-label={activeConversation?.knowledgeBaseEnabled ? '停用知识库插件' : '启用知识库插件'} aria-checked={activeConversation?.knowledgeBaseEnabled === true} className={activeConversation?.knowledgeBaseEnabled ? 'active' : ''} disabled={running || !activeConversation || !settings.knowledgeBase} onClick={() => void toggleConversationKnowledgeBase()}><Database /><span><strong>知识库</strong><small>{settings.knowledgeBase ? settings.knowledgeBase.name + (activeConversation?.knowledgeBaseEnabled ? ' · 已启用' : ' · 未启用') : '请先在设置中完成配置'}</small></span><i className="plugin-checkbox">{activeConversation?.knowledgeBaseEnabled ? <Check /> : null}</i></button></div> : null}</div> : null}</div><div className="permission-control" ref={permissionControlRef}><button type="button" className={'permission mode-' + (settings.permissionMode ?? 'request_approval')} disabled={running} aria-expanded={permissionMenuOpen} onClick={() => { setAddMenuOpen(false); setPluginMenuOpen(false); setModelMenuOpen(false); setWorkspaceMenuOpen(false); setPermissionMenuOpen((open) => !open) }}><Icon name="shield" />{permissionModeLabel(settings.permissionMode)}<Icon name="chevron-down" /></button>{permissionMenuOpen ? <PermissionMenu value={settings.permissionMode ?? 'request_approval'} onChange={(mode) => void selectPermissionMode(mode)} /> : null}</div></div><button type={running ? 'button' : 'submit'} className={'send ' + (running ? 'pause' : '') + (pauseRequested ? ' pausing' : '')} disabled={running ? pauseRequested : attachmentsLoading || (!prompt.trim() && !attachments.length)} aria-label={running ? pauseRequested ? '正在暂停任务' : '暂停任务' : '发送任务'} title={running ? pauseRequested ? '正在暂停…' : '暂停任务' : '发送任务'} onClick={running ? pauseTask : undefined}>{running ? <Square fill="currentColor" /> : <Icon name="send" />}</button></div>
         <footer><div className="workspace-control" ref={workspaceControlRef}><button type="button" className={'workspace-trigger ' + (activeConversation?.workspacePath ? 'overridden' : '')} disabled={running} title={activeWorkspacePath} aria-expanded={workspaceMenuOpen} onClick={() => { setModelMenuOpen(false); setPermissionMenuOpen(false); setWorkspaceMenuOpen((open) => !open) }}><Icon name="folder" /><span>{workspaceLabel(activeWorkspacePath)}</span><Icon name="chevron-down" /></button>{workspaceMenuOpen ? <div className="workspace-menu"><p>当前会话工作区</p><code>{activeWorkspacePath}</code><button type="button" onClick={() => void selectWorkspace()}><Icon name="folder" />选择目录</button>{activeConversation?.workspacePath ? <button type="button" onClick={() => void resetWorkspace()}><Icon name="monitor" />恢复全局目录</button> : null}</div> : null}</div><div className="model-control" ref={modelControlRef}><button type="button" className={'model-trigger ' + (activeConversation?.modelId ? 'overridden' : '')} disabled={running} title={'当前模型：' + modelDisplayName(activeModel)} aria-expanded={modelMenuOpen} onClick={() => { setWorkspaceMenuOpen(false); setPermissionMenuOpen(false); setModelMenuOpen((open) => !open) }}><Bot /><span>{modelDisplayName(activeModel)}</span><ChevronDown /></button>{modelMenuOpen ? <div className="model-menu"><p>当前会话模型</p><button type="button" className={!activeConversation?.modelId ? 'selected' : ''} onClick={() => void selectConversationModel()}><span><strong>跟随默认模型</strong><small>{defaultModel.provider || 'OpenAI 兼容'} · {modelDisplayName(defaultModel)}</small></span>{!activeConversation?.modelId ? <Check /> : null}</button>{modelProfiles.map((profile) => <button type="button" key={profile.id} className={activeConversation?.modelId === profile.id ? 'selected' : ''} onClick={() => void selectConversationModel(profile.id)}><span><strong>{modelDisplayName(profile)}</strong><small>{profile.name && profile.name !== modelDisplayName(profile) ? profile.name + ' · ' : ''}{profile.provider || 'OpenAI 兼容'}</small></span>{activeConversation?.modelId === profile.id ? <Check /> : null}</button>)}</div> : null}</div><span><Icon name="branch" />main<Icon name="chevron-down" /></span><ContextUsageMeter usage={latestContextUsage} configuredLimit={activeModel.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS} /></footer>
       </form>
       {previewAttachment ? <div className="attachment-lightbox" role="dialog" aria-modal="true" aria-label={previewAttachment.name} onClick={(event) => { if (event.target === event.currentTarget) setPreviewAttachment(undefined) }}><button type="button" className="attachment-lightbox-close" title="关闭预览" aria-label="关闭预览" onClick={() => setPreviewAttachment(undefined)}><Icon name="close" /></button><img className="attachment-lightbox-image" src={previewAttachment.dataUrl} alt={previewAttachment.name} /></div> : null}
     </main>
     {searchOpen ? <ConversationSearchOverlay query={searchQuery} onQueryChange={setSearchQuery} results={searchResults} conversationCount={visibleConversations.length} onOpenResult={openSearchResult} onClose={() => setSearchOpen(false)} /> : null}
   </div>
+}
+
+function KnowledgeBaseSettings({ settings, setSettings, onSave }: {
+  settings: AppSettings
+  setSettings: (value: AppSettings) => void
+  onSave: (settingsOverride?: AppSettings) => Promise<void>
+}): ReactElement {
+  const config = settings.knowledgeBase
+  const [draft, setDraft] = useState<KnowledgeBaseConfig>(() => config ? { ...config } : {
+    name: 'FastGPT 知识库',
+    baseUrl: '',
+    apiKey: '',
+    datasetId: '',
+    apiMode: 'searchTest',
+    limit: 5000,
+    similarity: 0.5,
+    searchMode: 'mixedRecall',
+    usingReRank: false
+  })
+  const [apiKeyVisible, setApiKeyVisible] = useState(false)
+  const [testQuery, setTestQuery] = useState('知识库中有哪些相关资料？')
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | undefined>()
+
+  function update(patch: Partial<KnowledgeBaseConfig>): void {
+    setNotice(undefined)
+    setDraft((current) => ({ ...current, ...patch }))
+  }
+
+  function validatedDraft(): KnowledgeBaseConfig | undefined {
+    const next = {
+      ...draft,
+      name: draft.name.trim(),
+      baseUrl: draft.baseUrl.trim().replace(/\/+$/, ''),
+      apiKey: draft.apiKey.trim(),
+      datasetId: draft.datasetId.trim(),
+      limit: Math.floor(draft.limit),
+      similarity: draft.similarity
+    }
+    if (!next.name) {
+      setNotice({ type: 'error', text: '请填写知识库名称。' })
+      return undefined
+    }
+    if (!next.baseUrl || !next.apiKey) {
+      setNotice({ type: 'error', text: '请填写 FastGPT 地址和 API Key。' })
+      return undefined
+    }
+    if (next.apiMode === 'searchTest' && !next.datasetId) {
+      setNotice({ type: 'error', text: '当前接口需要填写知识库 ID（datasetId）。' })
+      return undefined
+    }
+    try {
+      const url = new URL(next.baseUrl)
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('unsupported protocol')
+    } catch {
+      setNotice({ type: 'error', text: 'FastGPT 地址必须是有效的 HTTP 或 HTTPS 地址。' })
+      return undefined
+    }
+    if (!Number.isFinite(next.limit) || next.limit < 100 || next.limit > 20_000) {
+      setNotice({ type: 'error', text: '召回内容上限必须在 100 到 20,000 之间。' })
+      return undefined
+    }
+    if (!Number.isFinite(next.similarity) || next.similarity < 0 || next.similarity > 1) {
+      setNotice({ type: 'error', text: '相似度阈值必须在 0 到 1 之间。' })
+      return undefined
+    }
+    return next
+  }
+
+  async function submit(event: FormEvent): Promise<void> {
+    event.preventDefault()
+    const next = validatedDraft()
+    if (!next) return
+    setSaving(true)
+    try {
+      const nextSettings = { ...settings, knowledgeBase: next }
+      setSettings(nextSettings)
+      await onSave(nextSettings)
+      setNotice({ type: 'success', text: '知识库配置已保存。可在对话的加号菜单中按会话启用。' })
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : '保存知识库配置失败。' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function testConnection(): Promise<void> {
+    const next = validatedDraft()
+    if (!next) return
+    setTesting(true)
+    setNotice(undefined)
+    try {
+      const result = await window.api.testKnowledgeBase(next, testQuery.trim())
+      setNotice({ type: result.ok ? 'success' : 'error', text: result.message })
+    } catch {
+      setNotice({ type: 'error', text: '无法测试知识库连接，请检查配置。' })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  async function remove(): Promise<void> {
+    setSaving(true)
+    setNotice(undefined)
+    const nextSettings = { ...settings }
+    delete nextSettings.knowledgeBase
+    try {
+      setSettings(nextSettings)
+      await onSave(nextSettings)
+      setDraft((current) => ({ ...current, baseUrl: '', apiKey: '', datasetId: '' }))
+      setNotice({ type: 'success', text: '知识库配置已移除，所有会话中的知识库插件已停用。' })
+    } catch {
+      setSettings(settings)
+      setNotice({ type: 'error', text: '移除知识库配置失败，请重试。' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <section className="settings-section compact knowledge-base-settings" aria-labelledby="knowledge-base-title">
+    <form onSubmit={(event) => void submit(event)}>
+      <header className="knowledge-base-settings-heading"><h2 id="knowledge-base-title">知识库配置</h2></header>
+      <div className="knowledge-base-settings-body">
+        <section className="model-dialog-section model-dialog-fields"><h3>连接信息</h3>
+          <div className="model-dialog-grid">
+            <label>知识库名称<input value={draft.name} onChange={(event) => update({ name: event.target.value })} placeholder="例如：产品文档库" /></label>
+            <label>FastGPT 地址<input value={draft.baseUrl} onChange={(event) => update({ baseUrl: event.target.value })} placeholder="https://fastgpt.example.com" spellCheck={false} /></label>
+            <label>接口类型<select value={draft.apiMode} onChange={(event) => update({ apiMode: event.target.value as KnowledgeBaseApiMode })}><option value="searchTest">searchTest（系统 API Key）</option><option value="datasetSearch">Dataset Search（Dataset API Key）</option></select></label>
+            {draft.apiMode === 'searchTest' ? <label>知识库 ID（datasetId）<input value={draft.datasetId} onChange={(event) => update({ datasetId: event.target.value })} placeholder="例如：685xxxxxxxxxxxx" spellCheck={false} /></label> : null}
+          </div>
+          <div className="model-dialog-api-key"><label htmlFor="knowledge-base-api-key"><span>{draft.apiMode === 'searchTest' ? '系统 API Key' : 'Dataset API Key'}</span></label><div><input id="knowledge-base-api-key" type={apiKeyVisible ? 'text' : 'password'} value={draft.apiKey} onChange={(event) => update({ apiKey: event.target.value })} placeholder={draft.apiMode === 'searchTest' ? '输入 FastGPT 系统 API Key' : 'fastgpt-dataset-xxx'} autoComplete="off" spellCheck={false} /><button type="button" onClick={() => setApiKeyVisible((visible) => !visible)} aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'} title={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'}>{apiKeyVisible ? <EyeOff /> : <Eye />}</button></div></div>
+          <div className="model-dialog-protocol"><Database /><span><strong>FastGPT Dataset Search API</strong><small>{draft.apiMode === 'searchTest' ? 'POST /api/core/dataset/searchTest · datasetId + text' : 'POST /api/v1/dataset/search · query'} · 查询文本仅在模型决定检索时发送</small></span></div>
+        </section>
+        <section className="model-dialog-section model-dialog-fields"><h3>检索参数</h3>
+          <div className="model-dialog-grid knowledge-base-parameter-grid">
+            <label>召回内容上限<input type="number" min="100" max="100000" step="100" value={draft.limit} onChange={(event) => update({ limit: Number(event.target.value) })} /></label>
+            <label>相似度阈值<input type="number" min="0" max="1" step="0.05" value={draft.similarity} onChange={(event) => update({ similarity: Number(event.target.value) })} /></label>
+            <label>召回模式<select value={draft.searchMode} onChange={(event) => update({ searchMode: event.target.value as KnowledgeBaseSearchMode })}><option value="mixedRecall">混合召回</option><option value="embedding">向量召回</option><option value="fullTextRecall">全文召回</option></select></label>
+            <label className="knowledge-base-rerank-label">结果重排<button type="button" role="switch" aria-checked={draft.usingReRank} className={'knowledge-base-switch ' + (draft.usingReRank ? 'on' : '')} onClick={() => update({ usingReRank: !draft.usingReRank })}><i /><span>{draft.usingReRank ? '已启用' : '未启用'}</span></button></label>
+          </div>
+        </section>
+        <section className="model-dialog-section model-dialog-fields knowledge-base-test"><h3>连接测试</h3><label>测试问题<input value={testQuery} onChange={(event) => setTestQuery(event.target.value)} placeholder="输入一个适合在知识库中检索的问题" /></label><button type="button" className="connection-test" disabled={testing || saving} onClick={() => void testConnection()}>{testing ? <><LoaderCircle />正在检索…</> : '测试检索'}</button></section>
+        {notice ? <div className={'config-notice ' + notice.type} role="status">{notice.type === 'success' ? <Check /> : <SettingsIcon />}{notice.text}</div> : null}
+        <p className="knowledge-base-privacy-note">配置保存在本机应用数据中。Dataset API Key 不会进入模型上下文；模型调用检索工具时，查询文本会发送到上述 FastGPT 服务。</p>
+      </div>
+      <footer className="knowledge-base-settings-actions">{config ? <button type="button" className="knowledge-base-remove" disabled={saving || testing} onClick={() => void remove()}>移除配置</button> : <span />}<button type="submit" className="settings-save" disabled={saving || testing}>{saving ? <><LoaderCircle />保存中…</> : '保存知识库配置'}</button></footer>
+    </form>
+  </section>
 }
 
 function ConversationSearchOverlay({ query, onQueryChange, results, conversationCount, onOpenResult, onClose }: {
@@ -769,8 +987,8 @@ function normalizeHighlightTerm(value: string): string {
 }
 
 function markdownComponentsWithSearchHighlight(query: string): Components {
+  if (!query.trim()) return defaultMarkdownComponents
   const components: Components = { a: MarkdownExternalLink }
-  if (!query.trim()) return components
   const highlight = (children: ReactNode): ReactNode => highlightSearchNode(children, query)
   components.p = ({ children }) => <p>{highlight(children)}</p>
   components.li = ({ children }) => <li>{highlight(children)}</li>
@@ -784,6 +1002,9 @@ function markdownComponentsWithSearchHighlight(query: string): Components {
   components.th = ({ children, style }) => <th style={style}>{highlight(children)}</th>
   return components
 }
+
+const defaultMarkdownComponents: Components = { a: MarkdownExternalLink }
+const markdownRemarkPlugins = [remarkGfm]
 
 function formatSearchTimestamp(value: string): string {
   const date = new Date(value)
@@ -871,22 +1092,38 @@ function mergeLiveStep(steps: TaskStep[], nextStep: TaskStep): TaskStep[] {
   return upsertStep(currentSteps, nextStep)
 }
 
-function MessageView({ conversationId, message, highlighted, highlightQuery, onPreview }: { conversationId: string; message: ChatMessage; highlighted: boolean; highlightQuery: string; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
+const MessageView = memo(function MessageView({ conversationId, message, highlighted, highlightQuery, onPreview }: { conversationId: string; message: ChatMessage; highlighted: boolean; highlightQuery: string; onPreview: (attachment: ChatAttachment) => void }): ReactElement {
   const shouldShowProcess = message.role === 'assistant' && (message.status === 'acting' || Boolean(message.steps?.length))
   const activeHighlightQuery = highlighted ? highlightQuery : ''
+  const deferredContent = useDeferredValue(message.content)
+  const renderedContent = message.status === 'acting' ? deferredContent : message.content
   return <article data-message-id={message.id} className={'message-item ' + message.role + (highlighted ? ' search-highlight' : '')}>
     <div className="message-meta"><span>{message.role === 'user' ? '你' : 'Codext Agent'}</span>{message.status && <b className={'run-status ' + message.status}>{statusText[message.status]}</b>}</div>
-    {shouldShowProcess ? <AgentProcess key={message.status === 'acting' ? 'open' : 'closed'} message={message} /> : null}
+    {shouldShowProcess ? <AgentProcess message={message} /> : null}
     <div className="message-content-group" data-message-content>
-      {message.content ? message.role === 'assistant'
-        ? <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponentsWithSearchHighlight(activeHighlightQuery)}>{message.content}</ReactMarkdown></div>
-        : <div className="message-bubble">{highlightSearchNode(message.content, activeHighlightQuery)}</div> : null}
+      {renderedContent ? message.role === 'assistant'
+        ? message.status === 'acting'
+          ? <div className="message-bubble message-streaming-text">{renderedContent}</div>
+          : <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={markdownRemarkPlugins} components={markdownComponentsWithSearchHighlight(activeHighlightQuery)}>{renderedContent}</ReactMarkdown></div>
+        : <div className="message-bubble">{highlightSearchNode(renderedContent, activeHighlightQuery)}</div> : null}
       {message.role === 'assistant' && message.artifacts?.length ? <ResultArtifacts conversationId={conversationId} artifacts={message.artifacts} /> : null}
       {message.attachments?.length ? <div className="message-attachments">{message.attachments.map((attachment) => <AttachmentCard key={attachment.id} attachment={attachment} highlightQuery={activeHighlightQuery} onPreview={() => onPreview(attachment)} />)}</div> : null}
       {message.role === 'assistant' && message.tokenUsage ? <TokenUsageView usage={message.tokenUsage} /> : null}
     </div>
   </article>
-}
+})
+
+const MessageItems = memo(function MessageItems({ conversation, highlightedMessageId, highlightedSearchQuery, onPreview }: {
+  conversation?: Conversation
+  highlightedMessageId: string
+  highlightedSearchQuery: string
+  onPreview: (attachment: ChatAttachment) => void
+}): ReactElement {
+  if (!conversation?.messages.length) {
+    return <section className="welcome"><h1>今天想让 Agent 完成什么？</h1><p>同一会话里可以持续追问，Agent 会带着上下文继续执行。</p></section>
+  }
+  return <>{conversation.messages.map((message) => <MessageView key={message.id} conversationId={conversation.id} message={message} highlighted={highlightedMessageId === message.id} highlightQuery={highlightedSearchQuery} onPreview={onPreview} />)}</>
+})
 
 function MarkdownExternalLink({ href, children, ...props }: ComponentPropsWithoutRef<'a'>): ReactElement {
   const isWebUrl = typeof href === 'string' && /^https?:\/\//i.test(href)
@@ -1110,11 +1347,20 @@ function AgentProcess({ message }: { message: ChatMessage }): ReactElement {
   const steps = message.steps ?? []
   const flowItems = buildAgentFlowItems(steps)
   const isRunning = message.status === 'acting'
-  const actionCount = steps.filter((item) => item.phase === 'act' && item.title.startsWith('正在执行工具')).length
+  // Keep the execution trace visible after the task finishes. The previous
+  // status-controlled open prop remounted/collapsed the whole trace as soon
+  // as the final response arrived, making Action and Observation appear to be
+  // missing even though they had already been emitted.
+  const [open, setOpen] = useState(true)
+  const actionCount = steps.filter((item) => item.phase === 'act' && isToolActionStepTitle(item.title)).length
   const now = useNow(isRunning)
   const elapsed = formatElapsed(getElapsedMs(message, now))
 
-  return <details className="agent-process agent-process-flow" open={isRunning}>
+  useEffect(() => {
+    if (isRunning) setOpen(true)
+  }, [isRunning])
+
+  return <details className="agent-process agent-process-flow" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary><span>{isRunning ? '正在处理 ' + elapsed : '已处理 ' + elapsed}</span><small>{flowItems.length || 1} 个步骤 · {actionCount} 个工具</small></summary>
     <div className="agent-flow">
       {flowItems.length ? flowItems.map((item) => item.kind === 'tool'
@@ -1135,7 +1381,7 @@ function buildAgentFlowItems(steps: TaskStep[]): AgentFlowItem[] {
 
   for (const taskStep of steps) {
     if (isHiddenInternalAgentStep(taskStep)) continue
-    if (taskStep.phase === 'act' && taskStep.title.startsWith('正在执行工具')) {
+    if (taskStep.phase === 'act' && isToolActionStepTitle(taskStep.title)) {
       const item: Extract<AgentFlowItem, { kind: 'tool' }> = { kind: 'tool', action: taskStep }
       items.push(item)
       pendingTools.push(item)
@@ -1178,17 +1424,30 @@ function normalizeToolLabel(value: string): string {
   return value.trim().toLowerCase().replaceAll('-', '_')
 }
 
+function isToolActionStepTitle(title: string): boolean {
+  return /^(?:正在执行工具|工具调用已延后|工具调用已跳过)[：:]/.test(title)
+}
+
+function toolActionState(title: string): 'running' | 'deferred' | 'skipped' {
+  if (title.startsWith('工具调用已延后：') || title.startsWith('工具调用已延后:')) return 'deferred'
+  if (title.startsWith('工具调用已跳过：') || title.startsWith('工具调用已跳过:')) return 'skipped'
+  return 'running'
+}
+
 function AgentToolCallView({ action, liveOutput, observation }: { action: TaskStep; liveOutput?: TaskStep; observation?: TaskStep }): ReactElement {
+  const actionState = toolActionState(action.title)
   const completed = Boolean(observation)
   const toolName = normalizeToolLabel(getToolName(action))
-  const showLiveOutput = !completed && Boolean(liveOutput)
-  const commandRunning = !completed && (toolName === 'run_command' || toolName === 'start_service')
-  const summary = (completed ? '已执行：' : '正在执行：') + toolDisplayName(getToolName(action)) + (action.detail ? ' ' + action.detail : ' 无参数')
+  const showLiveOutput = actionState === 'running' && !completed && Boolean(liveOutput)
+  const commandRunning = actionState === 'running' && !completed && (toolName === 'run_command' || toolName === 'start_service')
+  const summaryPrefix = actionState === 'deferred' ? '已延后：' : actionState === 'skipped' ? '已跳过：' : completed ? '已执行：' : '正在执行：'
+  const summary = summaryPrefix + toolDisplayName(getToolName(action)) + (action.detail ? ' ' + action.detail : ' 无参数')
   const fileResult = observation && (toolName === 'edit_file' || toolName === 'write_file')
     ? parseFileChangeResult(observation.detail, toolName)
     : undefined
+  const flowStatus = actionState === 'deferred' || actionState === 'skipped' ? 'info' : completed ? 'done' : 'running'
   return <CollapsibleFlowBlock className={'agent-flow-action agent-flow-tool-call ' + (completed ? 'done' : 'running') + (commandRunning ? ' command-running' : '')} forceOpen={showLiveOutput}>
-    <summary><AgentStatusLine status={completed ? 'done' : 'running'} text={summary} /></summary>
+    <summary><AgentStatusLine status={flowStatus} text={summary} /></summary>
     {showLiveOutput && liveOutput ? <CommandLiveOutput output={liveOutput.detail} /> : null}
     {observation ? <div className={'agent-flow-tool-result' + (fileResult?.diff ? ' has-edit-diff' : '')}>
       <span>执行结果</span>
@@ -1317,7 +1576,7 @@ function CollapsibleFlowBlock({ className, initialOpen = false, forceOpen = fals
 }
 
 function getToolName(taskStep: TaskStep): string {
-  return taskStep.title.replace(/^正在执行工具：/, '').trim()
+  return taskStep.title.replace(/^(?:正在执行工具|工具调用已延后|工具调用已跳过)[：:]/, '').trim()
 }
 
 function toolDisplayName(name: string): string {
@@ -1579,6 +1838,7 @@ function ConfigSettings({ title, settings, setSettings, policy, setPolicy, onSav
     </section>
     <div className="config-actions model-config-actions"><button className="connection-test" onClick={() => void test()} disabled={testing || saving || !selectedProfile}>{testing ? '正在测试…' : '测试当前模型'}</button>{selectedProfile && selectedProfile.id !== defaultProfile?.id ? <button type="button" className="set-default-button" onClick={setDefaultModel}><Star />设为默认</button> : null}<button className={'settings-save ' + (saving ? 'is-loading' : '')} onClick={() => void save()} disabled={saving || testing}>{saving ? '保存中…' : '保存更改'}</button></div>
     {notice && <div className="model-config-notice"><div className={'config-notice ' + notice.type}>{notice.type === 'success' ? <Icon name="check" /> : <SettingsIcon />}{notice.text}</div></div>}
+    <KnowledgeBaseSettings settings={settings} setSettings={setSettings} onSave={onSave} />
     <section className="settings-section compact">
       <h2>系统提示词</h2>
       <p>每次请求模型时都会携带这段系统级约束。</p>

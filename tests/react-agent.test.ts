@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { ReactAgent } from '../src/main/agent/react-agent'
 import { PptMcpClient } from '../src/main/ppt/ppt-mcp-client'
 import { WorkspaceTools } from '../src/main/tools/workspace-tools'
-import type { AgentPolicy, AppSettings, AgentTask, ChatAttachment, CommandApprovalDetails } from '../src/shared/types'
+import type { AgentPolicy, AppSettings, AgentTask, ChatAttachment, CommandApprovalDetails, KnowledgeBaseConfig } from '../src/shared/types'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -75,11 +75,110 @@ describe('ReactAgent.execute', () => {
     await makeAgent(personalizedSettings).agent.run('检查设置')
 
     const request = vi.mocked(globalThis.fetch).mock.calls[0]?.[1]
-    const body = JSON.parse(String(request?.body)) as { messages: Array<{ role: string; content: string }> }
+    const body = JSON.parse(String(request?.body)) as {
+      messages: Array<{ role: string; content: string }>
+      response_format?: {
+        type?: string
+        json_schema?: {
+          name?: string
+          strict?: boolean
+          schema?: {
+            required?: string[]
+            anyOf?: Array<{ properties?: Record<string, unknown> }>
+            properties?: {
+              action?: { anyOf?: Array<{ properties?: { name?: { enum?: string[] }; arguments?: { properties?: Record<string, unknown>; required?: string[] } } }> }
+              tool_calls?: { anyOf?: Array<{ type?: string; items?: { anyOf?: Array<{ properties?: Record<string, unknown>; required?: string[] }> } }> }
+            }
+          }
+        }
+      }
+    }
     const systemPrompt = body.messages.find((message) => message.role === 'system')?.content ?? ''
     expect(systemPrompt).toContain('语气偏好：专业严谨')
     expect(systemPrompt).toContain('默认使用中文，并在修改代码后说明验证结果。')
     expect(systemPrompt).toContain('不得覆盖安全策略、权限规则、工具协议')
+    expect(systemPrompt).not.toContain('search_knowledge_base')
+    expect(body.response_format?.type).toBe('json_schema')
+    expect(body.response_format?.json_schema).toMatchObject({ name: 'codext_react_response', strict: true })
+    expect(body.response_format?.json_schema?.schema?.required).toEqual(['thought', 'action', 'tool_calls', 'choice', 'final'])
+    expect(body.response_format?.json_schema?.schema?.anyOf).toBeUndefined()
+    const actionBranches = body.response_format?.json_schema?.schema?.properties?.action?.anyOf ?? []
+    const readFileBranch = actionBranches.find((branch) => branch.properties?.name?.enum?.includes('read_file'))
+    const listFilesBranch = actionBranches.find((branch) => branch.properties?.name?.enum?.includes('list_files'))
+    expect(actionBranches.some((branch) => branch.properties?.name?.enum?.includes('search_knowledge_base'))).toBe(false)
+    expect(readFileBranch?.properties?.arguments?.required).toEqual(['path'])
+    expect(readFileBranch?.properties?.arguments?.properties).toEqual({ path: expect.objectContaining({ type: 'string' }) })
+    expect(readFileBranch?.properties?.arguments?.properties).not.toHaveProperty('query')
+    expect(listFilesBranch?.properties?.arguments?.required).toEqual(['path', 'recursive'])
+    expect(listFilesBranch?.properties?.arguments?.properties?.path).toEqual(expect.objectContaining({ type: ['string', 'null'] }))
+    const toolCallArray = body.response_format?.json_schema?.schema?.properties?.tool_calls?.anyOf?.find((branch) => branch.type === 'array')
+    expect(toolCallArray?.items?.anyOf?.length).toBeGreaterThan(1)
+    const listReadFileBranch = toolCallArray?.items?.anyOf?.find((branch) => {
+      const name = branch.properties?.name as { enum?: string[] } | undefined
+      return name?.enum?.includes('read_file')
+    })
+    expect(listReadFileBranch?.required).toEqual(['id', 'dependsOn', 'name', 'arguments'])
+  })
+
+  it('searches the configured knowledge base before asking the user to clarify an acronym', async () => {
+    const knowledgeBase: KnowledgeBaseConfig = {
+      name: '制度库',
+      baseUrl: 'https://fastgpt.example.com',
+      apiKey: 'fastgpt-dataset-secret',
+      datasetId: '',
+      apiMode: 'datasetSearch',
+      limit: 3000,
+      similarity: 0.3,
+      searchMode: 'mixedRecall',
+      usingReRank: false
+    }
+    let modelCalls = 0
+    let knowledgeCalls = 0
+    const modelBodies: string[] = []
+    globalThis.fetch = vi.fn().mockImplementation((input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/dataset/search')) {
+        knowledgeCalls++
+        expect(init?.headers).toMatchObject({ Authorization: 'Bearer ' + knowledgeBase.apiKey })
+        expect(JSON.parse(String(init?.body))).toEqual({
+          query: '介绍一下MBSD',
+          limit: 3000,
+          similarity: 0.3,
+          searchMode: 'mixedRecall',
+          usingReRank: false
+        })
+        return Promise.resolve(new Response(JSON.stringify({ code: 200, data: [{ q: 'MBSD', a: 'MBSD 指模型驱动的软件设计流程。', score: 0.92 }] }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      }
+      modelCalls++
+      modelBodies.push(String(init?.body))
+      const content = modelCalls === 1
+        ? JSON.stringify({ final: '“MBSD”可能有多种释义，需要先确认具体所指。' })
+        : JSON.stringify({ final: '根据知识库，MBSD 指模型驱动的软件设计流程。' })
+      return Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    const { agent } = makeAgent(makeSettings())
+
+    const task = await agent.run('介绍一下MBSD', [], undefined, undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined, knowledgeBase)
+
+    expect(task.status).toBe('succeeded')
+    expect(task.result).toBe('根据知识库，MBSD 指模型驱动的软件设计流程。')
+    expect(knowledgeCalls).toBe(1)
+    expect(modelCalls).toBe(2)
+    expect(modelBodies[0]).toContain('search_knowledge_base')
+    expect(modelBodies[1]).toContain('MBSD 指模型驱动的软件设计流程')
+    expect(modelBodies.join('\n')).not.toContain(knowledgeBase.apiKey)
+    expect(task.steps.some((item) => item.title.includes('search_knowledge_base'))).toBe(true)
+    expect(task.steps.some((item) => item.title === '知识库优先检索')).toBe(true)
+  })
+
+  it('does not contact a knowledge base when the model answers directly', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ final: '你好！' }) } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const knowledgeBase: KnowledgeBaseConfig = { name: '制度库', baseUrl: 'https://fastgpt.example.com', apiKey: 'dataset-key', datasetId: '', apiMode: 'datasetSearch', limit: 3000, similarity: 0.3, searchMode: 'mixedRecall', usingReRank: false }
+
+    const task = await makeAgent(makeSettings()).agent.run('你好', [], undefined, undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined, knowledgeBase)
+
+    expect(task.result).toBe('你好！')
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1)
   })
 
   describe('user choice continuation', () => {
@@ -468,6 +567,23 @@ describe('ReactAgent.execute', () => {
       expect(body).not.toContain('旧页面已经处理完成')
     })
 
+    it('sends the latest exchange when the current request refers to previous context', async () => {
+      const { agent } = makeAgent(makeSettings())
+      const history = [
+        { role: 'user' as const, content: '按用例复现检测流程' },
+        { role: 'assistant' as const, content: '依次执行标准检测、漏洞模式、冻结拍照、超分和报警拍照。', status: 'succeeded' }
+      ]
+
+      await agent.run('你确定是这些方法吗，你找到了报错的位置了吗', history)
+
+      const request = vi.mocked(globalThis.fetch).mock.calls[0]?.[1]
+      const body = JSON.parse(String(request?.body)) as { messages: Array<{ role: string; content: string }> }
+      expect(body.messages.map((message) => message.role)).toEqual(['system', 'user', 'assistant', 'user'])
+      expect(body.messages[1].content).toContain('按用例复现检测流程')
+      expect(body.messages[2].content).toContain('标准检测、漏洞模式、冻结拍照')
+      expect(body.messages[3].content).toContain('这些方法')
+    })
+
     it('sends an image attachment even when the visible message has no text', async () => {
       const { agent } = makeAgent(makeSettings())
       const image: ChatAttachment = { id: 'image-only', name: 'clipboard.png', mimeType: 'image/png', size: 8, dataUrl: 'data:image/png;base64,iVBORw0KGgo=' }
@@ -576,6 +692,41 @@ describe('ReactAgent.execute', () => {
 
       expect(result).toBe('Hello')
       expect(streamed).toBe('Hello')
+    })
+
+    it('does not stream an unvalidated Final that contains an Observation block', async () => {
+      const encoder = new TextEncoder()
+      const sse = (content: string): Uint8Array => encoder.encode('data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n')
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const chunks = callCount === 1
+          ? ['{"thought":"ok","final":"泄漏前缀\\n\\nObservation #1:\\nsecret tool output"}']
+          : ['{"final":"validated final"}']
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => 'text/event-stream' },
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const chunk of chunks) controller.enqueue(sse(chunk))
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+            }
+          })
+        })
+      })
+
+      let streamed = ''
+      const { agent } = makeAgent(makeSettings())
+      const task = makeTask()
+      const result = await (agent as unknown as { execute: (p: string, pol: AgentPolicy, t: AgentTask, history?: [], onStep?: undefined, onDelta?: (delta: string) => void) => Promise<string> })
+        .execute('finish', basePolicy, task, [], undefined, (delta) => { streamed += delta })
+
+      expect(result).toBe('validated final')
+      expect(streamed).toBe('validated final')
+      expect(streamed).not.toContain('Observation #')
+      expect(streamed).not.toContain('secret tool output')
+      expect(callCount).toBe(2)
     })
 
     it('hides tagged reasoning when the JSON final has no thought', async () => {
@@ -1235,6 +1386,52 @@ describe('ReactAgent.execute', () => {
       expect(listFiles).toHaveBeenCalledWith('.', false)
     })
 
+    it('executes an Action emitted with nullable strict-schema arguments', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({
+              thought: '需要先查看项目目录',
+              action: {
+                id: null,
+                dependsOn: null,
+                name: 'list_files',
+                arguments: {
+                  path: '.',
+                  content: null,
+                  old_text: null,
+                  new_text: null,
+                  replace_all: null,
+                  command: null,
+                  args: null,
+                  background: null,
+                  recursive: false,
+                  output_path: null,
+                  max_characters: null,
+                  include_notes: null,
+                  query: null
+                }
+              },
+              tool_calls: null,
+              choice: null,
+              final: null
+            })
+          : JSON.stringify({ thought: '已收到目录结果', action: null, tool_calls: null, choice: null, final: '目录检查完成' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const listFiles = vi.spyOn(WorkspaceTools.prototype, 'listFiles').mockResolvedValue('src\\npackage.json')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('检查项目目录')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('目录检查完成')
+      expect(listFiles).toHaveBeenCalledWith('.', false)
+      expect(task.steps.some((item) => item.title.startsWith('正在执行工具：list_files'))).toBe(true)
+      expect(task.steps.some((item) => item.title.startsWith('Observation #') && item.title.includes('list_files'))).toBe(true)
+    })
+
     it('executes multiple Qwen XML tool calls and hides the raw think block', async () => {
       let callCount = 0
       globalThis.fetch = vi.fn().mockImplementation(() => {
@@ -1267,7 +1464,7 @@ describe('ReactAgent.execute', () => {
           const body = JSON.parse(String(init?.body)) as { tools?: unknown[]; tool_choice?: string; parallel_tool_calls?: boolean }
           expect(body.tools?.length).toBeGreaterThan(0)
           expect(body.tool_choice).toBeUndefined()
-          expect(body.parallel_tool_calls).toBeUndefined()
+          expect(body.parallel_tool_calls).toBe(true)
         }
         const content = callCount === 1
           ? JSON.stringify({ tool_calls: [
@@ -1298,6 +1495,80 @@ describe('ReactAgent.execute', () => {
         expect.stringContaining('read_file')
       ])
       expect(observations.map((item) => item.detail)).toEqual(['slow.ts content', 'fast.ts content'])
+    })
+
+    it('accepts a bare JSON tool-call list from providers that ignore the response envelope', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify([
+              { name: 'read_file', arguments: { path: 'a.ts' } },
+              { name: 'read_file', arguments: { path: 'b.ts' } }
+            ])
+          : JSON.stringify({ final: 'bare list completed' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockImplementation(async (path) => path + ' content')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('璇诲彇 a.ts 鍜?b.ts')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('bare list completed')
+      expect(readFile).toHaveBeenCalledTimes(2)
+      expect(readFile).toHaveBeenNthCalledWith(1, 'a.ts')
+      expect(readFile).toHaveBeenNthCalledWith(2, 'b.ts')
+    })
+
+    it('accepts a provider content array containing tool-call objects', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const message = callCount === 1
+          ? {
+              content: [
+                { type: 'function', function: { name: 'read_file', arguments: '{"path":"a.ts"}' } },
+                { type: 'function', function: { name: 'read_file', arguments: '{"path":"b.ts"}' } }
+              ]
+            }
+          : { content: JSON.stringify({ final: 'content list completed' }) }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockImplementation(async (path) => path + ' content')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('璇诲彇 a.ts 鍜?b.ts')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('content list completed')
+      expect(readFile).toHaveBeenCalledTimes(2)
+    })
+
+    it('preserves tool_calls when a provider echoes an action alongside the batch', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({
+              action: { name: 'read_file', arguments: { path: 'a.ts' } },
+              tool_calls: [
+                { name: 'read_file', arguments: { path: 'a.ts' } },
+                { name: 'read_file', arguments: { path: 'b.ts' } }
+              ]
+            })
+          : JSON.stringify({ final: 'mixed envelope completed' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      const readFile = vi.spyOn(WorkspaceTools.prototype, 'readFile').mockImplementation(async (path) => path + ' content')
+      const { agent } = makeAgent(makeSettings({ model: 'Qwen3.6-32B' }))
+
+      const task = await agent.run('璇诲彇 a.ts 鍜?b.ts')
+
+      expect(task.status).toBe('succeeded')
+      expect(readFile).toHaveBeenCalledTimes(2)
+      expect(readFile).toHaveBeenNthCalledWith(1, 'a.ts')
+      expect(readFile).toHaveBeenNthCalledWith(2, 'b.ts')
     })
 
     it('parallelizes independent mutating calls when their resources do not conflict', async () => {
@@ -1477,6 +1748,7 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(task.steps.some((item) => item.title === '已规划工具执行顺序' && item.detail.includes('延后'))).toBe(true)
+      expect(task.steps.some((item) => item.title === '工具调用已延后：parse_word')).toBe(true)
       expect(task.steps.some((item) => item.detail.includes('依赖前置工具的真实输出'))).toBe(true)
       expect(readFile).toHaveBeenCalledOnce()
       expect(readFile).toHaveBeenCalledWith('report.decrypted.docx')
@@ -1529,6 +1801,7 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(writeFile).toHaveBeenCalledOnce()
+      expect(task.steps.some((item) => item.title === '工具调用已跳过：write_file')).toBe(true)
       expect(task.steps.some((item) => item.detail.includes('前置执行批次存在失败'))).toBe(true)
     })
 
@@ -1690,6 +1963,8 @@ describe('ReactAgent.execute', () => {
 
       expect(task.status).toBe('succeeded')
       expect(task.result).toContain('已基于已获得的工具结果整理当前结果')
+      expect(task.result).not.toContain('Observation #')
+      expect(task.result).not.toContain('调度说明')
       expect(task.result).not.toContain('<think>')
       expect(listFiles).toHaveBeenCalledOnce()
       expect(callCount).toBe(5)
@@ -1796,6 +2071,28 @@ describe('ReactAgent.execute', () => {
       expect(task.steps.some((item) => item.title === '模型响应无效，正在恢复')).toBe(true)
       expect(requestBodies[2]).not.toContain('[上一条工具调用')
       expect(requestBodies[2]).toContain('INTERNAL_PLACEHOLDER_ECHO')
+      expect(callCount).toBe(3)
+    })
+
+    it('rejects a Final that echoes an internal Observation block', async () => {
+      let callCount = 0
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++
+        const content = callCount === 1
+          ? JSON.stringify({ action: { name: 'read_file', arguments: { path: 'package.json' } } })
+          : callCount === 2
+            ? JSON.stringify({ final: '已整理结果。\n\nObservation #1:\nread_file: {"name":"codext-agent"}' })
+            : JSON.stringify({ final: 'package.json 已读取并完成总结。' })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ choices: [{ message: { content } }] }) })
+      })
+      vi.spyOn(WorkspaceTools.prototype, 'readFile').mockResolvedValue('{"name":"codext-agent"}')
+      const { agent } = makeAgent(makeSettings())
+
+      const task = await agent.run('读取 package.json 并总结')
+
+      expect(task.status).toBe('succeeded')
+      expect(task.result).toBe('package.json 已读取并完成总结。')
+      expect(task.result).not.toContain('Observation #1')
       expect(callCount).toBe(3)
     })
 

@@ -43,6 +43,22 @@ describe('task history selection', () => {
     expect(selectTaskHistory(history, '检查数据库迁移脚本')).toEqual([])
   })
 
+  it('keeps the latest exchange when a follow-up uses contextual references', () => {
+    const history: TestMessage[] = [
+      { role: 'user', content: '检查数据库迁移脚本' },
+      { role: 'assistant', content: '迁移脚本没有发现异常。', status: 'succeeded' },
+      { role: 'user', content: '按用例复现检测流程' },
+      { role: 'assistant', content: '依次执行标准检测、漏洞模式、冻结拍照、超分和报警拍照。', status: 'succeeded' }
+    ]
+
+    const selected = selectTaskHistory(history, '你确定是这些方法吗，你找到了报错的位置了吗')
+
+    expect(selected.map((message) => message.content)).toEqual([
+      '按用例复现检测流程',
+      '依次执行标准检测、漏洞模式、冻结拍照、超分和报警拍照。'
+    ])
+  })
+
   it('reuses only the latest task attachment for an explicit continuation', () => {
     const history: TestMessage[] = [
       { role: 'user', content: '查看这张图', attachments: [{ id: 'current-screen', name: 'current.png' }] },
@@ -94,6 +110,24 @@ describe('task history selection', () => {
     expect(resumedSelection[1].content).toContain('trace-3')
     expect(resumedSelection[1].content).toContain('trace-5')
     expect(resumedSelection[1].steps).toBeUndefined()
+  })
+
+  it('drops an assistant protocol echo before reusing task history', () => {
+    const history: TestMessage[] = [
+      { role: 'user', content: '读取 package.json 并总结' },
+      {
+        role: 'assistant',
+        content: '已整理结果。\n\nObservation #1:\nread_file: {...}\nPrevious task memory: {...}',
+        status: 'succeeded',
+        steps: [{ phase: 'act', title: 'Observation #1：read_file', detail: '{"name":"codext-agent"}' }]
+      }
+    ]
+
+    const selected = selectTaskHistory(history, '继续检查 package.json')
+
+    expect(selected[1].content).not.toContain('Observation #1:\nread_file: {...}')
+    expect(selected[1].content).toContain('Previous task memory:')
+    expect(selected[1].content).toContain('{"name":"codext-agent"}')
   })
 
   it('matches follow-up questions against facts introduced by the assistant and tool trace', () => {

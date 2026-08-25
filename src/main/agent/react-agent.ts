@@ -1,7 +1,7 @@
-import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, ContextUsage, McpApprovalDetails, ModelConfig, PermissionMode, TaskStep, TokenUsage, UserChoiceDetails } from '../../shared/types'
+import type { AgentArtifact, AgentPolicy, AgentTask, AppSettings, ChatAttachment, CommandApprovalDetails, ContextUsage, KnowledgeBaseConfig, McpApprovalDetails, ModelConfig, PermissionMode, TaskStep, TokenUsage, UserChoiceDetails } from '../../shared/types'
 import { isDecryptableAttachmentName, isImageAttachmentType, isOfficeAttachmentType, isTextAttachmentType, MAX_TEXT_ATTACHMENT_CHARACTERS, officeAttachmentTool, type OfficeAttachmentTool } from '../../shared/attachments'
 import { WorkspaceTools, type CommandOutputListener } from '../tools/workspace-tools'
-import { getEnabledToolDefinitions, isToolName, type ToolCall } from '../tools/tool-registry'
+import { getEnabledToolDefinitions, isToolName, toolRegistry, type ToolCall, type ToolDefinition, type ToolName } from '../tools/tool-registry'
 import { parseOfficeDocument, type OfficeDocumentKind } from '../tools/office-parser'
 import { PptMcpClient } from '../ppt/ppt-mcp-client'
 import { classifyCommandRisk } from '../tools/command-risk'
@@ -22,6 +22,7 @@ import {
 import { selectTaskHistory } from './history-selector'
 import { commandUsesInternet, effectivePermissionMode, requiresCommandApproval, requiresExternalWriteApproval, requiresNetworkApproval } from '../permission-policy'
 import { detectRuntimeEnvironment, formatRuntimeEnvironmentPrompt, type RuntimeEnvironmentInfo } from '../runtime-environment'
+import { searchKnowledgeBase } from '../knowledge-base'
 
 const MAX_REACT_TURNS = 100
 // A model may return several independent tool calls in one response. Keep a
@@ -40,6 +41,121 @@ const MAX_UNSTRUCTURED_RESPONSE_CHARACTERS = 64_000
 const MAX_DISPLAYED_THOUGHT_CHARACTERS = 240
 const MAX_LIVE_COMMAND_OUTPUT_CHARACTERS = 24_000
 const LIVE_COMMAND_OUTPUT_UPDATE_INTERVAL_MS = 80
+
+// Keep the ReAct envelope machine-readable at the provider boundary. Strict
+// schemas require every object property to be present, so optional arguments
+// are represented as nullable values. Tool calls use one schema branch per
+// tool; this prevents the model from filling unrelated fields (for example a
+// knowledge-base query on a read_file Action) merely because one giant shared
+// arguments object marked every field as required.
+const REACT_TOOL_CALL_SCHEMAS = new Map((Object.keys(toolRegistry) as ToolName[]).map((name) => [name, createReactToolCallSchema(name, toolRegistry[name])]))
+
+function createReactToolCallSchema(name: ToolName, definition: ToolDefinition): Record<string, unknown> {
+  const sourceProperties = definition.inputSchema.properties
+  const properties = sourceProperties && typeof sourceProperties === 'object' && !Array.isArray(sourceProperties)
+    ? sourceProperties as Record<string, Record<string, unknown>>
+    : {}
+  const requiredProperties = new Set(
+    Array.isArray(definition.inputSchema.required)
+      ? definition.inputSchema.required.filter((field): field is string => typeof field === 'string')
+      : []
+  )
+  const argumentProperties = Object.fromEntries(Object.entries(properties).map(([key, value]) => {
+    const schema = strictArgumentPropertySchema(value)
+    // Required tool arguments stay non-null so the model cannot emit an
+    // Action that is guaranteed to fail. Optional arguments must be nullable
+    // because strict mode still requires their property to be present.
+    if (!requiredProperties.has(key)) {
+      const types = Array.isArray(schema.type) ? schema.type : typeof schema.type === 'string' ? [schema.type] : []
+      if (!types.includes('null')) schema.type = [...types, 'null']
+    }
+    return [key, schema]
+  }))
+  const argumentKeys = Object.keys(argumentProperties)
+  const argumentsSchema: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: false,
+    properties: argumentProperties,
+    required: argumentKeys
+  }
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      id: { type: ['string', 'null'] },
+      dependsOn: { type: ['array', 'null'], items: { type: 'string' } },
+      name: { type: 'string', enum: [name] },
+      arguments: argumentsSchema
+    },
+    required: ['id', 'dependsOn', 'name', 'arguments']
+  }
+}
+
+// Keep only the structural keywords accepted by the OpenAI-compatible
+// structured-output subset. Runtime validation still enforces constraints such
+// as max_characters ranges after parsing the Action.
+function strictArgumentPropertySchema(value: Record<string, unknown>): Record<string, unknown> {
+  const schema: Record<string, unknown> = {}
+  if (typeof value.type === 'string' || Array.isArray(value.type)) schema.type = value.type
+  if (Array.isArray(value.enum)) schema.enum = value.enum
+  if (value.items && typeof value.items === 'object' && !Array.isArray(value.items)) {
+    schema.items = strictArgumentPropertySchema(value.items as Record<string, unknown>)
+  }
+  return schema
+}
+
+function createReactResponseFormat(enabledTools: string[] = Object.keys(toolRegistry)): Record<string, unknown> {
+  const branches = [...new Set(enabledTools.filter(isToolName))]
+    .map((name) => REACT_TOOL_CALL_SCHEMAS.get(name))
+    .filter((schema): schema is Record<string, unknown> => Boolean(schema))
+  const action = branches.length ? { anyOf: [...branches, { type: 'null' }] } : { type: 'null' }
+  const toolCalls = branches.length
+    ? { anyOf: [{ type: 'array', items: { anyOf: branches } }, { type: 'null' }] }
+    : { type: 'null' }
+  const choice = {
+    anyOf: [
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          description: { type: ['string', 'null'] },
+          options: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                label: { type: 'string' },
+                description: { type: ['string', 'null'] },
+                workspacePath: { type: ['string', 'null'] }
+              },
+              required: ['id', 'label', 'description', 'workspacePath']
+            }
+          }
+        },
+        required: ['title', 'description', 'options']
+      },
+      { type: 'null' }
+    ]
+  }
+  const final = { type: ['string', 'null'] }
+  const properties = { thought: { type: 'string' }, action, tool_calls: toolCalls, choice, final }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'codext_react_response',
+      strict: true,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties,
+        required: ['thought', 'action', 'tool_calls', 'choice', 'final']
+      }
+    }
+  }
+}
 
 const step = (phase: TaskStep['phase'], title: string, detail: string): TaskStep => ({
   id: crypto.randomUUID(),
@@ -113,6 +229,12 @@ function sanitizeLiveCommandOutput(value: string): string {
 function normalizeModelContent(value: unknown): string {
   if (typeof value === 'string') return value
   if (!Array.isArray(value)) return ''
+  const containsToolCallShape = value.some((part) => {
+    if (!part || typeof part !== 'object') return false
+    const candidate = part as Record<string, unknown>
+    return 'name' in candidate || 'function' in candidate || 'arguments' in candidate || 'parameters' in candidate || 'input' in candidate || 'action_input' in candidate || 'tool_calls' in candidate || 'action' in candidate
+  })
+  if (containsToolCallShape) return JSON.stringify(value)
   return value.map((part) => {
     if (typeof part === 'string') return part
     if (typeof part === 'object' && part !== null && 'text' in part && typeof part.text === 'string') return part.text
@@ -134,15 +256,18 @@ export class ReactAgent {
     this.runtimeEnvironmentPrompt = formatRuntimeEnvironmentPrompt(runtimeEnvironment)
   }
 
-  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback): Promise<AgentTask> {
+  async run(prompt: string, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, workspacePath?: string, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback, knowledgeBase?: KnowledgeBaseConfig): Promise<AgentTask> {
     const task: AgentTask = { id: crypto.randomUUID(), prompt, status: 'reasoning', createdAt: new Date().toISOString(), steps: [] }
     const configuredPolicy = this.getPolicy()
-    const policy = workspacePath?.trim() ? { ...configuredPolicy, workspacePath: workspacePath.trim() } : configuredPolicy
+    const workspacePolicy = workspacePath?.trim() ? { ...configuredPolicy, workspacePath: workspacePath.trim() } : configuredPolicy
+    const policy = knowledgeBase && !workspacePolicy.enabledTools.includes('search_knowledge_base')
+      ? { ...workspacePolicy, enabledTools: [...workspacePolicy.enabledTools, 'search_knowledge_base'] }
+      : workspacePolicy
 
     task.status = 'acting'
 
     try {
-      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval, modelOverride, onContextUsage)
+      const result = await this.execute(prompt, policy, task, history, onStep, onDelta, attachments, requestMcpApproval, signal, requestUserChoice, requestCommandApproval, modelOverride, onContextUsage, knowledgeBase)
       task.result = result
       this.retainFinalServiceArtifacts(task, result)
       task.status = 'validating'
@@ -155,7 +280,7 @@ export class ReactAgent {
     return task
   }
 
-  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback): Promise<string> {
+  private async execute(prompt: string, policy: AgentPolicy, task: AgentTask, history: ConversationMessage[] = [], onStep?: StepCallback, onDelta?: DeltaCallback, attachments: ChatAttachment[] = [], requestMcpApproval?: McpApprovalCallback, signal?: AbortSignal, requestUserChoice?: UserChoiceCallback, requestCommandApproval?: CommandApprovalCallback, modelOverride?: ModelConfig, onContextUsage?: ContextUsageCallback, knowledgeBase?: KnowledgeBaseConfig): Promise<string> {
     throwIfAborted(signal)
     const settings = this.getSettings()
     const model = modelOverride ?? settings.model
@@ -211,7 +336,8 @@ export class ReactAgent {
         (delta) => {
           thoughtStep.detail += delta
           this.upsertStep(task, thoughtStep, onStep)
-        }
+        },
+        onDelta
       )
       let content: string
       let modelResponse: ModelResponse
@@ -280,12 +406,22 @@ export class ReactAgent {
           content: JSON.stringify({ thought: '准备执行模型给出的命令。', action: inferredCommandCall })
         }
       }
+      const hasKnowledgeBaseObservation = task.steps.some((item) => item.phase === 'act' && item.title.includes('search_knowledge_base'))
+      if (knowledgeBase && !toolCalls.length && !hasKnowledgeBaseObservation && shouldSearchKnowledgeBaseBeforeClarifying(toolIntentPrompt, reply)) {
+        const knowledgeBaseCall: ToolCall = { name: 'search_knowledge_base', arguments: { query: toolIntentPrompt } }
+        toolCalls = [knowledgeBaseCall]
+        messages[assistantMessageIndex] = {
+          role: 'assistant',
+          content: JSON.stringify({ thought: '术语含义不明确，准备先检索当前会话知识库。', action: knowledgeBaseCall })
+        }
+        this.addStep(task, step('reason', '知识库优先检索', '模型准备澄清术语含义；当前会话已配置知识库，先检索相关资料后再回答。'), onStep)
+      }
       if (finalizationOnly) {
-        const forcedFinal = !toolCalls.length && typeof reply.final === 'string' && !isIncompleteFinal(reply.final)
-          ? sanitizeThoughtText(reply.final)
+        const forcedFinal = !toolCalls.length && typeof reply.final === 'string' && !isIncompleteFinal(reply.final) && !isProtocolEchoFinal(reply.final)
+          ? sanitizeAssistantText(reply.final)
           : ''
         if (forcedFinal) {
-          onDelta?.(forcedFinal)
+          stream.flushFinal(forcedFinal)
           return forcedFinal
         }
         return this.fallbackFinalAfterRepeatedAction(task, observationsForFallback)
@@ -444,18 +580,18 @@ export class ReactAgent {
           messages.push({ role: 'user', content: '上一条 run_command 仍处于失败状态，任务尚未验证完成，不能输出 Final。请根据 Observation 中的 stdout/stderr 读取相关文件并修复，然后重新执行对应的构建、测试或检查命令；只有命令成功后才能完成任务。工具名必须使用 run_command，不能写成 run-command。' })
           continue
         }
-        if (isIncompleteFinal(reply.final)) {
+        if (isIncompleteFinal(reply.final) || isProtocolEchoFinal(reply.final)) {
           messages.push({ role: 'user', content: '任务尚未完成。不要等待用户提供工具结果；如果需要检查、读取、写入或执行命令，请立即输出下一步 Action JSON。只有完成全部目标后才能输出 Final。' })
           continue
         }
         const finalText = sanitizeAssistantText(reply.final)
-        onDelta?.(finalText)
+        stream.flushFinal(finalText)
         return finalText
       }
 
       if (!toolCalls.length) {
         const finalText = sanitizeAssistantText(reply.unparsed ?? content)
-        onDelta?.(finalText)
+        stream.flushFinal(finalText)
         return finalText
       }
       const deniedMcpCall = toolCalls.find((call) => call.name === 'parse_powerpoint' && call.arguments.path && deniedMcpPaths.has(call.arguments.path))
@@ -538,7 +674,7 @@ export class ReactAgent {
         }
         let output: string
         try {
-          output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, requestCommandApproval, signal, permissionMode, onCommandOutput)
+          output = await this.executeTool(call, tools, currentPolicy, requestMcpApproval, requestCommandApproval, signal, permissionMode, onCommandOutput, knowledgeBase)
           throwIfAborted(signal)
           this.recordToolArtifacts(task, call, output)
           if (call.name === 'run_command') unresolvedCommandFailure = false
@@ -578,11 +714,17 @@ export class ReactAgent {
       let stopAfterFailure = false
       for (const batch of executionPlan) {
         if (stopAfterFailure) {
-          for (const item of batch.items) indexedResults[item.index] = skippedToolResult()
+          for (const item of batch.items) {
+            this.addStep(task, step('act', '工具调用已跳过：' + item.call.name, this.toolDetail(item.call) + '\n前置执行批次失败，本次未执行。'), onStep)
+            indexedResults[item.index] = skippedToolResult()
+          }
           continue
         }
         if (batch.mode === 'deferred') {
-          for (const item of batch.items) indexedResults[item.index] = deferredToolResult()
+          for (const item of batch.items) {
+            this.addStep(task, step('act', '工具调用已延后：' + item.call.name, this.toolDetail(item.call) + '\n依赖前置工具的真实输出，本次未执行。'), onStep)
+            indexedResults[item.index] = deferredToolResult()
+          }
           continue
         }
         const results = batch.mode === 'parallel'
@@ -634,21 +776,28 @@ export class ReactAgent {
   }
 
   private fallbackFinalAfterRepeatedAction(task: AgentTask, observationTexts: string[] = []): string {
-    const observations = observationTexts.length
-      ? observationTexts.join('\n\n')
-      : task.steps
-        .filter((item) => item.phase === 'act' && (item.title.startsWith('Observation #') || item.title.startsWith('工具结果')))
-        .map((item) => item.title + '\n' + item.detail)
-        .join('\n\n')
-    return '已基于已获得的工具结果整理当前结果：\n\n' + (observations || '暂无可用工具结果。')
+    // Do not turn the internal recovery context into the user-facing answer.
+    // The previous implementation returned every Observation verbatim, which
+    // exposed scheduling prompts, prior-task memory, and potentially sensitive
+    // tool output after the model failed to produce a Final response.
+    const observationCount = observationTexts.length || task.steps.filter((item) => item.phase === 'act' && item.title.startsWith('Observation #')).length
+    const toolNames = [...new Set(task.steps
+      .filter((item) => item.phase === 'act' && item.title.startsWith('Observation #'))
+      .map((item) => item.title.replace(/^Observation\s+#\s*\d+\s*[：:]\s*/i, '').trim())
+      .filter(Boolean))]
+    const summary = observationCount
+      ? '工具已执行' + (toolNames.length ? '（' + toolNames.join('、') + '）' : '') + '，但模型未生成可交付的最终摘要。请查看上方执行结果。'
+      : '本次未获得可用的工具结果，模型也未生成最终摘要。'
+    return '已基于已获得的工具结果整理当前结果：\n\n' + summary
   }
 
   private buildSystemPrompt(policy: AgentPolicy): string {
     const settings = this.getSettings()
+    const enabledToolNames = getEnabledToolDefinitions(policy.enabledTools).map((definition) => definition.name).join('|')
     const toolSchema = [
       '{',
       '  "thought": "简短说明下一步及原因",',
-      '  "action": { "name": "read_file|write_file|edit_file|create_directory|list_files|decrypt_file|parse_word|parse_excel|parse_powerpoint|run_command|start_service", "arguments": { ... } }',
+      '  "action": { "id": null, "dependsOn": null, "name": "' + enabledToolNames + '", "arguments": { ... } }',
       '}'
     ].join('\n')
 
@@ -656,8 +805,8 @@ export class ReactAgent {
       '{',
       '  "thought": "简短说明这一批工具的共同目的",',
       '  "tool_calls": [',
-      '    { "id": "read_a", "name": "read_file", "arguments": { "path": "src/a.ts" } },',
-      '    { "id": "read_b", "name": "read_file", "arguments": { "path": "src/b.ts" } }',
+      '    { "id": "read_a", "dependsOn": null, "name": "read_file", "arguments": { "path": "src/a.ts" } },',
+      '    { "id": "read_b", "dependsOn": null, "name": "read_file", "arguments": { "path": "src/b.ts" } }',
       '  ]',
       '}'
     ].join('\n')
@@ -698,12 +847,15 @@ export class ReactAgent {
       '如果本轮输出 Action JSON，就必须立刻停止输出，等待工具 Observation；同一轮绝不能再输出 Final 或第二个 JSON 对象。',
       '这里的工具通过文本 Action JSON 协议调用；即使模型 API 的原生 tools 列表为空，也不代表这些工具不可用。禁止声称工具未挂载、无法调用或要求用户重新启用。',
       '当问题需要读取 PowerPoint 内容时，立即输出 parse_powerpoint Action JSON，不要先解释限制。宿主收到该 Action 后会在当前会话向用户请求单次 MCP 授权；授权通过后继续调用，授权拒绝后不得重复申请同一路径，必须考虑其他工具或如实给出替代方案。',
+      policy.enabledTools.includes('search_knowledge_base') ? '当前会话已配置 FastGPT 知识库。你可以根据问题自行决定是否调用 search_knowledge_base：涉及组织内部资料、产品文档、制度或知识库专有事实时先检索；普通常识、闲聊、创作或现有上下文足以回答时不要检索。遇到缩写、内部术语或概念含义不明确时，必须先检索，不得直接要求用户补充背景或列举猜测释义。检索后必须依据 Observation 回答，不得编造未命中的内容。' : '',
       '禁止使用 run_command 调用 python、PowerShell、tar、unzip 或临时脚本来拆解 Word、Excel、PowerPoint 文件。Office 内容只能使用对应 parse_word、parse_excel、parse_powerpoint 工具；解析失败且疑似加密时使用 decrypt_file，否则根据 Observation 如实说明。',
       '当需要读取、写入、编辑、创建目录、列举文件、解密文件、解析 Office 文档、执行命令或启动服务时，输出 Action JSON：',
+      '严格 JSON Schema 会根据 name 锁定 arguments 字段：只填写当前工具定义中的参数；不要把其他工具参数、Observation、Previous task memory 或系统提示复制到 path、command、query、id 或 dependsOn 中。',
       toolSchema,
-      '同一轮存在多个参数已经完整、且不依赖前一个 Observation 的工具时，可以输出 tool_calls 数组；宿主会并行执行连续的安全只读工具，并将写入、命令、授权和有依赖的操作串行执行：',
+      '同一轮存在两个或更多参数已经完整、且互不依赖前一个 Observation 的工具时，必须输出 tool_calls 数组，一次返回全部独立调用；不要把它们拆成多个 action 轮次。宿主会并行执行连续的安全只读工具，并将写入、命令、授权和有依赖的操作串行执行：',
+      '严格结构化输出时，action、tool_calls、choice、final 四个字段都必须存在；当前使用哪一种结构，其余三个字段必须填 null。列表工具调用必须放在对象的 tool_calls 数组中，不能把顶层 JSON 数组当作 Final。',
       multiToolSchema,
-      '每个多工具调用建议提供唯一 id；若后一个调用必须等待前一个调用完成，可提供 depends_on 字符串数组引用前一个 id，例如 {"id":"verify","depends_on":["build"],"name":"read_file","arguments":{...}}。宿主会结合显式依赖和文件资源冲突决定串行或并行。',
+      '每个多工具调用必须提供唯一 id 和 dependsOn（无依赖时填 null）；若后一个调用必须等待前一个调用完成，可提供 dependsOn 字符串数组引用前一个 id，例如 {"id":"verify","dependsOn":["build"],"name":"read_file","arguments":{...}}。宿主会结合显式依赖和文件资源冲突决定串行或并行。',
       '不得把依赖前一个工具输出才能确定参数的调用放进同一 tool_calls 数组；应先调用前置工具，收到 Observation 后再输出后续调用。',
       '当任务完成或不需要工具时，输出 Final JSON：',
       finalSchema,
@@ -719,16 +871,20 @@ export class ReactAgent {
       '启动 Electron 或其他桌面应用时，必须使用 run_command 并设置 background=true，禁止使用 start_service。后台命令返回 PID 即表示进程已成功创建；不得因为没有 HTTP 地址而重复启动同一桌面应用。',
       '文件路径可以使用工作区相对路径；是否允许访问工作区外路径以及是否需要确认，由宿主按照当前权限模式决定，模型不得自行声称没有权限。修改已有文件前先用 read_file 读取实际内容，局部修改优先用 edit_file；old_text 必须包含足够上下文以确保唯一匹配，只有明确要替换全部匹配时才设置 replace_all=true。write_file 的单次 content 不得超过 6000 个字符；较大的页面或程序必须拆分为多个文件并逐个写入，禁止在一个 Action 中嵌入超长文件。Word、Excel 使用本地 parse_word、parse_excel 工具；PowerPoint 使用 parse_powerpoint PPT MCP 工具，是否确认由当前权限模式决定。解析因企业加密失败时，调用 decrypt_file 生成解密副本，再使用对应解析工具读取 output_path。run_command 的工具名必须严格写成 run_command，不能写成 run-command；command 必须是可执行文件名，参数放入 args 数组。命令、联网与外部文件编辑是否弹出确认由宿主权限策略决定；用户或安全策略拒绝后不得重复申请相同操作。删除、格式化、关机、终止进程、重启和强制清理等高风险命令也必须输出 run_command，由宿主决定自动执行或显示强化警告；禁止在生成 Action 前自行拒绝用户明确要求的命令。用户明确要求查看远程目录或文件时，应立即调用 ssh 等只读命令，不要仅因远程路径不在本地工作区而拒绝。调用 Node 包管理器时 command 始终使用 npm 或 npx；宿主会自动处理 Windows 的 .cmd 启动文件，禁止自行改用 npm.cmd、npm。cmd，禁止仅为探测 PATH 重复调用同一命令。创建或更新 Node 项目时必须先读取 node --version，并选择满足当前 Node 引擎要求的依赖版本；遇到 EBADENGINE 时应修改 package.json 中不兼容的依赖版本后重新安装，不要反复执行相同的 npm install。任何构建、测试或检查命令失败后，必须根据完整 Observation 定位并修改文件，再重新运行验证命令；验证成功前禁止输出 Final。启动开发服务器或其他长驻 Web 服务必须使用 start_service，禁止使用 run_command；start_service 返回地址后，Final 必须包含该完整 http 或 https 地址。',
       '每轮最多请求 ' + MAX_ACTIONS_PER_TURN + ' 个工具调用；复杂任务应分多轮进行。',
-      '再次确认输出契约：使用文本协议时只返回一个 JSON 对象，并且只包含 thought + action、thought + tool_calls、thought + choice 或 thought + final 四种结构之一。需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
+      '再次确认输出契约：使用文本协议时只返回一个 JSON 对象，并且只包含 thought + action、thought + tool_calls、thought + choice 或 thought + final 四种结构之一。两个或更多独立工具必须使用 tool_calls 数组；需要操作文件、仓库、命令或服务且尚未收到 Observation 时，禁止输出 final。'
     ].join('\n')
   }
 
-  private async executeTool(call: ToolCall, tools: WorkspaceTools, policy: AgentPolicy, requestMcpApproval?: McpApprovalCallback, requestCommandApproval?: CommandApprovalCallback, signal?: AbortSignal, permissionMode: RuntimePermissionMode = this.getSettings().permissionMode ?? 'legacy', onCommandOutput?: CommandOutputListener): Promise<string> {
+  private async executeTool(call: ToolCall, tools: WorkspaceTools, policy: AgentPolicy, requestMcpApproval?: McpApprovalCallback, requestCommandApproval?: CommandApprovalCallback, signal?: AbortSignal, permissionMode: RuntimePermissionMode = this.getSettings().permissionMode ?? 'legacy', onCommandOutput?: CommandOutputListener, knowledgeBase?: KnowledgeBaseConfig): Promise<string> {
     throwIfAborted(signal)
     if (!policy.enabledTools.includes(call.name)) throw new Error('工具未启用：' + call.name)
     const validated = prepareToolCall(call, { currentRequest: '' })
     if (!validated.call) throw new Error(issueFailureMessage(validated.issue!))
     call = validated.call
+    if (call.name === 'search_knowledge_base' && call.arguments.query) {
+      if (!knowledgeBase) throw new Error('当前会话未配置知识库。')
+      return searchKnowledgeBase(knowledgeBase, call.arguments.query, signal)
+    }
     if (call.name === 'read_file' && call.arguments.path) return tools.readFile(call.arguments.path)
     if (call.name === 'write_file' && call.arguments.path && typeof call.arguments.content === 'string') {
       if (!await this.approveExternalWrite(call.name, call.arguments.path, tools, policy, permissionMode, requestCommandApproval)) return '用户拒绝编辑工作区外文件，写入已取消。'
@@ -988,7 +1144,14 @@ export class ReactAgent {
       if (model.apiKey.trim()) headers.Authorization = 'Bearer ' + model.apiKey
       const contextWindowTokens = Math.max(4096, Math.floor(model.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS))
       const maxOutputTokens = Math.min(Math.max(256, Math.floor(model.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS)), Math.floor(contextWindowTokens * 0.5))
-      const requestBody: Record<string, unknown> = { model: model.model, messages, temperature: 0, max_tokens: maxOutputTokens, stream: useStreaming }
+      const requestBody: Record<string, unknown> = {
+        model: model.model,
+        messages,
+        temperature: 0,
+        max_tokens: maxOutputTokens,
+        response_format: createReactResponseFormat(enabledTools),
+        stream: useStreaming
+      }
       if (useStreaming) requestBody.stream_options = { include_usage: true }
       const nativeTools = getEnabledToolDefinitions(enabledTools).map((definition) => ({
         type: 'function',
@@ -1000,6 +1163,9 @@ export class ReactAgent {
       }))
       if (nativeTools.length && isQwenModel(model.model)) {
         requestBody.tools = nativeTools
+        // Qwen-compatible endpoints commonly default to one native function
+        // call unless parallel execution is explicitly enabled.
+        requestBody.parallel_tool_calls = true
       }
       const response = await modelFetch(model.baseUrl.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST',
@@ -1281,14 +1447,25 @@ export class ReactAgent {
   }
 
   private normalizeReplyCandidate(value: unknown): ReactModelReply | undefined {
+    if (Array.isArray(value)) {
+      const normalizedCalls = value.flatMap((item) => normalizeRawToolCall(item).call ?? [])
+      if (normalizedCalls.length) return this.attachThought({ tool_calls: normalizedCalls })
+      const issue = value.map((item) => normalizeRawToolCall(item).issue).find((candidate): candidate is ToolCallIssue => Boolean(candidate))
+      return issue ? this.attachThought({ toolIssue: issue }) : undefined
+    }
     if (!value || typeof value !== 'object') return undefined
     const candidate = value as ReactModelReply
     const calls = this.getToolCalls(candidate)
     if (calls.length) {
       const toolIssue = this.getToolCallIssue(candidate)
-      const normalized = candidate.action
-        ? { ...candidate, action: calls[0], tool_calls: undefined, toolIssue }
-        : { ...candidate, action: undefined, tool_calls: calls, toolIssue }
+      // Some OpenAI-compatible endpoints still return `action` together with
+      // `tool_calls`. Keeping only action here silently discards the batch.
+      // Preserve every valid call and normalize the envelope to tool_calls.
+      const normalized = calls.length > 1 || candidate.tool_calls?.length
+        ? { ...candidate, action: undefined, tool_calls: calls, toolIssue }
+        : candidate.action
+          ? { ...candidate, action: calls[0], tool_calls: undefined, toolIssue }
+          : { ...candidate, action: undefined, tool_calls: calls, toolIssue }
       return this.attachThought(normalized)
     }
     const toolIssue = this.getToolCallIssue(candidate)
@@ -1514,7 +1691,13 @@ export class ReactAgent {
 
   private getToolCalls(reply: ReactModelReply): ToolCall[] {
     const calls = this.getRawToolCalls(reply)
-    return calls.flatMap((item) => normalizeRawToolCall(item).call ?? [])
+    const seen = new Set<string>()
+    return calls.flatMap((item) => normalizeRawToolCall(item).call ?? []).filter((call) => {
+      const signature = JSON.stringify({ id: call.id, name: call.name, arguments: call.arguments, dependsOn: call.dependsOn })
+      if (seen.has(signature)) return false
+      seen.add(signature)
+      return true
+    })
   }
 
   private getToolCallIssue(reply: ReactModelReply): ToolCallIssue | undefined {
@@ -1524,10 +1707,14 @@ export class ReactAgent {
   }
 
   private getRawToolCalls(reply: ReactModelReply): unknown[] {
-    if (reply.action) return [reply.action]
-    if (reply.tool_calls?.length) return reply.tool_calls
-    if (reply.function_call) return [reply.function_call]
-    return reply.tools ?? []
+    // Strict schema should make these fields mutually exclusive, but provider
+    // adapters sometimes echo more than one variant in the same response.
+    return [
+      ...(Array.isArray(reply.action) ? reply.action : reply.action ? [reply.action] : []),
+      ...(Array.isArray(reply.tool_calls) ? reply.tool_calls : []),
+      ...(reply.function_call ? [reply.function_call] : []),
+      ...(Array.isArray(reply.tools) ? reply.tools : [])
+    ]
   }
 
   private addStep(task: AgentTask, taskStep: TaskStep, onStep?: StepCallback): void {
@@ -1762,8 +1949,26 @@ function sanitizeThoughtText(thought: string): string {
 }
 
 function sanitizeAssistantText(text: string): string {
-  const sanitized = sanitizeThoughtText(text)
+  // Observation blocks are host-only context.  A recovery/fallback response
+  // may contain the exact prompt that was sent back to the model, so remove
+  // those blocks before applying the normal thought cleanup.  Merely replacing
+  // "Observation #N" with a label still leaks the complete tool output.
+  const sanitized = sanitizeThoughtText(stripReactInternalSections(text))
   return sanitized || '模型未按 ReAct 协议返回最终结果，原始思考内容已隐藏。'
+}
+
+/**
+ * Remove host-only ReAct sections from text that is about to be shown to the
+ * user.  Keep any short narrative that precedes the section, but never expose
+ * Observation payloads, memory snapshots, or scheduling instructions.
+ */
+function stripReactInternalSections(value: string): string {
+  const normalized = stripThoughtTags(value).trim()
+  if (!normalized) return ''
+  const marker = /(?:^|\n)\s*(?:Observation\s*#\s*\d+|UserChoice\s+Observation\s*:|Previous\s+task\s+memory\s*:|调度说明\s*[：:])/i.exec(normalized)
+  if (!marker) return normalized
+  const markerIndex = marker.index + (marker[0].startsWith('\n') ? 1 : 0)
+  return normalized.slice(0, markerIndex).trim()
 }
 
 function formatThoughtDetail(thought: string): string {
@@ -1808,6 +2013,22 @@ function nativeAssistantToolMessage(reply: ReactModelReply): ModelMessage {
 
 function isIncompleteFinal(finalText: string): boolean {
   return /(?:请|需要).{0,16}(?:提供|返回).{0,12}(?:工具|Observation|结果)|(?:等待|获取).{0,12}(?:工具|Observation).{0,12}(?:结果|返回)|(?:任务|项目|构建|验证|修复|定位).{0,8}(?:尚未|未).{0,8}(?:完成|结束|通过|解决)|(?:还需|需要继续|将继续).{0,12}(?:创建|写入|检查|执行|完成)/i.test(finalText)
+}
+
+function shouldSearchKnowledgeBaseBeforeClarifying(prompt: string, reply: ReactModelReply): boolean {
+  const response = [reply.thought, reply.final, reply.unparsed].filter((value): value is string => typeof value === 'string').join('\n')
+  if (!response) return false
+  const requestsClarification = /(?:需要|请).{0,18}(?:澄清|确认|提供|补充)|(?:当前|现有).{0,12}(?:上下文|信息).{0,12}(?:不足|不够)|无法确定|不能确定|可能指|多种(?:释义|含义|概念)|避免.{0,12}(?:错误|误解)/i.test(response)
+  const asksForDefinition = /介绍|是什么|什么是|定义|含义|流程|说明|解释|了解/i.test(prompt)
+  const hasAcronym = /\b[A-Z][A-Z0-9_-]{2,}\b/.test(prompt)
+  return requestsClarification || (asksForDefinition && hasAcronym)
+}
+
+function isProtocolEchoFinal(finalText: string): boolean {
+  const normalized = finalText.trim()
+  if (!normalized) return false
+  if (/(?:Observation\s*#\s*\d+|Previous\s+task\s+memory|REACT_(?:PROTOCOL|FORMAT)|调度说明)/i.test(normalized)) return true
+  return normalized.length > 1200 && /(?:read_file|write_file|edit_file|run_command|tool_calls|action)/i.test(normalized)
 }
 
 function looksLikeIncompleteToolCall(content: string): boolean {
@@ -1887,7 +2108,7 @@ function planToolExecution(calls: ToolCall[], permissionMode: RuntimePermissionM
 }
 
 function isToolExecutionBarrier(call: ToolCall, permissionMode: RuntimePermissionMode): boolean {
-  if (call.name === 'run_command' || call.name === 'start_service' || call.name === 'decrypt_file' || call.name === 'parse_powerpoint') return true
+  if (call.name === 'run_command' || call.name === 'start_service' || call.name === 'decrypt_file' || call.name === 'parse_powerpoint' || call.name === 'search_knowledge_base') return true
   return permissionMode !== 'legacy' && permissionMode !== 'full_access' && (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'create_directory')
 }
 
@@ -2148,7 +2369,7 @@ function isRecoverableToolError(error: unknown, toolName?: ToolCall['name']): bo
   const message = error instanceof Error ? error.message : String(error)
   if (/工具未启用|工具调用参数修复失败|工具调用无法执行/.test(message)) return false
   if (/文件操作仅允许在当前工作区内进行|路径不能经过符号链接|路径必须是文件|路径必须是目录/.test(message)) return true
-  if (toolName === 'edit_file' || toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint') return true
+  if (toolName === 'edit_file' || toolName === 'run_command' || toolName === 'start_service' || toolName === 'decrypt_file' || toolName === 'parse_word' || toolName === 'parse_excel' || toolName === 'parse_powerpoint' || toolName === 'search_knowledge_base') return true
   const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : ''
   return code === 'ENOENT' || /no such file|cannot find|找不到|不存在|路径不存在/i.test(message)
 }
@@ -2163,15 +2384,15 @@ class ReactFieldStream {
   push(delta: string): void {
     this.buffer += delta
     this.emitThought()
-    this.emitFinal()
   }
 
   flushFinal(finalText: string): void {
     if (!this.onFinalDelta) return
-    if (finalText.length > this.emittedFinal.length) {
-      this.onFinalDelta(finalText.slice(this.emittedFinal.length))
+    const safeFinalText = stripReactInternalSections(finalText)
+    if (safeFinalText.length > this.emittedFinal.length) {
+      this.onFinalDelta(safeFinalText.slice(this.emittedFinal.length))
     }
-    this.emittedFinal = finalText
+    this.emittedFinal = safeFinalText
   }
 
   private emitThought(): void {
@@ -2181,24 +2402,6 @@ class ReactFieldStream {
 
     this.onThoughtDelta(thoughtText.slice(this.emittedThought.length))
     this.emittedThought = thoughtText
-  }
-
-  private emitFinal(): void {
-    if (!this.onFinalDelta) return
-    const finalText = this.extractFinalText()
-    if (finalText.length <= this.emittedFinal.length) return
-
-    this.onFinalDelta(finalText.slice(this.emittedFinal.length))
-    this.emittedFinal = finalText
-  }
-
-  private extractFinalText(): string {
-    const payload = stripThoughtTags(this.buffer)
-    const finalIndex = payload.indexOf('"final"')
-    if (finalIndex < 0) return ''
-    const actionIndex = payload.search(/"(action|tool_calls)"\s*:/)
-    if (actionIndex >= 0 && actionIndex < finalIndex) return ''
-    return this.extractStringField('final', payload)
   }
 
   private extractStringField(fieldName: string, source = this.buffer): string {

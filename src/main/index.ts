@@ -23,6 +23,7 @@ import { startPptMcpServer, type RunningPptMcpServer } from './ppt/ppt-mcp-serve
 import { isTextFilePath, launchApplication, normalizeWebUrl, resolveWorkspaceFile, validateApplicationPath } from './navigation'
 import { modelFetch } from './model-fetch'
 import { modelConfig, resolveModelProfile } from '../shared/models'
+import { normalizeKnowledgeBaseConfig, searchKnowledgeBase } from './knowledge-base'
 
 const store = new LocalStore()
 let pptMcpUrl = ''
@@ -73,7 +74,8 @@ app.whenReady().then(async () => {
     runningTasks.set(key, controller)
     try {
     const conversationAtStart = store.getConversation(conversationId)
-    const modelProfile = resolveModelProfile(store.getSettings(), conversationAtStart.modelId)
+    const currentSettings = store.getSettings()
+    const modelProfile = resolveModelProfile(currentSettings, conversationAtStart.modelId)
     const workspacePath = effectiveWorkspacePath(conversationAtStart)
     const normalizedPrompt = typeof prompt === 'string' ? prompt.trim() : ''
     const validatedAttachments = validateAttachments(attachments)
@@ -125,7 +127,7 @@ app.whenReady().then(async () => {
     }, (request) => commandApprovalManager.request(event.sender, { ...request, conversationId }), modelConfig(modelProfile), (contextUsage) => {
       assistantMessage.contextUsage = contextUsage
       event.sender.send('agent:context-usage', { conversationId, messageId: assistantMessage.id, contextUsage })
-    })
+    }, conversationAtStart.knowledgeBaseEnabled ? currentSettings.knowledgeBase : undefined)
     assistantMessage.content = task.status === 'paused' && assistantMessage.content.trim()
       ? assistantMessage.content.trimEnd() + '\n\n[已暂停]'
       : task.result ?? task.error ?? ''
@@ -168,6 +170,27 @@ app.whenReady().then(async () => {
   ipcMain.handle('conversations:set-model', (_event, conversationId: unknown, modelId: unknown) => {
     if (typeof conversationId !== 'string' || (modelId !== undefined && typeof modelId !== 'string')) throw new Error('会话模型参数无效。')
     return store.setConversationModel(conversationId, modelId)
+  })
+  ipcMain.handle('conversations:set-knowledge-base-enabled', (_event, conversationId: unknown, enabled: unknown) => {
+    if (typeof conversationId !== 'string' || typeof enabled !== 'boolean') throw new Error('会话知识库参数无效。')
+    return store.setConversationKnowledgeBaseEnabled(conversationId, enabled)
+  })
+  ipcMain.handle('knowledge-base:test', async (_event, config: unknown, query: unknown) => {
+    const normalized = normalizeKnowledgeBaseConfig(config)
+    if (!normalized) return { ok: false, message: '请先填写 FastGPT 地址、API Key 和 datasetId。' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 30_000)
+    try {
+      const result = await searchKnowledgeBase(normalized, typeof query === 'string' && query.trim() ? query.trim() : '知识库连接测试', controller.signal)
+      return { ok: true, message: result.includes('未检索到') ? '连接成功，当前测试问题没有命中知识片段。' : '连接成功，知识库检索可用。' }
+    } catch (error) {
+      const message = error instanceof Error && error.name === 'AbortError'
+        ? '连接超时，请检查 FastGPT 地址和网络。'
+        : error instanceof Error ? error.message : '知识库连接失败。'
+      return { ok: false, message }
+    } finally {
+      clearTimeout(timer)
+    }
   })
   ipcMain.handle('workspace:open-file', async (_event, conversationId: unknown, filePath: unknown) => {
     try {
